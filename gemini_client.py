@@ -78,7 +78,10 @@ def build_system_instruction(
     return "\n".join(lines)
 
 
-def build_user_prompt(request: EvaluateRequest) -> str:
+def build_user_prompt(
+    request: EvaluateRequest,
+    tmdb_context: Optional[str] = None,
+) -> str:
     parts = [f"Release string / query: {request.raw_text}"]
     if request.hint_title:
         parts.append(f"Hint title: {request.hint_title}")
@@ -86,6 +89,10 @@ def build_user_prompt(request: EvaluateRequest) -> str:
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
         parts.append(f"Extra context: {request.extra_context}")
+    if tmdb_context:
+        parts.append("")
+        parts.append(tmdb_context)
+        parts.append("")
     parts.append(
         "Identify the exact film, verify available critic/audience scores via Google Search, "
         "and return the structured triage JSON."
@@ -131,6 +138,7 @@ class GeminiTriageClient:
         self,
         request: EvaluateRequest,
         system_instruction: str,
+        tmdb_context: Optional[str] = None,
     ) -> EvaluationPayload:
         client = self._get_client()
         config = types.GenerateContentConfig(
@@ -141,7 +149,7 @@ class GeminiTriageClient:
         )
         response = client.models.generate_content(
             model=self.model,
-            contents=build_user_prompt(request),
+            contents=build_user_prompt(request, tmdb_context=tmdb_context),
             config=config,
         )
         raw_text = getattr(response, "text", None)
@@ -160,6 +168,8 @@ class GeminiTriageClient:
         self,
         request: EvaluateRequest,
         recent_feedback: list[dict[str, Any]],
+        *,
+        tmdb_context: Optional[str] = None,
     ) -> EvaluationPayload:
         # Dynamically reload taste_profile.txt on every single request
         taste_profile = load_taste_profile(self.taste_profile_path)
@@ -167,7 +177,7 @@ class GeminiTriageClient:
 
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._call_sync, request, system_instruction),
+                asyncio.to_thread(self._call_sync, request, system_instruction, tmdb_context),
                 timeout=self.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:

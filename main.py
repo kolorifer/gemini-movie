@@ -17,6 +17,7 @@ from schemas import (
     HealthResponse,
     RecentEvaluationItem,
 )
+from tmdb_client import TmdbClient, apply_tmdb_verification, is_tmdb_compatible
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -31,6 +32,7 @@ gemini_client = GeminiTriageClient(
     model=GEMINI_MODEL,
     taste_profile_path=BASE_DIR / "taste_profile.txt",
 )
+tmdb_client = TmdbClient(api_key=os.getenv("TMDB_API_KEY", "").strip())
 
 
 @asynccontextmanager
@@ -53,6 +55,7 @@ async def health() -> HealthResponse:
         model=GEMINI_MODEL,
         port=PORT,
         cache_entries=db.get_cache_entries_count(ttl_hours=CACHE_TTL_HOURS),
+        tmdb_enabled=tmdb_client.enabled,
     )
 
 
@@ -69,15 +72,40 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         if cached is not None:
             return EvaluateResponse(cached=True, **cached)
 
+    tmdb_movie = await tmdb_client.lookup_from_request(payload)
+
+    # Cross-language/alias cache check via deterministic TMDB -> IMDb ID resolution
+    if not payload.force_refresh and tmdb_movie is not None and tmdb_movie.imdb_id:
+        cached_by_imdb = db.get_cached_evaluation(
+            payload.raw_text,
+            hint_title=tmdb_movie.canonical_title,
+            hint_year=tmdb_movie.year,
+            extra_context=tmdb_movie.imdb_id,
+            ttl_hours=CACHE_TTL_HOURS,
+        )
+        if cached_by_imdb is not None:
+            return EvaluateResponse(cached=True, **cached_by_imdb)
+
     recent_feedback = db.get_recent_feedback(limit=20)
+    tmdb_context = tmdb_movie.to_prompt_block() if tmdb_movie is not None else None
     try:
-        result = await gemini_client.evaluate(payload, recent_feedback)
+        result = await gemini_client.evaluate(
+            payload,
+            recent_feedback,
+            tmdb_context=tmdb_context,
+        )
     except GeminiTimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except GeminiClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    result_dict = result.model_dump()
+    if tmdb_client.enabled and (
+        tmdb_movie is None or not is_tmdb_compatible(result.identification, tmdb_movie)
+    ):
+        tmdb_movie = await tmdb_client.verify_identification(result.identification)
+
+    verified_result = apply_tmdb_verification(result, tmdb_movie)
+    result_dict = verified_result.model_dump()
     db.save_evaluation(
         payload.raw_text,
         result_dict,

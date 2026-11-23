@@ -24,6 +24,7 @@ class Identification(BaseModel):
     year: int = Field(..., description="Theatrical or festival release year")
     director: str = Field(..., description="Director full name(s)")
     imdb_id: Optional[str] = Field(default=None, description="Verified IMDb ID in ttNNNNNNN format or null")
+    tmdb_id: Optional[int] = Field(default=None, description="Verified TMDB movie ID or null if unverified")
     runtime_minutes: Optional[int] = Field(default=None, description="Runtime in minutes or null if unverified")
     genres: list[str] = Field(default_factory=list, description="Up to 4 concise genre labels")
     match_confidence: MatchConfidence = Field(..., description="Confidence in exact movie identification")
@@ -110,6 +111,7 @@ class HealthResponse(BaseModel):
     model: str
     port: int
     cache_entries: int
+    tmdb_enabled: bool = False
 
 
 class RecentEvaluationItem(BaseModel):

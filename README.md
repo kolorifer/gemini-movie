@@ -1,11 +1,11 @@
 # Movie Triage API (`movie-triage-api`)
 
-Local-only Python FastAPI microservice for fast movie release triage using Google Search-grounded Gemini (`google-genai`), Pydantic v2 structured output, and SQLite caching/feedback persistence.
+Local-only Python FastAPI microservice for fast movie release triage using Google Search-grounded Gemini (`google-genai`), optional TMDB deterministic ID/runtime/original-title verification (`TMDB_API_KEY`), Pydantic v2 structured output, and SQLite caching/feedback persistence.
 
 ## Endpoints
 
-- `GET /health` — Service status, configured model, bound port, and active cache entry count.
-- `POST /evaluate` — Identifies a movie from a release string (with optional hints/context), fetches grounded ratings and critical reception, and returns a `WATCH` / `MAYBE` / `SKIP` verdict. Results are cached in SQLite (`data/triage.db`) for `CACHE_TTL_HOURS` (default `72`).
+- `GET /health` — Service status, configured model, bound port, active cache entry count, and whether TMDB lookup is enabled.
+- `POST /evaluate` — Identifies a movie from a release string (with optional hints/context and TMDB metadata verification when `TMDB_API_KEY` is configured), fetches grounded ratings and critical reception, and returns a `WATCH` / `MAYBE` / `SKIP` verdict. Results are cached in SQLite (`data/triage.db`) for `CACHE_TTL_HOURS` (default `72`).
 - `POST /feedback` — Records personal `WATCH` / `MAYBE` / `SKIP` feedback and notes to guide future evaluations.
 - `GET /recent` — Lists recent evaluations.
 
