@@ -630,7 +630,7 @@ DEFAULT_TASTE_PROFILE = (
     "or notable festival/critical recognition. Flag derivative blockbusters, slow "
     "pacing with weak payoff, or ratings inflated by very low vote counts."
 )
-REQUEST_TIMEOUT_SECONDS = 45.0
+REQUEST_TIMEOUT_SECONDS = 75.0
 
 
 class GeminiClientError(RuntimeError):
@@ -638,7 +638,7 @@ class GeminiClientError(RuntimeError):
 
 
 class GeminiTimeoutError(GeminiClientError):
-    """Raised when the Gemini API call exceeds the 45-second timeout."""
+    """Raised when the Gemini API call exceeds the 75-second timeout."""
 
 
 def load_taste_profile(path: Optional[Path | str] = None) -> str:
