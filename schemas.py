@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from typing import Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MatchConfidence = Literal["high", "medium", "low"]
 Verdict = Literal["WATCH", "MAYBE", "SKIP"]
+FeedbackDecision = Literal["WATCH", "SKIP"]
 
 
 class EvaluateRequest(BaseModel):
@@ -96,14 +97,32 @@ class FeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     imdb_id: Optional[str] = Field(default=None, description="IMDb ID if known (e.g. tt14561712)")
+    tmdb_id: Optional[int] = Field(default=None, description="Optional TMDB movie ID")
     title: str = Field(..., min_length=1, description="Movie title")
-    decision: Verdict = Field(..., description="User decision: WATCH, MAYBE, or SKIP")
+    decision: FeedbackDecision = Field(..., description="User decision: watch or skip (case-insensitive)")
     note: Optional[str] = Field(default=None, description="Optional personal note explaining why")
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _normalize_decision(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
 
 class FeedbackResponse(BaseModel):
     status: Literal["saved"] = "saved"
+    decision: FeedbackDecision
     total_feedback: int
+
+
+class FeedbackItem(BaseModel):
+    id: int
+    imdb_id: Optional[str] = None
+    title: str
+    decision: FeedbackDecision
+    note: Optional[str] = None
+    created_at: str
 
 
 class HealthResponse(BaseModel):

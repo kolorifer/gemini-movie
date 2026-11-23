@@ -43,7 +43,6 @@ fi
 echo "[2/6] Creating project directory and writing microservice files..."
 mkdir -p "$APP_DIR/data" "$SYSTEMD_DIR"
 
-
 cat <<'EOF_REQUIREMENTS' > "$APP_DIR/requirements.txt"
 fastapi
 uvicorn[standard]
@@ -60,11 +59,12 @@ cat <<'EOF_SCHEMAS' > "$APP_DIR/schemas.py"
 from __future__ import annotations
 
 from typing import Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MatchConfidence = Literal["high", "medium", "low"]
 Verdict = Literal["WATCH", "MAYBE", "SKIP"]
+FeedbackDecision = Literal["WATCH", "SKIP"]
 
 
 class EvaluateRequest(BaseModel):
@@ -155,14 +155,32 @@ class FeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     imdb_id: Optional[str] = Field(default=None, description="IMDb ID if known (e.g. tt14561712)")
+    tmdb_id: Optional[int] = Field(default=None, description="Optional TMDB movie ID")
     title: str = Field(..., min_length=1, description="Movie title")
-    decision: Verdict = Field(..., description="User decision: WATCH, MAYBE, or SKIP")
+    decision: FeedbackDecision = Field(..., description="User decision: watch or skip (case-insensitive)")
     note: Optional[str] = Field(default=None, description="Optional personal note explaining why")
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _normalize_decision(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
 
 class FeedbackResponse(BaseModel):
     status: Literal["saved"] = "saved"
+    decision: FeedbackDecision
     total_feedback: int
+
+
+class FeedbackItem(BaseModel):
+    id: int
+    imdb_id: Optional[str] = None
+    title: str
+    decision: FeedbackDecision
+    note: Optional[str] = None
+    created_at: str
 
 
 class HealthResponse(BaseModel):
@@ -585,14 +603,26 @@ class TriageDB:
     ) -> int:
         ts = created_at or utc_now_iso()
         clean_imdb = imdb_id.strip().lower() if imdb_id and imdb_id.strip() else None
+        clean_title = title.strip()
+        clean_decision = decision.strip().upper()
         clean_note = note.strip() if note and note.strip() else None
         with self._connect() as conn:
+            if clean_imdb:
+                conn.execute(
+                    "DELETE FROM feedback WHERE lower(imdb_id) = ?",
+                    (clean_imdb,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM feedback WHERE imdb_id IS NULL AND lower(trim(title)) = ?",
+                    (clean_title.lower(),),
+                )
             conn.execute(
                 """
                 INSERT INTO feedback (imdb_id, title, decision, note, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (clean_imdb, title.strip(), decision, clean_note, ts),
+                (clean_imdb, clean_title, clean_decision, clean_note, ts),
             )
             row = conn.execute("SELECT COUNT(*) AS cnt FROM feedback").fetchone()
             return int(row["cnt"]) if row else 0
@@ -1268,6 +1298,7 @@ from gemini_client import GeminiClientError, GeminiTimeoutError, GeminiTriageCli
 from schemas import (
     EvaluateRequest,
     EvaluateResponse,
+    FeedbackItem,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -1379,7 +1410,17 @@ async def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
         decision=payload.decision,
         note=payload.note,
     )
-    return FeedbackResponse(status="saved", total_feedback=total)
+    return FeedbackResponse(
+        status="saved",
+        decision=payload.decision,
+        total_feedback=total,
+    )
+
+
+@app.get("/feedback", response_model=list[FeedbackItem])
+async def list_feedback(limit: int = Query(default=20, ge=1, le=50)) -> list[FeedbackItem]:
+    rows = db.get_recent_feedback(limit=limit)
+    return [FeedbackItem(**row) for row in rows]
 
 
 @app.get("/recent", response_model=list[RecentEvaluationItem])

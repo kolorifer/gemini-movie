@@ -6,7 +6,8 @@ Local-only Python FastAPI microservice for fast movie release triage using Googl
 
 - `GET /health` — Service status, configured model, bound port, active cache entry count, and whether TMDB lookup is enabled.
 - `POST /evaluate` — Identifies a movie from a release string (with optional hints/context and TMDB metadata verification when `TMDB_API_KEY` is configured), fetches grounded ratings and critical reception, and returns a `WATCH` / `MAYBE` / `SKIP` verdict. Results are cached in SQLite (`data/triage.db`) for `CACHE_TTL_HOURS` (default `72`).
-- `POST /feedback` — Records personal `WATCH` / `MAYBE` / `SKIP` feedback and notes to guide future evaluations.
+- `POST /feedback` — Records user `watch` or `skip` decisions (case-insensitive, deduplicated per movie) and optional notes to guide future evaluations.
+- `GET /feedback` — Lists recent stored feedback entries fed into Gemini prompts.
 - `GET /recent` — Lists recent evaluations.
 
 ## Ultra.cc Non-Root Deployment

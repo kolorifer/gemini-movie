@@ -12,6 +12,7 @@ from gemini_client import GeminiClientError, GeminiTimeoutError, GeminiTriageCli
 from schemas import (
     EvaluateRequest,
     EvaluateResponse,
+    FeedbackItem,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -123,7 +124,17 @@ async def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
         decision=payload.decision,
         note=payload.note,
     )
-    return FeedbackResponse(status="saved", total_feedback=total)
+    return FeedbackResponse(
+        status="saved",
+        decision=payload.decision,
+        total_feedback=total,
+    )
+
+
+@app.get("/feedback", response_model=list[FeedbackItem])
+async def list_feedback(limit: int = Query(default=20, ge=1, le=50)) -> list[FeedbackItem]:
+    rows = db.get_recent_feedback(limit=limit)
+    return [FeedbackItem(**row) for row in rows]
 
 
 @app.get("/recent", response_model=list[RecentEvaluationItem])

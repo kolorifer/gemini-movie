@@ -401,14 +401,26 @@ class TriageDB:
     ) -> int:
         ts = created_at or utc_now_iso()
         clean_imdb = imdb_id.strip().lower() if imdb_id and imdb_id.strip() else None
+        clean_title = title.strip()
+        clean_decision = decision.strip().upper()
         clean_note = note.strip() if note and note.strip() else None
         with self._connect() as conn:
+            if clean_imdb:
+                conn.execute(
+                    "DELETE FROM feedback WHERE lower(imdb_id) = ?",
+                    (clean_imdb,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM feedback WHERE imdb_id IS NULL AND lower(trim(title)) = ?",
+                    (clean_title.lower(),),
+                )
             conn.execute(
                 """
                 INSERT INTO feedback (imdb_id, title, decision, note, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (clean_imdb, title.strip(), decision, clean_note, ts),
+                (clean_imdb, clean_title, clean_decision, clean_note, ts),
             )
             row = conn.execute("SELECT COUNT(*) AS cnt FROM feedback").fetchone()
             return int(row["cnt"]) if row else 0

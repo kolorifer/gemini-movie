@@ -289,6 +289,65 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertEqual(resp2.identification.tmdb_id, 837335)
                 self.assertEqual(mock_gemini_eval.await_count, 1)
 
+    def test_feedback_watch_skip_normalization_and_dedup(self) -> None:
+        from pydantic import ValidationError
+        import main
+        from schemas import FeedbackRequest
+
+        # Lowercase watch / skip normalize cleanly to WATCH / SKIP
+        req_watch = FeedbackRequest(
+            imdb_id="tt0432283",
+            tmdb_id=10315,
+            title="Fantastic Mr. Fox",
+            decision="watch",  # type: ignore[arg-type]
+            note="Grabbed via Telegram",
+        )
+        self.assertEqual(req_watch.decision, "WATCH")
+
+        req_skip = FeedbackRequest(
+            imdb_id="tt0105104",
+            title="Passenger 57",
+            decision="skip",  # type: ignore[arg-type]
+        )
+        self.assertEqual(req_skip.decision, "SKIP")
+
+        # Non watch/skip values (including MAYBE) are rejected
+        with self.assertRaises(ValidationError):
+            FeedbackRequest(title="Some Film", decision="maybe")  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            with patch.object(main, "db", test_db):
+                r1 = asyncio.run(main.submit_feedback(req_watch))
+                self.assertEqual(r1.status, "saved")
+                self.assertEqual(r1.decision, "WATCH")
+                self.assertEqual(r1.total_feedback, 1)
+
+                r2 = asyncio.run(main.submit_feedback(req_skip))
+                self.assertEqual(r2.decision, "SKIP")
+                self.assertEqual(r2.total_feedback, 2)
+
+                # Re-submitting for same IMDb ID updates decision without duplicating row
+                r3 = asyncio.run(
+                    main.submit_feedback(
+                        FeedbackRequest(
+                            imdb_id="tt0432283",
+                            title="Fantastic Mr. Fox",
+                            decision="skip",  # type: ignore[arg-type]
+                            note="Changed mind",
+                        )
+                    )
+                )
+                self.assertEqual(r3.decision, "SKIP")
+                self.assertEqual(r3.total_feedback, 2)
+
+                items = asyncio.run(main.list_feedback(limit=10))
+                self.assertEqual(len(items), 2)
+                self.assertEqual(items[0].imdb_id, "tt0432283")
+                self.assertEqual(items[0].decision, "SKIP")
+                self.assertEqual(items[0].note, "Changed mind")
+
 
 if __name__ == "__main__":
     unittest.main()
