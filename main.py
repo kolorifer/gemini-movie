@@ -23,7 +23,7 @@ from tmdb_client import TmdbClient, apply_tmdb_verification, is_tmdb_compatible
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
 PORT = int(os.getenv("PORT", "8000"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "72"))
 

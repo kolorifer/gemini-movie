@@ -1211,7 +1211,7 @@ class GeminiTriageClient:
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
         self.taste_profile_path = (
             Path(taste_profile_path)
             if taste_profile_path is not None
@@ -1309,7 +1309,7 @@ from tmdb_client import TmdbClient, apply_tmdb_verification, is_tmdb_compatible
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
 PORT = int(os.getenv("PORT", "8000"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "72"))
 
@@ -1432,7 +1432,7 @@ EOF_MAIN
 echo "[3/6] Writing locked-down .env (chmod 600)..."
 cat <<EOF_ENV > "$APP_DIR/.env"
 GEMINI_API_KEY=${GEMINI_API_KEY}
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-4-hydrogen
 HOST=127.0.0.1
 PORT=${CHOSEN_PORT}
 CACHE_TTL_HOURS=72

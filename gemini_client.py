@@ -118,7 +118,7 @@ class GeminiTriageClient:
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
         self.taste_profile_path = (
             Path(taste_profile_path)
             if taste_profile_path is not None
