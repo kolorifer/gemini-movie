@@ -543,15 +543,50 @@ def canonical_release_key(canonical_title: str, year: int) -> str:
 class TriageDB:
     def __init__(self, db_path: Optional[Path | str] = None) -> None:
         env_path = os.getenv("DB_PATH")
-        resolved = Path(db_path or env_path or DEFAULT_DB_PATH).expanduser().resolve()
-        self.db_path = resolved
+        raw = Path(db_path or env_path or DEFAULT_DB_PATH).expanduser()
+        self.db_path = Path(os.path.abspath(str(raw)))
+
+    def _ensure_private_permissions(self) -> None:
+        parent = self.db_path.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            st = parent.stat()
+            if st.st_uid == os.getuid() and not (st.st_mode & 0o1000):
+                os.chmod(parent, 0o700)
+        except OSError:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.db_path}{suffix}")
+            if candidate.is_symlink():
+                raise RuntimeError(f"Refusing to open symlinked database path: {candidate}")
+        try:
+            fd = os.open(
+                str(self.db_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+            )
+            os.close(fd)
+        except FileExistsError:
+            pass
+
+    def _harden_db_file_permissions(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(f"{self.db_path}{suffix}")
+            try:
+                if target.exists() and not target.is_symlink():
+                    st = target.stat()
+                    if st.st_uid == os.getuid():
+                        os.chmod(target, 0o600)
+            except OSError:
+                pass
 
     def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_permissions()
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        self._harden_db_file_permissions()
         return conn
 
     def init_db(self) -> None:
@@ -563,6 +598,7 @@ class TriageDB:
                     raw_text_normalized TEXT NOT NULL,
                     release_key TEXT,
                     quality_key TEXT NOT NULL DEFAULT '',
+                    evidence_key TEXT NOT NULL DEFAULT '',
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
                     canonical_title TEXT NOT NULL,
@@ -605,6 +641,10 @@ class TriageDB:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN quality_key TEXT NOT NULL DEFAULT ''"
                 )
+            if "evidence_key" not in cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN evidence_key TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_quality
@@ -617,6 +657,25 @@ class TriageDB:
                     ON evaluations (release_key, quality_key, created_at DESC)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_raw_qual_ev
+                    ON evaluations (raw_text_normalized, quality_key, evidence_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_qual_ev
+                    ON evaluations (lower(imdb_id), quality_key, evidence_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_qual_ev
+                    ON evaluations (release_key, quality_key, evidence_key, created_at DESC)
+                """
+            )
+        self._harden_db_file_permissions()
 
     def get_cached_evaluation(
         self,
@@ -626,54 +685,66 @@ class TriageDB:
         hint_year: Optional[int] = None,
         extra_context: Optional[str] = None,
         quality_key: Optional[str] = None,
+        evidence_key: str = "",
+        allow_imdb_lookup: bool = True,
         ttl_hours: int = 72,
     ) -> Optional[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
             timespec="seconds"
         )
         norm_raw = normalize_raw_text(raw_text)
-        imdb_id = extract_imdb_id(raw_text, extra_context)
+        imdb_id = extract_imdb_id(raw_text, extra_context) if allow_imdb_lookup else None
         rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
+        query_year: Optional[int] = hint_year
+        if query_year is None and rel_key:
+            tail = rel_key.rsplit(" ", 1)[-1]
+            if YEAR_RE.match(tail):
+                query_year = int(tail)
         q_key = (
             quality_key
             if quality_key is not None
             else parse_release_quality(raw_text).cache_key
         )
+        ev_key = (evidence_key or "").strip()
 
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT response_json
+                SELECT response_json, year
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND quality_key = ? AND created_at >= ?
+                WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, q_key, cutoff),
+                (norm_raw, q_key, ev_key, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
-                row = conn.execute(
+                candidate = conn.execute(
                     """
-                    SELECT response_json
+                    SELECT response_json, year
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND quality_key = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), q_key, cutoff),
+                    (imdb_id.lower(), q_key, ev_key, cutoff),
                 ).fetchone()
+                if candidate is not None:
+                    cached_year = int(candidate["year"])
+                    if query_year is None or abs(cached_year - query_year) <= 1:
+                        row = candidate
 
             if row is None and rel_key:
                 row = conn.execute(
                     """
-                    SELECT response_json
+                    SELECT response_json, year
                     FROM evaluations
-                    WHERE release_key = ? AND quality_key = ? AND created_at >= ?
+                    WHERE release_key = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, q_key, cutoff),
+                    (rel_key, q_key, ev_key, cutoff),
                 ).fetchone()
 
         if row is None:
@@ -689,6 +760,7 @@ class TriageDB:
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
         quality_key: Optional[str] = None,
+        evidence_key: str = "",
         created_at: Optional[str] = None,
     ) -> None:
         identification = payload["identification"]
@@ -709,24 +781,25 @@ class TriageDB:
             if quality_key is not None
             else parse_release_quality(raw_text).cache_key
         )
+        ev_key = (evidence_key or "").strip()
         ts = created_at or utc_now_iso()
         serialized = json.dumps(payload, ensure_ascii=False)
 
         with self._connect() as conn:
-            # Replace superseded entries for the same movie AND release quality tier
+            # Replace superseded entries for the same movie, quality tier, AND evidence digest
             conn.execute(
-                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ?",
-                (norm_raw, q_key),
+                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ?",
+                (norm_raw, q_key, ev_key),
             )
             if imdb_id:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ?",
-                    (imdb_id, q_key),
+                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ?",
+                    (imdb_id, q_key, ev_key),
                 )
             elif rel_key:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ?",
-                    (rel_key, q_key),
+                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ? AND evidence_key = ?",
+                    (rel_key, q_key, ev_key),
                 )
 
             conn.execute(
@@ -735,6 +808,7 @@ class TriageDB:
                     raw_text_normalized,
                     release_key,
                     quality_key,
+                    evidence_key,
                     raw_text_original,
                     imdb_id,
                     canonical_title,
@@ -742,12 +816,13 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
                     rel_key,
                     q_key,
+                    ev_key,
                     raw_text,
                     imdb_id,
                     canonical_title,
@@ -757,6 +832,7 @@ class TriageDB:
                     ts,
                 ),
             )
+        self._harden_db_file_permissions()
 
     def get_cache_entries_count(self, ttl_hours: int = 72) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(

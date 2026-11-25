@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +23,8 @@ TMDB_TIMEOUT_SECONDS = 6.0
 
 _TRACKER_SECRET_RE = re.compile(
     r"https?://\S+|magnet:\S+|www\.\S+"
-    r"|\b(?:passkey|token|password|authorization|cookie|bearer)\b\s*[:=]?\s*\S+"
+    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|authorization|cookie|bearer)\b\s*[:=]?\s*\S+"
+    r"|\bkey\s*=\s*\S+"
     r"|[A-Za-z0-9_-]{48,}",
     re.IGNORECASE,
 )
@@ -75,14 +77,14 @@ _LANGUAGE_TO_ISO: dict[str, set[str]] = {
 }
 
 
-def sanitize_tracker_text(raw: Optional[str], *, max_chars: int = 900) -> str:
-    """Scrub URLs, passkeys, cookies, and control chars from tracker text before LLM use."""
+def sanitize_tracker_text(raw: Optional[str], *, max_chars: Optional[int] = 900) -> str:
+    """Scrub URLs, passkeys, cookies, API keys, and control chars from text."""
     if not raw:
         return ""
     scrubbed = _TRACKER_SECRET_RE.sub("[redacted]", raw)
     cleaned = "".join(" " if unicodedata.category(ch).startswith("C") else ch for ch in scrubbed)
     collapsed = re.sub(r"\s+", " ", cleaned).strip()
-    if len(collapsed) > max_chars:
+    if max_chars is not None and len(collapsed) > max_chars:
         return collapsed[: max_chars - 3].rstrip() + "..."
     return collapsed
 
@@ -529,6 +531,74 @@ def format_torrent_info_for_prompt(
     return "\n".join(lines)
 
 
+def compute_evidence_key(request: EvaluateRequest) -> str:
+    """
+    Build a deterministic, secret-free cache scope digest covering all evidence
+    fields beyond raw_text/quality_key (hints, extra_context, and torrent_info).
+    Returns '' when no supplemental evidence is provided so plain release lookups
+    preserve cross-language/alias cache sharing.
+    """
+    evidence: dict[str, Any] = {}
+
+    if request.hint_title and request.hint_title.strip():
+        evidence["hint_title"] = re.sub(r"\s+", " ", request.hint_title.strip().lower())
+    if request.hint_year is not None:
+        evidence["hint_year"] = int(request.hint_year)
+    if request.extra_context and request.extra_context.strip():
+        clean_extra = sanitize_tracker_text(request.extra_context, max_chars=None).lower()
+        if clean_extra:
+            evidence["extra_context"] = clean_extra
+
+    tinfo = request.torrent_info
+    if tinfo is not None:
+        t_dict: dict[str, Any] = {}
+        if tinfo.indexer and tinfo.indexer.strip():
+            t_dict["indexer"] = tinfo.indexer.strip().lower()
+        if tinfo.category and tinfo.category.strip():
+            t_dict["category"] = tinfo.category.strip().lower()
+        if tinfo.imdb_id and tinfo.imdb_id.strip():
+            t_dict["imdb_id"] = tinfo.imdb_id.strip().lower()
+        if tinfo.tmdb_id is not None:
+            t_dict["tmdb_id"] = int(tinfo.tmdb_id)
+        effective_runtime = tinfo.runtime_minutes or extract_nfo_runtime_minutes(tinfo.nfo_text)
+        if effective_runtime is not None:
+            t_dict["runtime_minutes"] = int(effective_runtime)
+        if tinfo.audio_languages:
+            langs = sorted({lang.strip().lower() for lang in tinfo.audio_languages if lang.strip()})
+            if langs:
+                t_dict["audio_languages"] = langs
+        if tinfo.resolution and tinfo.resolution.strip():
+            t_dict["resolution"] = tinfo.resolution.strip().lower()
+        if tinfo.source and tinfo.source.strip():
+            t_dict["source"] = tinfo.source.strip().lower()
+        if tinfo.dynamic_range:
+            dr_tags = sorted({tag.strip().lower() for tag in tinfo.dynamic_range if tag.strip()})
+            if dr_tags:
+                t_dict["dynamic_range"] = dr_tags
+        if tinfo.media_processing and tinfo.media_processing.strip():
+            t_dict["media_processing"] = tinfo.media_processing.strip().lower()
+        if tinfo.group and tinfo.group.strip():
+            t_dict["group"] = tinfo.group.strip().lower()
+        if tinfo.size_gb is not None:
+            t_dict["size_gb"] = round(float(tinfo.size_gb), 2)
+        if tinfo.freeleech is not None:
+            t_dict["freeleech"] = bool(tinfo.freeleech)
+        clean_desc = sanitize_tracker_text(tinfo.description, max_chars=None)
+        if clean_desc:
+            t_dict["description"] = clean_desc
+        clean_nfo = sanitize_tracker_text(tinfo.nfo_text, max_chars=None)
+        if clean_nfo:
+            t_dict["nfo_text"] = clean_nfo
+        if t_dict:
+            evidence["torrent_info"] = t_dict
+
+    if not evidence:
+        return ""
+
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "ev1:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
 class TmdbClient:
     def __init__(
         self,
@@ -745,19 +815,31 @@ class TmdbClient:
         )
         audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
 
-        # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context (not tracker)
+        # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context
+        # Cross-check against release title/year/MediaInfo whenever those signals exist.
+        tracker_conflict: Optional[str] = None
         direct_imdb = extract_imdb_id(request.raw_text, request.extra_context)
         if direct_imdb:
             direct_tmdb_id = self._find_tmdb_id_by_imdb(direct_imdb)
             if direct_tmdb_id is not None:
-                return TmdbLookupResult(
-                    movie=self._fetch_movie_details(direct_tmdb_id),
-                    tracker_conflict=None,
-                    trusted_for_cache=True,
+                direct_movie = self._fetch_movie_details(direct_tmdb_id)
+                conflict = check_tracker_movie_consistency(
+                    direct_movie,
+                    query_title=query_title,
+                    query_year=query_year,
+                    nfo_runtime=nfo_runtime,
+                    audio_languages=audio_languages,
                 )
+                if conflict is None:
+                    return TmdbLookupResult(
+                        movie=direct_movie,
+                        tracker_conflict=None,
+                        trusted_for_cache=True,
+                    )
+                logger.warning("Rejecting conflicting direct IMDb TMDB candidate: %s", conflict)
+                tracker_conflict = conflict
 
         # 2) Check tracker-supplied TMDB/IMDb ID — ALWAYS cross-checked against release & MediaInfo!
-        tracker_conflict: Optional[str] = None
         if tinfo is not None and (tinfo.tmdb_id is not None or tinfo.imdb_id):
             tracker_tmdb_id: Optional[int] = tinfo.tmdb_id
             if tracker_tmdb_id is None and tinfo.imdb_id:
@@ -834,10 +916,16 @@ class TmdbClient:
                 timeout=self.timeout_seconds + 4.0,
             )
         except (urllib.error.URLError, TimeoutError, asyncio.TimeoutError, ValueError, KeyError) as exc:
-            logger.warning("TMDB pre-lookup failed (falling back to Gemini-only): %s", exc)
+            logger.warning(
+                "TMDB pre-lookup failed (falling back to Gemini-only): %s",
+                sanitize_tracker_text(str(exc), max_chars=240),
+            )
             return TmdbLookupResult()
         except Exception as exc:
-            logger.warning("Unexpected TMDB pre-lookup error: %s", exc)
+            logger.warning(
+                "Unexpected TMDB pre-lookup error: %s",
+                sanitize_tracker_text(str(exc), max_chars=240),
+            )
             return TmdbLookupResult()
 
     async def lookup_from_request(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
@@ -853,8 +941,14 @@ class TmdbClient:
                 timeout=self.timeout_seconds + 2.0,
             )
         except (urllib.error.URLError, TimeoutError, asyncio.TimeoutError, ValueError, KeyError) as exc:
-            logger.warning("TMDB post-verification failed: %s", exc)
+            logger.warning(
+                "TMDB post-verification failed: %s",
+                sanitize_tracker_text(str(exc), max_chars=240),
+            )
             return None
         except Exception as exc:
-            logger.warning("Unexpected TMDB post-verification error: %s", exc)
+            logger.warning(
+                "Unexpected TMDB post-verification error: %s",
+                sanitize_tracker_text(str(exc), max_chars=240),
+            )
             return None

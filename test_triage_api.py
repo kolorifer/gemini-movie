@@ -642,6 +642,475 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertEqual(items[0].decision, "SKIP")
                 self.assertEqual(items[0].note, "Changed mind")
 
+    def test_internal_token_auth_enforcement_and_health_bypass(self) -> None:
+        from fastapi.testclient import TestClient
+        import main
+        from tmdb_client import TmdbLookupResult
+
+        gemini_raw = _sample_payload(imdb_id="tt14561712", tmdb_id=837335)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            mock_tmdb = TmdbClient(api_key="")
+            mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                return_value=TmdbLookupResult()
+            )
+            mock_gemini_eval = AsyncMock(return_value=gemini_raw)
+
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", mock_tmdb),
+                patch.object(main.gemini_client, "evaluate", mock_gemini_eval),
+                patch.object(main, "INTERNAL_API_SECRET", "s3cr3t-loopback-token"),
+                TestClient(main.app) as client,
+            ):
+                # /health stays unauthenticated and reports auth_enabled=True
+                health = client.get("/health")
+                self.assertEqual(health.status_code, 200)
+                self.assertTrue(health.json()["auth_enabled"])
+
+                # Missing or wrong X-Internal-Token returns 401 across protected endpoints
+                for method, path, body in (
+                    ("POST", "/evaluate", {"raw_text": "La.Chimera.2023.1080p.REMUX-GRP"}),
+                    ("POST", "/feedback", {"title": "La Chimera", "decision": "watch"}),
+                    ("GET", "/feedback", None),
+                    ("GET", "/recent", None),
+                ):
+                    r_missing = client.request(method, path, json=body)
+                    self.assertEqual(r_missing.status_code, 401)
+                    self.assertEqual(r_missing.json(), {"detail": "Unauthorized"})
+
+                    r_wrong = client.request(
+                        method,
+                        path,
+                        json=body,
+                        headers={"X-Internal-Token": "wrong-token"},
+                    )
+                    self.assertEqual(r_wrong.status_code, 401)
+
+                # Valid X-Internal-Token succeeds
+                headers = {"X-Internal-Token": "s3cr3t-loopback-token"}
+                r_eval = client.post(
+                    "/evaluate",
+                    json={"raw_text": "La.Chimera.2023.1080p.REMUX-GRP"},
+                    headers=headers,
+                )
+                self.assertEqual(r_eval.status_code, 200)
+                self.assertFalse(r_eval.json()["cached"])
+
+                r_fb = client.post(
+                    "/feedback",
+                    json={"title": "La Chimera", "imdb_id": "tt14561712", "decision": "watch"},
+                    headers=headers,
+                )
+                self.assertEqual(r_fb.status_code, 200)
+                self.assertEqual(r_fb.json()["status"], "saved")
+                self.assertEqual(client.get("/feedback", headers=headers).status_code, 200)
+                self.assertEqual(client.get("/recent", headers=headers).status_code, 200)
+
+            # Backward-compatible mode when INTERNAL_API_SECRET is empty
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "INTERNAL_API_SECRET", ""),
+                TestClient(main.app) as client,
+            ):
+                health_open = client.get("/health")
+                self.assertEqual(health_open.status_code, 200)
+                self.assertFalse(health_open.json()["auth_enabled"])
+                self.assertEqual(client.get("/recent").status_code, 200)
+
+    def test_compute_evidence_key_sensitivity_and_empty_parity(self) -> None:
+        from schemas import TorrentInfo
+        from tmdb_client import compute_evidence_key
+
+        # Plain release string and all-empty TorrentInfo both map to ""
+        self.assertEqual(compute_evidence_key(EvaluateRequest(raw_text="La.Chimera.2023")), "")
+        self.assertEqual(
+            compute_evidence_key(EvaluateRequest(raw_text="La.Chimera.2023", torrent_info=TorrentInfo())),
+            "",
+        )
+
+        base_req = EvaluateRequest(
+            raw_text="The.Furious.2025.2160p.UHD.BluRay.REMUX-GRP",
+            torrent_info=TorrentInfo(
+                indexer="TorrentLeech",
+                imdb_id="tt33311069",
+                runtime_minutes=113,
+                audio_languages=["Cantonese", "English"],
+                freeleech=False,
+                size_gb=64.25,
+                description="Clean disc description",
+            ),
+        )
+        base_key = compute_evidence_key(base_req)
+        self.assertTrue(base_key.startswith("ev1:"))
+
+        # Order-insensitive lists and case-insensitive tokens produce identical digest
+        same_req = EvaluateRequest(
+            raw_text="The.Furious.2025.2160p.UHD.BluRay.REMUX-GRP",
+            torrent_info=TorrentInfo(
+                indexer="torrentleech",
+                imdb_id="TT33311069",
+                runtime_minutes=113,
+                audio_languages=["english", "cantonese"],
+                freeleech=False,
+                size_gb=64.2501,
+                description="Clean disc description",
+            ),
+        )
+        self.assertEqual(compute_evidence_key(same_req), base_key)
+
+        # Changing freeleech False -> True, imdb_id, runtime, or description changes digest
+        self.assertNotEqual(
+            compute_evidence_key(
+                base_req.model_copy(
+                    update={"torrent_info": base_req.torrent_info.model_copy(update={"freeleech": True})}  # type: ignore[union-attr]
+                )
+            ),
+            base_key,
+        )
+        self.assertNotEqual(
+            compute_evidence_key(
+                base_req.model_copy(
+                    update={"torrent_info": base_req.torrent_info.model_copy(update={"freeleech": None})}  # type: ignore[union-attr]
+                )
+            ),
+            base_key,
+        )
+        self.assertNotEqual(
+            compute_evidence_key(
+                base_req.model_copy(
+                    update={"torrent_info": base_req.torrent_info.model_copy(update={"runtime_minutes": 95})}  # type: ignore[union-attr]
+                )
+            ),
+            base_key,
+        )
+        self.assertNotEqual(
+            compute_evidence_key(
+                base_req.model_copy(
+                    update={"torrent_info": base_req.torrent_info.model_copy(update={"imdb_id": "tt0000010"})}  # type: ignore[union-attr]
+                )
+            ),
+            base_key,
+        )
+        self.assertNotEqual(
+            compute_evidence_key(EvaluateRequest(raw_text="Film", hint_year=1999)),
+            compute_evidence_key(EvaluateRequest(raw_text="Film", hint_year=2024)),
+        )
+
+        # Secret URLs in description are scrubbed prior to hashing
+        k_url_a = compute_evidence_key(
+            EvaluateRequest(
+                raw_text="Film.2024",
+                torrent_info=TorrentInfo(description="See https://tracker.example/dl?passkey=aaa"),
+            )
+        )
+        k_url_b = compute_evidence_key(
+            EvaluateRequest(
+                raw_text="Film.2024",
+                torrent_info=TorrentInfo(description="See https://tracker.example/dl?passkey=bbb"),
+            )
+        )
+        self.assertEqual(k_url_a, k_url_b)
+
+    def test_evaluate_cache_scoped_by_evidence_key_and_blocks_poisoned_imdb(self) -> None:
+        import main
+        from schemas import TorrentInfo
+        from tmdb_client import TmdbLookupResult
+
+        movie_2025 = _sample_payload(
+            title="Silent Night, Deadly Night",
+            year=2025,
+            director="Mike P. Nelson",
+            imdb_id="tt33000025",
+            tmdb_id=202599,
+            runtime_minutes=97,
+        )
+        movie_1984 = _sample_payload(
+            title="Silent Night, Deadly Night",
+            year=1984,
+            director="Charles E. Sellier Jr.",
+            imdb_id="tt0088117",
+            tmdb_id=198499,
+            runtime_minutes=79,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            # Pre-seed 1984 original in cache under plain evidence_key=""
+            test_db.save_evaluation(
+                "Silent.Night.Deadly.Night.1984.2160p.UHD.BluRay.REMUX-GRP",
+                movie_1984.model_dump(),
+            )
+
+            mock_tmdb = TmdbClient(api_key="dummy-key")
+            mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                return_value=TmdbLookupResult(
+                    movie=None,
+                    tracker_conflict="year mismatch",
+                    trusted_for_cache=False,
+                )
+            )
+            mock_tmdb.verify_identification = AsyncMock(return_value=None)  # type: ignore[method-assign]
+            mock_gemini_eval = AsyncMock(return_value=movie_2025)
+
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", mock_tmdb),
+                patch.object(main.gemini_client, "evaluate", mock_gemini_eval),
+            ):
+                # 1) Plain 2025 release with poisoned 1984 IMDb in extra_context MUST NOT hit 1984 cache
+                r1 = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            extra_context="tt0088117",
+                        )
+                    )
+                )
+                self.assertFalse(r1.cached)
+                self.assertEqual(r1.identification.year, 2025)
+                self.assertEqual(mock_gemini_eval.await_count, 1)
+
+                # 2) Same 2025 release with new MediaInfo/tracker evidence MUST miss cache
+                tinfo_a = TorrentInfo(
+                    indexer="TorrentLeech",
+                    imdb_id="tt0088117",
+                    runtime_minutes=97,
+                    freeleech=False,
+                )
+                r2 = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            torrent_info=tinfo_a,
+                        )
+                    )
+                )
+                self.assertFalse(r2.cached)
+                self.assertEqual(mock_gemini_eval.await_count, 2)
+
+                # 3) Identical evidence hits cache
+                r3 = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            torrent_info=tinfo_a,
+                        )
+                    )
+                )
+                self.assertTrue(r3.cached)
+                self.assertEqual(mock_gemini_eval.await_count, 2)
+
+                # 4) Changed evidence (freeleech False -> True) misses cache
+                r4 = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            torrent_info=tinfo_a.model_copy(update={"freeleech": True}),
+                        )
+                    )
+                )
+                self.assertFalse(r4.cached)
+                self.assertEqual(mock_gemini_eval.await_count, 3)
+
+    def test_db_legacy_migration_private_permissions_and_symlink_rejection(self) -> None:
+        import json
+        import os
+        import sqlite3
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "private_data"
+            data_dir.mkdir(mode=0o755)
+            db_file = data_dir / "triage.db"
+
+            # Create a legacy evaluations table missing quality_key and evidence_key
+            legacy_payload = _sample_payload(
+                title="Silent Night, Deadly Night",
+                year=1984,
+                imdb_id="tt0088117",
+            ).model_dump()
+            with sqlite3.connect(str(db_file)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE evaluations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        raw_text_normalized TEXT NOT NULL,
+                        release_key TEXT,
+                        raw_text_original TEXT NOT NULL,
+                        imdb_id TEXT,
+                        canonical_title TEXT NOT NULL,
+                        year INTEGER NOT NULL,
+                        verdict TEXT NOT NULL,
+                        response_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO evaluations (
+                        raw_text_normalized, release_key, raw_text_original,
+                        imdb_id, canonical_title, year, verdict, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "silent night deadly night 1984",
+                        "silent night deadly night 1984",
+                        "Silent Night Deadly Night 1984",
+                        "tt0088117",
+                        "Silent Night, Deadly Night",
+                        1984,
+                        "WATCH",
+                        json.dumps(legacy_payload),
+                        "2099-01-01T00:00:00+00:00",
+                    ),
+                )
+
+            db = TriageDB(db_file)
+            db.init_db()
+
+            # Directory is tightened to 0700 and DB file to 0600
+            self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(db_file.stat().st_mode), 0o600)
+
+            # Migrated row is readable with empty evidence_key, and blocked across remake years
+            hit = db.get_cached_evaluation("Silent Night Deadly Night 1984")
+            self.assertIsNotNone(hit)
+            cross_year_miss = db.get_cached_evaluation(
+                "Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                extra_context="tt0088117",
+                quality_key="",
+                evidence_key="",
+            )
+            self.assertIsNone(cross_year_miss)
+
+            # Symlinked DB path is rejected
+            link_path = data_dir / "link.db"
+            os.symlink(db_file, link_path)
+            with self.assertRaises(RuntimeError):
+                TriageDB(link_path).init_db()
+
+    def test_secret_redaction_in_prompts_and_upstream_errors(self) -> None:
+        from gemini_client import GeminiClientError, GeminiTriageClient, build_system_instruction
+
+        req = EvaluateRequest(
+            raw_text="La.Chimera.2023.1080p.REMUX-GRP",
+            extra_context="tt14561712 https://tracker.example/dl?passkey=secret999 api_key=abc123",
+        )
+        prompt = build_user_prompt(req)
+        self.assertIn("tt14561712", prompt)
+        self.assertNotIn("secret999", prompt)
+        self.assertNotIn("abc123", prompt)
+        self.assertNotIn("tracker.example", prompt)
+
+        sys_instr = build_system_instruction(
+            "Taste profile",
+            [{"decision": "WATCH", "title": "La Chimera", "note": "cookie=topsecret https://evil.test/x"}],
+        )
+        self.assertNotIn("topsecret", sys_instr)
+        self.assertNotIn("evil.test", sys_instr)
+
+        # GeminiClientError redacts API key / URL from upstream exception messages
+        client = GeminiTriageClient(api_key="AIzaDummyKeyForTest")
+        with patch.object(
+            client,
+            "_call_sync",
+            side_effect=RuntimeError(
+                "Request to https://generativelanguage.googleapis.com/v1?key=AIzaSuperSecretKey failed"
+            ),
+        ):
+            with self.assertRaises(GeminiClientError) as ctx:
+                asyncio.run(client.evaluate(req, []))
+            self.assertNotIn("AIzaSuperSecretKey", str(ctx.exception))
+            self.assertNotIn("googleapis.com", str(ctx.exception))
+
+        # TMDB client warning logs redact v3 api_key URLs
+        tmdb = TmdbClient(api_key="0123456789abcdef0123456789abcdef")
+        with (
+            patch.object(
+                tmdb,
+                "_lookup_with_diagnostics_sync",
+                side_effect=urllib.error.URLError(
+                    "https://api.themoviedb.org/3/movie/1?api_key=0123456789abcdef0123456789abcdef"
+                ),
+            ),
+            self.assertLogs("tmdb_client", level="WARNING") as logs,
+        ):
+            res = asyncio.run(tmdb.lookup_with_diagnostics(req))
+            self.assertIsNone(res.movie)
+            combined_logs = "\n".join(logs.output)
+            self.assertNotIn("0123456789abcdef0123456789abcdef", combined_logs)
+
+    def test_direct_imdb_conflict_rejected_while_bare_imdb_resolves(self) -> None:
+        client = TmdbClient(api_key="0123456789abcdef0123456789abcdef")
+        movie_1984 = TmdbMovie(
+            tmdb_id=10,
+            canonical_title="Silent Night, Deadly Night",
+            original_title="Silent Night, Deadly Night",
+            year=1984,
+            imdb_id="tt0088117",
+            runtime_minutes=79,
+            original_language="en",
+        )
+        movie_2025 = TmdbMovie(
+            tmdb_id=20,
+            canonical_title="Silent Night, Deadly Night",
+            original_title="Silent Night, Deadly Night",
+            year=2025,
+            imdb_id="tt33000025",
+            runtime_minutes=97,
+            original_language="en",
+        )
+
+        with (
+            patch.object(client, "_find_tmdb_id_by_imdb", return_value=10),
+            patch.object(
+                client,
+                "_search_results",
+                return_value=[
+                    {
+                        "id": 20,
+                        "title": "Silent Night, Deadly Night",
+                        "original_title": "Silent Night, Deadly Night",
+                        "release_date": "2025-12-01",
+                        "popularity": 20.0,
+                    }
+                ],
+            ),
+            patch.object(
+                client,
+                "_fetch_movie_details",
+                side_effect=lambda tid: movie_1984 if tid == 10 else movie_2025,
+            ),
+        ):
+            # Conflicting 1984 IMDb in extra_context for a 2025 release is flagged & falls back to 2025
+            res_conflict = asyncio.run(
+                client.lookup_with_diagnostics(
+                    EvaluateRequest(
+                        raw_text="Silent.Night.Deadly.Night.2025.2160p.UHD.BluRay.REMUX-GRP",
+                        extra_context="tt0088117",
+                    )
+                )
+            )
+            self.assertIsNotNone(res_conflict.tracker_conflict)
+            self.assertFalse(res_conflict.trusted_for_cache)
+            self.assertIsNotNone(res_conflict.movie)
+            assert res_conflict.movie is not None
+            self.assertEqual(res_conflict.movie.tmdb_id, 20)
+
+            # Bare IMDb lookup with no conflicting title/year still resolves directly
+            res_bare = asyncio.run(
+                client.lookup_with_diagnostics(EvaluateRequest(raw_text="tt0088117"))
+            )
+            self.assertIsNone(res_bare.tracker_conflict)
+            self.assertTrue(res_bare.trusted_for_cache)
+            self.assertIsNotNone(res_bare.movie)
+            assert res_bare.movie is not None
+            self.assertEqual(res_bare.movie.tmdb_id, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

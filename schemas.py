@@ -196,6 +196,7 @@ class HealthResponse(BaseModel):
     port: int
     cache_entries: int
     tmdb_enabled: bool = False
+    auth_enabled: bool = False
 
 
 class RecentEvaluationItem(BaseModel):

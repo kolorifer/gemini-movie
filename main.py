@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import hmac
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from db import TriageDB, parse_release_quality
 from gemini_client import GeminiClientError, GeminiTimeoutError, GeminiTriageClient
@@ -21,6 +25,7 @@ from schemas import (
 from tmdb_client import (
     TmdbClient,
     apply_tmdb_verification,
+    compute_evidence_key,
     format_torrent_info_for_prompt,
     is_tmdb_compatible,
 )
@@ -28,9 +33,12 @@ from tmdb_client import (
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+logger = logging.getLogger(__name__)
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
 PORT = int(os.getenv("PORT", "8000"))
 CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "72"))
+INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "").strip()
 
 db = TriageDB(BASE_DIR / "data" / "triage.db")
 gemini_client = GeminiTriageClient(
@@ -41,31 +49,56 @@ gemini_client = GeminiTriageClient(
 tmdb_client = TmdbClient(api_key=os.getenv("TMDB_API_KEY", "").strip())
 
 
+def require_internal_token(
+    x_internal_token: Optional[str] = Header(default=None, alias="X-Internal-Token"),
+) -> None:
+    expected = INTERNAL_API_SECRET.strip()
+    if not expected:
+        return
+    if not x_internal_token or not hmac.compare_digest(
+        x_internal_token.encode("utf-8"),
+        expected.encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db.init_db()
+    await asyncio.to_thread(db.init_db)
+    if not INTERNAL_API_SECRET.strip():
+        logger.warning(
+            "INTERNAL_API_SECRET is not set; loopback endpoints are unauthenticated"
+        )
     yield
 
 
 app = FastAPI(
     title="Movie Triage API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
+    cache_entries = await asyncio.to_thread(
+        db.get_cache_entries_count, ttl_hours=CACHE_TTL_HOURS
+    )
     return HealthResponse(
         status="ok",
         model=GEMINI_MODEL,
         port=PORT,
-        cache_entries=db.get_cache_entries_count(ttl_hours=CACHE_TTL_HOURS),
+        cache_entries=cache_entries,
         tmdb_enabled=tmdb_client.enabled,
+        auth_enabled=bool(INTERNAL_API_SECRET.strip()),
     )
 
 
-@app.post("/evaluate", response_model=EvaluateResponse)
+@app.post(
+    "/evaluate",
+    response_model=EvaluateResponse,
+    dependencies=[Depends(require_internal_token)],
+)
 async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     tinfo = payload.torrent_info
     release_quality = parse_release_quality(
@@ -78,14 +111,18 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         nfo_text=tinfo.nfo_text if tinfo else None,
         description=tinfo.description if tinfo else None,
     )
+    evidence_key = compute_evidence_key(payload)
 
     if not payload.force_refresh:
-        cached = db.get_cached_evaluation(
+        cached = await asyncio.to_thread(
+            db.get_cached_evaluation,
             payload.raw_text,
             hint_title=payload.hint_title,
             hint_year=payload.hint_year,
             extra_context=payload.extra_context,
             quality_key=release_quality.cache_key,
+            evidence_key=evidence_key,
+            allow_imdb_lookup=False,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached is not None:
@@ -95,25 +132,28 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     tmdb_movie = lookup.movie
 
     # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
-    # and the cached evaluation matches the incoming release quality tier.
+    # and both quality tier and supplemental evidence digest match.
     if (
         not payload.force_refresh
         and lookup.trusted_for_cache
         and tmdb_movie is not None
         and tmdb_movie.imdb_id
     ):
-        cached_by_imdb = db.get_cached_evaluation(
+        cached_by_imdb = await asyncio.to_thread(
+            db.get_cached_evaluation,
             payload.raw_text,
             hint_title=tmdb_movie.canonical_title,
             hint_year=tmdb_movie.year,
             extra_context=tmdb_movie.imdb_id,
             quality_key=release_quality.cache_key,
+            evidence_key=evidence_key,
+            allow_imdb_lookup=True,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached_by_imdb is not None:
             return EvaluateResponse(cached=True, **cached_by_imdb)
 
-    recent_feedback = db.get_recent_feedback(limit=20)
+    recent_feedback = await asyncio.to_thread(db.get_recent_feedback, limit=20)
     tmdb_context = tmdb_movie.to_prompt_block() if tmdb_movie is not None else None
     torrent_context = format_torrent_info_for_prompt(
         payload.torrent_info,
@@ -139,19 +179,26 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
 
     verified_result = apply_tmdb_verification(result, tmdb_movie)
     result_dict = verified_result.model_dump()
-    db.save_evaluation(
+    await asyncio.to_thread(
+        db.save_evaluation,
         payload.raw_text,
         result_dict,
         hint_title=payload.hint_title,
         hint_year=payload.hint_year,
         quality_key=release_quality.cache_key,
+        evidence_key=evidence_key,
     )
     return EvaluateResponse(cached=False, **result_dict)
 
 
-@app.post("/feedback", response_model=FeedbackResponse)
+@app.post(
+    "/feedback",
+    response_model=FeedbackResponse,
+    dependencies=[Depends(require_internal_token)],
+)
 async def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
-    total = db.add_feedback(
+    total = await asyncio.to_thread(
+        db.add_feedback,
         imdb_id=payload.imdb_id,
         title=payload.title,
         decision=payload.decision,
@@ -164,13 +211,21 @@ async def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
     )
 
 
-@app.get("/feedback", response_model=list[FeedbackItem])
+@app.get(
+    "/feedback",
+    response_model=list[FeedbackItem],
+    dependencies=[Depends(require_internal_token)],
+)
 async def list_feedback(limit: int = Query(default=20, ge=1, le=50)) -> list[FeedbackItem]:
-    rows = db.get_recent_feedback(limit=limit)
+    rows = await asyncio.to_thread(db.get_recent_feedback, limit=limit)
     return [FeedbackItem(**row) for row in rows]
 
 
-@app.get("/recent", response_model=list[RecentEvaluationItem])
+@app.get(
+    "/recent",
+    response_model=list[RecentEvaluationItem],
+    dependencies=[Depends(require_internal_token)],
+)
 async def recent(limit: int = Query(default=20, ge=1, le=100)) -> list[RecentEvaluationItem]:
-    rows = db.get_recent_evaluations(limit=limit)
+    rows = await asyncio.to_thread(db.get_recent_evaluations, limit=limit)
     return [RecentEvaluationItem(**row) for row in rows]
