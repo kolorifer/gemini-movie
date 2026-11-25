@@ -67,15 +67,18 @@ def build_system_instruction(
         "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
         "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
         "disambiguation_note.",
-        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) and "
-        "FAVORITE RELEASE GROUP (e.g., CiNEPHiLES) as soft edge-case tie-breakers per the user's "
-        "taste profile: strongly prefer Remux-2160p over Remux-1080p, treat Dolby Vision (DV/DoVi) "
-        "as a meaningful visual bonus, and treat releases from a favorite group like CiNEPHiLES as "
-        "a strong positive signal for both technical care and curated selection. Never treat these "
-        "as hard rules — do NOT upgrade a clearly weak film to WATCH solely for 2160p DV or group, "
-        "and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. Only mention "
-        "release quality or release group in verdict_reason or red_flags when it meaningfully "
-        "influences the decision.",
+        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision Profile 7 FEL vs "
+        "MEL / Profile 8 / HDR / SDR) and FAVORITE RELEASE GROUP (e.g., CiNEPHiLES) as soft "
+        "edge-case tie-breakers per the user's taste profile: treat Remux-2160p with Dolby Vision "
+        "Profile 7 FEL as a HUGE positive bonus (above P7 MEL / P8 / generic DV > HDR/SDR > "
+        "Remux-1080p), and treat CiNEPHiLES as a strong positive signal for technical care and "
+        "curated selection. When a 2160p UHD Remux shows Profile 7 (BL+EL+RPU) without explicit "
+        "FEL/MEL in the NFO, you may check via Google Search whether the UHD Blu-ray disc is "
+        "documented as a P7 FEL transfer (clearly note if disc-reported rather than NFO-confirmed; "
+        "never guess if unverified). Never treat format or group as a hard rule — do NOT upgrade "
+        "a clearly weak film to WATCH solely for 2160p DV P7 FEL or group, and do NOT downgrade a "
+        "clearly great film to SKIP solely for 1080p SDR. Mention release quality / P7 FEL / group "
+        "in verdict_reason or red_flags only when it meaningfully influences the decision.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),

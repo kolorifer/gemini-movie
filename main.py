@@ -76,6 +76,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         media_processing=tinfo.media_processing if tinfo else None,
         group=tinfo.group if tinfo else None,
         nfo_text=tinfo.nfo_text if tinfo else None,
+        description=tinfo.description if tinfo else None,
     )
 
     if not payload.force_refresh:

@@ -305,6 +305,83 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         self.assertIsNone(parse_release_quality("Movie 2025 1080p WEB-DL").release_group)
         self.assertIsNone(parse_release_quality("Movie 2025 2160p UHD Blu-ray").release_group)
 
+    def test_dolby_vision_profile7_fel_mel_and_guards(self) -> None:
+        from db import parse_release_quality
+
+        # 1) Standard MediaInfo P7 (BL+EL+RPU without FEL/MEL) -> unconfirmed P7
+        q_p7_unknown = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-TRiToN",
+            nfo_text="HDR format : Dolby Vision, Version 1.0, Profile 7.6, dvhe.07.06, BL+EL+RPU, Blu-ray compatible / SMPTE ST 2086, HDR10 compatible",
+        )
+        self.assertEqual(q_p7_unknown.dv_profile, "7")
+        self.assertIsNone(q_p7_unknown.dv_el_type)
+        self.assertEqual(q_p7_unknown.cache_key, "2160p_remux_dv_p7")
+        self.assertIn("NFO does not specify FEL vs MEL", q_p7_unknown.to_prompt_line() or "")
+
+        # 2) Explicit FEL via new MediaInfo RPU / uploader notes -> P7 FEL top tier
+        q_p7_fel = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-CiNEPHiLES",
+            nfo_text="HDR format : Dolby Vision, Version 1.0, Profile 7.6, dvhe.07.06, BL+EL+RPU, FEL",
+        )
+        self.assertEqual(q_p7_fel.dv_profile, "7")
+        self.assertEqual(q_p7_fel.dv_el_type, "FEL")
+        self.assertEqual(q_p7_fel.dv_el_source, "explicit")
+        self.assertEqual(q_p7_fel.cache_key, "2160p_remux_dv_p7_fel_fav_cinephiles")
+        self.assertIn("TOP PREFERRED TIER", q_p7_fel.to_prompt_line() or "")
+
+        # 3) Explicit [MEL] in CiNEPHiLES description -> P7 MEL
+        q_p7_mel = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-CiNEPHiLES",
+            description="Used superior [MEL] video from Arrow UK UHD Blu-ray",
+        )
+        self.assertEqual(q_p7_mel.dv_profile, "7")
+        self.assertEqual(q_p7_mel.dv_el_type, "MEL")
+        self.assertEqual(q_p7_mel.cache_key, "2160p_remux_dv_p7_mel_fav_cinephiles")
+
+        # 4) BDInfo 1080p EL bitrate heuristic (>=3000 kbps = FEL, <3000 kbps = MEL)
+        q_bd_fel = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-GRP",
+            nfo_text=(
+                "MPEG-H HEVC Video     55123 kbps   2160p / 23.976 fps / 16:9\n"
+                "* MPEG-H HEVC Video    6842 kbps   1080p / 23.976 fps / 16:9"
+            ),
+        )
+        self.assertEqual(q_bd_fel.dv_profile, "7")
+        self.assertEqual(q_bd_fel.dv_el_type, "FEL")
+        self.assertEqual(q_bd_fel.dv_el_source, "bdinfo_bitrate")
+        self.assertEqual(q_bd_fel.cache_key, "2160p_remux_dv_p7_fel")
+
+        q_bd_mel = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-GRP",
+            nfo_text="* MPEG-H HEVC Video    1.25 Mbps   1080p / 23.976 fps / 16:9",
+        )
+        self.assertEqual(q_bd_mel.dv_profile, "7")
+        self.assertEqual(q_bd_mel.dv_el_type, "MEL")
+        self.assertEqual(q_bd_mel.dv_el_source, "bdinfo_bitrate")
+
+        # 5) Profile 8 single-layer + negated FEL guard ("converted from FEL to Profile 8.1")
+        q_p8 = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-GRP",
+            nfo_text="HDR format : Dolby Vision, Version 1.0, dvhe.08.06, BL+RPU",
+            description="Converted from FEL to Profile 8.1 for broad compatibility.",
+        )
+        self.assertEqual(q_p8.dv_profile, "8")
+        self.assertIsNone(q_p8.dv_el_type)
+        self.assertEqual(q_p8.cache_key, "2160p_remux_dv_p8")
+
+        # 6) False-positive guards: "Mel Gibson" prose and ambiguous "FEL/MEL" or dual mention
+        q_prose = parse_release_quality(
+            "Ransom.1996.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-GRP",
+            description="Mel Gibson stars as a wealthy airline executive whose son is kidnapped.",
+        )
+        self.assertIsNone(q_prose.dv_el_type)
+
+        q_both = parse_release_quality(
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-GRP",
+            description="Comparison: US disc [FEL] vs UK disc [MEL] (FEL/MEL noted).",
+        )
+        self.assertIsNone(q_both.dv_el_type)
+
     def test_evaluate_endpoint_wires_tmdb_grounding_and_cache(self) -> None:
         import main
 

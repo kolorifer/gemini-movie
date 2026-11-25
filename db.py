@@ -94,11 +94,111 @@ def extract_release_group(raw_text: str, *, group: Optional[str] = None) -> Opti
     return candidate
 
 
+_DV_P7_RE = re.compile(
+    r"(?<![a-z0-9])(?:dvhe\.07(?:\.\d{2})?|bl\+el\+rpu|profile[\s._-]*7(?:\.\d+)?|dv[\s._-]*p7|dovi[\s._-]*p7|p7[\s._-]*(?:fel|mel))(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_DV_P8_RE = re.compile(
+    r"(?<![a-z0-9])(?:dvhe\.08(?:\.\d{2})?|bl\+rpu|profile[\s._-]*8(?:\.\d+)?|dv[\s._-]*p8|dovi[\s._-]*p8|p8(?:\.1)?)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_DV_P5_RE = re.compile(
+    r"(?<![a-z0-9])(?:dvhe\.05(?:\.\d{2})?|profile[\s._-]*5(?:\.\d+)?|dv[\s._-]*p5|dovi[\s._-]*p5)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_FEL_NEGATED_RE = re.compile(
+    r"\b(?:no|not|without|dropped|drop|stripped|strip|removed|remove|converted\s+from)\s+(?:p7[\s._-]*)?fel\b|\bfel\s*/\s*mel\b|\bmel\s*/\s*fel\b",
+    re.IGNORECASE,
+)
+_FEL_EXPLICIT_RE = re.compile(
+    r"\bfull\s+enhancement\s+layer\b"
+    r"|\b(?:el\s*type|enhancement\s*layer)\s*[:=]\s*fel\b"
+    r"|\b(?:p7|profile[\s._-]*7(?:\.\d+)?|dvhe\.07(?:\.\d{2})?|bl\+el\+rpu)[^.\n]{0,40}\bfel\b"
+    r"|\bfel\b[^.\n]{0,30}\b(?:p7|profile[\s._-]*7|dolby[\s._-]*vision|dovi|dv|enhancement|layer|rpu|remux)\b"
+    r"|\b(?:dolby[\s._-]*vision|dovi|dv)[^.\n]{0,30}\bfel\b",
+    re.IGNORECASE,
+)
+_FEL_BRACKET_RE = re.compile(r"[\[\(]\s*FEL\s*[\]\)]")
+_MEL_EXPLICIT_RE = re.compile(
+    r"\bminim(?:al|um)\s+enhancement\s+layer\b"
+    r"|\b(?:el\s*type|enhancement\s*layer)\s*[:=]\s*mel\b"
+    r"|\b(?:p7|profile[\s._-]*7(?:\.\d+)?|dvhe\.07(?:\.\d{2})?|bl\+el\+rpu)[^.\n]{0,40}\bmel\b"
+    r"|\bmel\b[^.\n]{0,30}\b(?:p7|profile[\s._-]*7|dolby[\s._-]*vision|dovi|dv|enhancement|layer|rpu|remux)\b"
+    r"|\b(?:dolby[\s._-]*vision|dovi|dv)[^.\n]{0,30}\bmel\b",
+    re.IGNORECASE,
+)
+_MEL_BRACKET_RE = re.compile(r"[\[\(]\s*MEL\s*[\]\)]")
+_BDINFO_1080_HEVC_RE = re.compile(
+    r"hevc\s+video[^\n]{0,20}?(\d+(?:[.,]\d+)?)\s*(kbps|mbps)[^\n]{0,20}?1080p",
+    re.IGNORECASE,
+)
+
+
+def _detect_dv_profile_and_el(
+    *,
+    has_dv: bool,
+    resolution: Optional[str],
+    tag_text: str,
+    nfo_text: str,
+    description: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Detect Dolby Vision profile ('7', '8', '5') and Profile 7 enhancement layer
+    ('FEL' vs 'MEL') from explicit tags/NFO/description or BDInfo 1080p EL bitrate.
+    Returns (dv_profile, dv_el_type, dv_el_source).
+    """
+    combined = "\n".join(p for p in (tag_text, nfo_text, description) if p)
+    if not combined:
+        return None, None, None
+
+    dv_profile: Optional[str] = None
+    if _DV_P7_RE.search(combined):
+        dv_profile = "7"
+    elif _DV_P8_RE.search(combined):
+        dv_profile = "8"
+    elif _DV_P5_RE.search(combined):
+        dv_profile = "5"
+
+    # Strip negated / slash-ambiguous phrases (e.g. "not FEL", "FEL/MEL") before EL matching
+    sanitized = _FEL_NEGATED_RE.sub(" ", combined)
+    has_fel = bool(_FEL_EXPLICIT_RE.search(sanitized) or _FEL_BRACKET_RE.search(sanitized))
+    has_mel = bool(_MEL_EXPLICIT_RE.search(sanitized) or _MEL_BRACKET_RE.search(sanitized))
+
+    if has_fel and not has_mel:
+        return (dv_profile or "7"), "FEL", "explicit"
+    if has_mel and not has_fel:
+        return (dv_profile or "7"), "MEL", "explicit"
+    if has_fel and has_mel:
+        # Both FEL and MEL mentioned (e.g. disc comparison notes); stay conservative
+        return (dv_profile or ("7" if has_dv else None)), None, None
+
+    # BDInfo 1080p HEVC enhancement-layer bitrate heuristic (only for 2160p DV / Profile 7)
+    if (has_dv and resolution == "2160p") or dv_profile == "7":
+        bd_source = "\n".join(p for p in (nfo_text, description) if p)
+        match = _BDINFO_1080_HEVC_RE.search(bd_source)
+        if match:
+            raw_num = match.group(1).replace(",", "")
+            unit = match.group(2).lower()
+            try:
+                kbps = float(raw_num) * (1000.0 if unit == "mbps" else 1.0)
+            except ValueError:
+                kbps = 0.0
+            if kbps >= 3000.0:
+                return "7", "FEL", "bdinfo_bitrate"
+            if kbps > 0.0:
+                return "7", "MEL", "bdinfo_bitrate"
+
+    return dv_profile, None, None
+
+
 @dataclass(frozen=True)
 class ReleaseQuality:
     resolution: Optional[str] = None
     is_remux: bool = False
     dolby_vision: bool = False
+    dv_profile: Optional[str] = None
+    dv_el_type: Optional[str] = None
+    dv_el_source: Optional[str] = None
     hdr: bool = False
     hdr_label: str = "unknown"
     format_label: str = "unknown"
@@ -109,8 +209,26 @@ class ReleaseQuality:
     def to_prompt_line(self) -> Optional[str]:
         if not self.cache_key and not self.release_group:
             return None
-        if self.resolution == "2160p" and self.dolby_vision:
-            tier_note = "top preferred tier: 2160p + Dolby Vision bonus (positive tie-breaker on edge cases)"
+
+        if self.resolution == "2160p" and self.dv_profile == "7" and self.dv_el_type == "FEL":
+            via = "BDInfo 1080p EL bitrate" if self.dv_el_source == "bdinfo_bitrate" else "NFO/tracker notes"
+            tier_note = (
+                f"TOP PREFERRED TIER: Remux-2160p + confirmed Dolby Vision Profile 7 FEL ({via}) "
+                "— HUGE positive bonus on edge cases"
+            )
+        elif self.resolution == "2160p" and self.dv_profile == "7" and self.dv_el_type == "MEL":
+            tier_note = (
+                "preferred 2160p + Dolby Vision Profile 7 MEL (strong DV bonus, below Profile 7 FEL)"
+            )
+        elif self.resolution == "2160p" and self.dv_profile == "7":
+            tier_note = (
+                "preferred 2160p + Dolby Vision Profile 7 dual-layer (BL+EL+RPU); NFO does not "
+                "specify FEL vs MEL — check via Google Search if this UHD Blu-ray disc is a known P7 FEL transfer"
+            )
+        elif self.resolution == "2160p" and self.dv_profile == "8":
+            tier_note = "preferred 2160p + Dolby Vision Profile 8 (single-layer DV bonus, below Profile 7 FEL)"
+        elif self.resolution == "2160p" and self.dolby_vision:
+            tier_note = "preferred tier: 2160p + Dolby Vision bonus (profile/FEL unspecified; positive tie-breaker on edge cases)"
         elif self.resolution == "2160p":
             tier_note = "preferred resolution tier: 2160p (strong preference over 1080p on edge cases)"
         elif self.resolution == "1080p" and self.dolby_vision:
@@ -140,8 +258,9 @@ def parse_release_quality(
     media_processing: Optional[str] = None,
     group: Optional[str] = None,
     nfo_text: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> ReleaseQuality:
-    """Deterministically parse release resolution, remux status, Dolby Vision/HDR, and release group."""
+    """Deterministically parse release resolution, remux status, Dolby Vision profile/FEL, HDR, and release group."""
     res_candidates = " ".join(p for p in (resolution or "", raw_text or "", source or "") if p)
     detected_res: Optional[str] = None
     if _RES_2160_RE.search(res_candidates):
@@ -159,17 +278,42 @@ def parse_release_quality(
     dr_joined = " ".join(dynamic_range or [])
     tag_text = " ".join(p for p in (dr_joined, raw_text or "") if p)
     nfo_str = nfo_text or ""
+    desc_str = description or ""
 
     has_dv = bool(_DV_TAG_RE.search(tag_text) or _DV_NFO_RE.search(nfo_str))
+    dv_profile, dv_el_type, dv_el_source = _detect_dv_profile_and_el(
+        has_dv=has_dv,
+        resolution=detected_res,
+        tag_text=tag_text,
+        nfo_text=nfo_str,
+        description=desc_str,
+    )
+    if dv_profile is not None or dv_el_type is not None:
+        has_dv = True
+
     has_hdr10plus = bool(_HDR10PLUS_RE.search(tag_text) or _HDR10PLUS_RE.search(nfo_str))
     has_hdr = has_hdr10plus or bool(_HDR_RE.search(tag_text) or _HDR_RE.search(nfo_str))
 
-    if has_dv and has_hdr10plus:
-        hdr_label = "Dolby Vision + HDR10+"
-    elif has_dv and has_hdr:
-        hdr_label = "Dolby Vision + HDR"
-    elif has_dv:
-        hdr_label = "Dolby Vision"
+    if has_dv:
+        if dv_profile == "7" and dv_el_type == "FEL":
+            dv_label = "Dolby Vision Profile 7 FEL"
+        elif dv_profile == "7" and dv_el_type == "MEL":
+            dv_label = "Dolby Vision Profile 7 MEL"
+        elif dv_profile == "7":
+            dv_label = "Dolby Vision Profile 7 (FEL/MEL unconfirmed)"
+        elif dv_profile == "8":
+            dv_label = "Dolby Vision Profile 8"
+        elif dv_profile == "5":
+            dv_label = "Dolby Vision Profile 5"
+        else:
+            dv_label = "Dolby Vision"
+
+        if has_hdr10plus:
+            hdr_label = f"{dv_label} + HDR10+"
+        elif has_hdr:
+            hdr_label = f"{dv_label} + HDR"
+        else:
+            hdr_label = dv_label
     elif has_hdr10plus:
         hdr_label = "HDR10+"
     elif has_hdr:
@@ -197,7 +341,22 @@ def parse_release_quality(
     if not detected_res and not is_remux and not has_dv and not has_hdr and not is_favorite_group:
         cache_key = ""
     else:
-        dr_key = "dv" if has_dv else ("hdr" if has_hdr else "sdr")
+        if has_dv:
+            if dv_profile == "7" and dv_el_type == "FEL":
+                dr_key = "dv_p7_fel"
+            elif dv_profile == "7" and dv_el_type == "MEL":
+                dr_key = "dv_p7_mel"
+            elif dv_profile == "7":
+                dr_key = "dv_p7"
+            elif dv_profile == "8":
+                dr_key = "dv_p8"
+            else:
+                dr_key = "dv"
+        elif has_hdr:
+            dr_key = "hdr"
+        else:
+            dr_key = "sdr"
+
         parts = [detected_res or "unknown"]
         if is_remux:
             parts.append("remux")
@@ -210,6 +369,9 @@ def parse_release_quality(
         resolution=detected_res,
         is_remux=is_remux,
         dolby_vision=has_dv,
+        dv_profile=dv_profile,
+        dv_el_type=dv_el_type,
+        dv_el_source=dv_el_source,
         hdr=has_hdr or has_dv,
         hdr_label=hdr_label,
         format_label=format_label,

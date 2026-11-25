@@ -3,6 +3,7 @@ No strong genre bias yet. Prioritize films with strong craft, originality, or no
 Release quality preference (soft edge-case factor, not a hard rule):
 - Incoming releases are normally Remux-2160p or Remux-1080p.
 - Strongly prefer Remux-2160p over Remux-1080p, and treat Dolby Vision (DV / DoVi) as a notable visual plus.
+- Dolby Vision Profile 7 FEL (Full Enhancement Layer) is a HUGE positive bonus — rank preference as: Remux-2160p DV Profile 7 FEL >> Remux-2160p DV (P7 MEL / P8 / unspecified) > Remux-2160p HDR/SDR > Remux-1080p.
 - Favorite release group: CiNEPHiLES. Treat releases from CiNEPHiLES as a meaningful positive signal (both for technical/remux quality and curated film selection), especially on borderline/edge-case titles.
-- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV or from a favorite group, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
-- Let release quality and favorite release group tip the scales on borderline/edge-case films (especially visually driven cinema where 4K Remux + Dolby Vision shines, vs. borderline films in 1080p SDR).
+- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV P7 FEL or from a favorite group, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
+- Let release quality (especially 2160p DV Profile 7 FEL) and favorite release group tip the scales on borderline/edge-case films, and briefly mention confirmed P7 FEL in verdict_reason when it factors into the decision.
