@@ -2253,6 +2253,156 @@ Language : German
                 self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
                 self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
 
+    def test_known_identity_conflicts_not_masked_by_reverse_or_tl_outages(self) -> None:
+        """Codex Round 4 P1: Known source-ID / movie conflicts must supersede verified cards even during reverse-lookup or TL outages."""
+        from services.movie_intake_api.tmdb_verifier import run_independent_identity_gate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024904,
+                title="Conflict Mask Film",
+                original_title="Conflict Mask Film",
+                year=2024,
+                imdb_id="tt2024904",
+                runtime_minutes=118,
+            )
+
+            reverse_mode: dict[str, Optional[list[int]]] = {"result": [2024904]}
+
+            class OutageReverseTmdbClient(StubTmdbClient):
+                async def find_movies_by_imdb_id(self, imdb_id: str) -> Optional[list[int]]:
+                    return reverse_mode["result"]
+
+            tmdb = OutageReverseTmdbClient(cfg.tmdb_cache_path, {2024904: movie}, {"tt2024904": [2024904]})
+            tl_outcome_box = {
+                "res": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024904",
+                    file_runtime_minutes=118,
+                    audio_languages=("English",),
+                )
+            }
+            tl = StubTlScraper(db, cfg.tl_cookie_file, lambda _e, _n: tl_outcome_box["res"])
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Conflict Mask Film",
+                        year=2024,
+                        imdb_id="tt2024904",
+                        tmdb_id=2024904,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Exact Codex Round 4 repro: verified rev 1 -> correction changes meta_imdb to contradict
+                #    TL IMDb while meta_tmdb still resolves to movie AND reverse /find fails transiently (None)
+                w1 = _make_autobrr_movie_webhook(
+                    release_name="Conflict.Mask.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="904001",
+                    title="Conflict Mask Film",
+                    year=2024,
+                    meta_imdb="tt2024904",
+                    meta_tmdb=2024904,
+                )
+                rel_id = client.post("/webhook/test-webhook-secret", json=w1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel_id)["identity_gate_status"], "verified")  # type: ignore[index]
+                self.assertEqual(len(actions.card_calls), 1)
+
+                reverse_mode["result"] = None
+                w2_source_conflict = _make_autobrr_movie_webhook(
+                    release_name="Conflict.Mask.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="904001",
+                    title="Conflict Mask Film",
+                    year=2024,
+                    meta_imdb="tt9999904",  # Contradicts TL tt2024904!
+                    meta_tmdb=2024904,
+                )
+                client.post("/webhook/test-webhook-secret", json=w2_source_conflict)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_after = db.get_release(rel_id)
+                assert rel_after is not None
+                self.assertEqual(rel_after["state"], "completed")
+                self.assertEqual(rel_after["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_after["verified_tmdb_id"])
+                self.assertEqual(rel_after["card_revision"], 2)
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+
+                # 2) Movie-evidence conflict (MediaInfo runtime mismatch) during reverse /find outage
+                #    is STILL detected as is_genuine_conflict=True before reverse lookup runs
+                gate_rt = asyncio.run(
+                    run_independent_identity_gate(
+                        tmdb_client=tmdb,
+                        exact_release_name="Conflict.Mask.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                        proposed_imdb_id="tt2024904",
+                        proposed_tmdb_id=2024904,
+                        proposal_confidence="high",
+                        from_evaluator=False,
+                        tl_applicable=True,
+                        tl_outcome="listing_id_found",
+                        observed_meta_imdb="tt2024904",
+                        observed_meta_tmdb=2024904,
+                        observed_tl_imdb="tt2024904",
+                        file_runtime_minutes=195,
+                    )
+                )
+                self.assertEqual(gate_rt.status, "evidence_review")
+                self.assertTrue(gate_rt.is_genuine_conflict)
+                self.assertIn("mediainfo_runtime_mismatch", gate_rt.checks_failed)
+
+                # 3) Correction contradicting previously verified IMDb during a transient TL outage
+                #    MUST supersede verified rev 1 card to evidence_review rev 2
+                reverse_mode["result"] = [2024904]
+                w_tl1 = _make_autobrr_movie_webhook(
+                    release_name="Conflict.Mask.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="904002",
+                    title="Conflict Mask Film",
+                    year=2024,
+                    meta_imdb="tt2024904",
+                    meta_tmdb=2024904,
+                )
+                rel_tl_id = client.post("/webhook/test-webhook-secret", json=w_tl1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel_tl_id)["identity_gate_status"], "verified")  # type: ignore[index]
+
+                tl_outcome_box["res"] = TorrentLeechResult(outcome="listing_temporary_http")
+                w_tl2 = _make_autobrr_movie_webhook(
+                    release_name="Conflict.Mask.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="904002",
+                    title="Conflict Mask Film",
+                    year=2024,
+                    meta_imdb="tt8888904",  # Contradicts previously verified tt2024904
+                    meta_tmdb=2024904,
+                )
+                client.post("/webhook/test-webhook-secret", json=w_tl2)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_tl_after = db.get_release(rel_tl_id)
+                assert rel_tl_after is not None
+                self.assertEqual(rel_tl_after["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_tl_after["verified_tmdb_id"])
+                self.assertEqual(rel_tl_after["card_revision"], 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+
 
 if __name__ == "__main__":
     unittest.main()

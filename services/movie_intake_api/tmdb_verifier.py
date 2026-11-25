@@ -319,6 +319,43 @@ class TmdbIndependentClient:
         return ids
 
 
+def _find_local_source_conflicts(
+    *,
+    observed_meta_imdb: Optional[str],
+    observed_meta_tmdb: Optional[int],
+    observed_tl_imdb: Optional[str],
+    proposed_imdb_id: Optional[str] = None,
+    proposed_tmdb_id: Optional[int] = None,
+    movie: Optional[TmdbMovieRecord] = None,
+) -> list[str]:
+    """Detect deterministic identity conflicts across observed source IDs, proposals, and resolved movie."""
+    conflicts: list[str] = []
+    meta_imdb = observed_meta_imdb.strip().lower() if observed_meta_imdb else None
+    tl_imdb = observed_tl_imdb.strip().lower() if observed_tl_imdb else None
+
+    if meta_imdb and tl_imdb and meta_imdb != tl_imdb:
+        conflicts.append(f"autobrr meta_imdb {meta_imdb} != TL listing IMDb {tl_imdb}")
+
+    if proposed_imdb_id:
+        if meta_imdb and proposed_imdb_id != meta_imdb:
+            conflicts.append(f"proposed IMDb {proposed_imdb_id} != autobrr meta_imdb {meta_imdb}")
+        if tl_imdb and proposed_imdb_id != tl_imdb:
+            conflicts.append(f"proposed IMDb {proposed_imdb_id} != TL listing IMDb {tl_imdb}")
+
+    if proposed_tmdb_id is not None and observed_meta_tmdb is not None and proposed_tmdb_id != observed_meta_tmdb:
+        conflicts.append(f"proposed TMDB {proposed_tmdb_id} != autobrr meta_tmdb {observed_meta_tmdb}")
+
+    if movie is not None:
+        if meta_imdb and movie.imdb_id and meta_imdb != movie.imdb_id:
+            conflicts.append(f"autobrr meta_imdb {meta_imdb} != verified {movie.imdb_id}")
+        if observed_meta_tmdb is not None and observed_meta_tmdb != movie.tmdb_id:
+            conflicts.append(f"autobrr meta_tmdb {observed_meta_tmdb} != verified {movie.tmdb_id}")
+        if tl_imdb and movie.imdb_id and tl_imdb != movie.imdb_id:
+            conflicts.append(f"TorrentLeech listing IMDb {tl_imdb} != verified {movie.imdb_id}")
+
+    return conflicts
+
+
 async def run_independent_identity_gate(
     *,
     tmdb_client: TmdbIndependentClient,
@@ -337,22 +374,60 @@ async def run_independent_identity_gate(
     """
     Independent Identity Verification Gate (docs/ARCHITECTURE.md §5.2):
     All 6 checks must pass before ordinary Grab/Watched buttons may be attached.
+    Deterministic conflicts across already-available source IDs and movie metadata are
+    checked BEFORE returning any non-conflict transient lookup failure so outages never
+    mask genuine identity contradictions.
     """
     passed: list[str] = []
     failed: list[str] = []
 
+    clean_imdb = (
+        proposed_imdb_id.strip().lower()
+        if proposed_imdb_id and _IMDB_RE.fullmatch(proposed_imdb_id.strip())
+        else None
+    )
+    clean_tmdb = (
+        int(proposed_tmdb_id)
+        if isinstance(proposed_tmdb_id, int) and not isinstance(proposed_tmdb_id, bool) and proposed_tmdb_id > 0
+        else None
+    )
+
+    early_conflicts = _find_local_source_conflicts(
+        observed_meta_imdb=observed_meta_imdb,
+        observed_meta_tmdb=observed_meta_tmdb,
+        observed_tl_imdb=observed_tl_imdb,
+        proposed_imdb_id=clean_imdb,
+        proposed_tmdb_id=clean_tmdb,
+    )
+
     # Check 1: Source / TorrentLeech integrity
     if tl_applicable and tl_outcome in TL_FAILED_OUTCOMES:
         failed.append(f"tl_integrity_failed:{tl_outcome}")
-        is_conflict = tl_outcome in TL_INTEGRITY_CONFLICT_OUTCOMES
+        is_conflict = (tl_outcome in TL_INTEGRITY_CONFLICT_OUTCOMES) or bool(early_conflicts)
+        reason = f"TorrentLeech lookup outcome '{tl_outcome}' cannot authorize ordinary actions"
+        if early_conflicts:
+            failed.append("local_source_id_conflict")
+            reason = f"{reason}; {'; '.join(early_conflicts)}"
         return IdentityGateResult(
             status="evidence_review",
-            conflict_reason=f"TorrentLeech lookup outcome '{tl_outcome}' cannot authorize ordinary actions",
+            conflict_reason=reason,
             is_genuine_conflict=is_conflict,
             checks_passed=tuple(passed),
             checks_failed=tuple(failed),
         )
     passed.append("source_tl_integrity")
+
+    # Early local source-ID conflict check (zero network calls): catches explicit source-ID
+    # contradictions before any transient TMDB outage or low-confidence early return.
+    if early_conflicts:
+        failed.append("local_source_id_conflict")
+        return IdentityGateResult(
+            status="evidence_review",
+            conflict_reason="; ".join(early_conflicts),
+            is_genuine_conflict=True,
+            checks_passed=tuple(passed),
+            checks_failed=tuple(failed),
+        )
 
     # Check 2: Evaluator confidence & canonical IDs
     if from_evaluator and (proposal_confidence or "").strip().lower() != "high":
@@ -365,16 +440,6 @@ async def run_independent_identity_gate(
             checks_failed=tuple(failed),
         )
 
-    clean_imdb = (
-        proposed_imdb_id.strip().lower()
-        if proposed_imdb_id and _IMDB_RE.fullmatch(proposed_imdb_id.strip())
-        else None
-    )
-    clean_tmdb = (
-        int(proposed_tmdb_id)
-        if isinstance(proposed_tmdb_id, int) and not isinstance(proposed_tmdb_id, bool) and proposed_tmdb_id > 0
-        else None
-    )
     if not clean_imdb and clean_tmdb is None:
         failed.append("missing_canonical_ids")
         return IdentityGateResult(
@@ -386,7 +451,7 @@ async def run_independent_identity_gate(
         )
     passed.append("confidence_and_id_format")
 
-    # Check 3: Independent bidirectional IMDb <-> TMDB movie agreement
+    # Check 3a: Independent TMDB forward movie lookup
     if not tmdb_client.enabled:
         failed.append("tmdb_client_disabled")
         return IdentityGateResult(
@@ -442,29 +507,8 @@ async def run_independent_identity_gate(
             checks_failed=tuple(failed),
         )
 
-    # Confirm reverse /find/{imdb_id} agrees uniquely with movie.tmdb_id
-    reverse_ids = await tmdb_client.find_movies_by_imdb_id(movie.imdb_id)
-    if reverse_ids is None:
-        failed.append("tmdb_reverse_find_failed")
-        return IdentityGateResult(
-            status="evidence_review",
-            conflict_reason=f"Reverse TMDB lookup for {movie.imdb_id} failed transiently",
-            is_genuine_conflict=False,
-            checks_passed=tuple(passed),
-            checks_failed=tuple(failed),
-        )
-    if len(reverse_ids) != 1 or reverse_ids[0] != movie.tmdb_id:
-        failed.append("imdb_reverse_find_disagreement")
-        return IdentityGateResult(
-            status="evidence_review",
-            conflict_reason=f"Reverse TMDB lookup for {movie.imdb_id} did not uniquely match TMDB {movie.tmdb_id}",
-            is_genuine_conflict=True,
-            checks_passed=tuple(passed),
-            checks_failed=tuple(failed),
-        )
-    passed.append("imdb_tmdb_bidirectional_agreement")
-
     # Check 4: Independent release title & year check against exact_release_name
+    # (evaluated BEFORE reverse /find network call so known movie conflicts are never masked by an outage)
     release_title, release_year = parse_release_title_year(exact_release_name)
     if not release_title or not _titles_match(release_title, movie.all_titles()):
         failed.append("release_title_mismatch")
@@ -503,25 +547,13 @@ async def run_independent_identity_gate(
             )
     passed.append("mediainfo_runtime_check")
 
-    # Check 6: Local conflict checks across observed autobrr & TL source IDs
-    conflict_reasons: list[str] = []
-    if observed_meta_imdb and observed_meta_imdb.lower() != movie.imdb_id:
-        conflict_reasons.append(
-            f"autobrr meta_imdb {observed_meta_imdb.lower()} != verified {movie.imdb_id}"
-        )
-    if observed_meta_tmdb is not None and observed_meta_tmdb != movie.tmdb_id:
-        conflict_reasons.append(
-            f"autobrr meta_tmdb {observed_meta_tmdb} != verified {movie.tmdb_id}"
-        )
-    if observed_tl_imdb and observed_tl_imdb.lower() != movie.imdb_id:
-        conflict_reasons.append(
-            f"TorrentLeech listing IMDb {observed_tl_imdb.lower()} != verified {movie.imdb_id}"
-        )
-    if observed_meta_imdb and observed_tl_imdb and observed_meta_imdb.lower() != observed_tl_imdb.lower():
-        conflict_reasons.append(
-            f"autobrr meta_imdb {observed_meta_imdb.lower()} != TL listing IMDb {observed_tl_imdb.lower()}"
-        )
-
+    # Check 6: Local conflict checks across observed autobrr & TL source IDs against resolved movie
+    conflict_reasons = _find_local_source_conflicts(
+        observed_meta_imdb=observed_meta_imdb,
+        observed_meta_tmdb=observed_meta_tmdb,
+        observed_tl_imdb=observed_tl_imdb,
+        movie=movie,
+    )
     if conflict_reasons:
         failed.append("local_source_id_conflict")
         return IdentityGateResult(
@@ -532,6 +564,29 @@ async def run_independent_identity_gate(
             checks_failed=tuple(failed),
         )
     passed.append("local_conflict_check")
+
+    # Check 3b: Confirm reverse /find/{imdb_id} agrees uniquely with movie.tmdb_id
+    # Only reached after all deterministic source-ID & movie checks passed with zero conflicts.
+    reverse_ids = await tmdb_client.find_movies_by_imdb_id(movie.imdb_id)
+    if reverse_ids is None:
+        failed.append("tmdb_reverse_find_failed")
+        return IdentityGateResult(
+            status="evidence_review",
+            conflict_reason=f"Reverse TMDB lookup for {movie.imdb_id} failed transiently",
+            is_genuine_conflict=False,
+            checks_passed=tuple(passed),
+            checks_failed=tuple(failed),
+        )
+    if len(reverse_ids) != 1 or reverse_ids[0] != movie.tmdb_id:
+        failed.append("imdb_reverse_find_disagreement")
+        return IdentityGateResult(
+            status="evidence_review",
+            conflict_reason=f"Reverse TMDB lookup for {movie.imdb_id} did not uniquely match TMDB {movie.tmdb_id}",
+            is_genuine_conflict=True,
+            checks_passed=tuple(passed),
+            checks_failed=tuple(failed),
+        )
+    passed.append("imdb_tmdb_bidirectional_agreement")
 
     return IdentityGateResult(
         status="verified",

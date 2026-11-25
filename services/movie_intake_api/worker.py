@@ -557,16 +557,39 @@ class IntakeWorker:
             file_runtime_minutes=tl_result.file_runtime_minutes,
         )
 
+        prev_verified_conflict_reasons: list[str] = []
+        if prev_verified:
+            prev_imdb = str(row.get("verified_imdb_id") or "").strip().lower() or None
+            prev_tmdb = row.get("verified_tmdb_id")
+            if prev_imdb and classified.meta_imdb and classified.meta_imdb.lower() != prev_imdb:
+                prev_verified_conflict_reasons.append(
+                    f"correction meta_imdb {classified.meta_imdb.lower()} != previously verified {prev_imdb}"
+                )
+            if (
+                isinstance(prev_tmdb, int)
+                and not isinstance(prev_tmdb, bool)
+                and classified.meta_tmdb is not None
+                and classified.meta_tmdb != prev_tmdb
+            ):
+                prev_verified_conflict_reasons.append(
+                    f"correction meta_tmdb {classified.meta_tmdb} != previously verified {prev_tmdb}"
+                )
+            if prev_imdb and tl_result.imdb_id and tl_result.imdb_id.lower() != prev_imdb:
+                prev_verified_conflict_reasons.append(
+                    f"TL listing IMDb {tl_result.imdb_id.lower()} != previously verified {prev_imdb}"
+                )
+        has_prev_verified_conflict = bool(prev_verified_conflict_reasons)
+
         next_card_rev = prev_card_revision + 1
 
         # Guard: if already verified previously and this correction pass had only a
-        # transient TL lookup failure (never a genuine tracker conflict like
-        # listing_mismatch / listing_id_conflict / listing_id_malformed),
-        # preserve the already-verified release without downgrading.
+        # transient TL lookup failure (never a genuine tracker conflict or metadata
+        # contradiction against the verified identity), preserve the verified release.
         if (
             prev_verified
             and pre_gate.status != "verified"
             and not pre_gate.is_genuine_conflict
+            and not has_prev_verified_conflict
             and tl_result.outcome in TL_TRANSIENT_FAILURE_OUTCOMES
         ):
             await asyncio.to_thread(
@@ -920,7 +943,11 @@ class IntakeWorker:
             lease_seconds=self.config.worker_lease_seconds,
             new_state="evaluating",
         )
-        conflict_context = pre_gate.conflict_reason if pre_gate.is_genuine_conflict else None
+        conflict_notes: list[str] = []
+        if pre_gate.is_genuine_conflict and pre_gate.conflict_reason:
+            conflict_notes.append(pre_gate.conflict_reason)
+        conflict_notes.extend(prev_verified_conflict_reasons)
+        conflict_context = "; ".join(conflict_notes) if conflict_notes else None
         eval_body, full_digest = build_triage_evaluate_request(
             classified=classified,
             tl_result=tl_result,
@@ -929,6 +956,7 @@ class IntakeWorker:
         )
         if (
             pre_gate.is_genuine_conflict
+            or has_prev_verified_conflict
             or prev_card_revision > 0
             or (prev_last_eval_digest is not None and prev_last_eval_digest != full_digest)
             or tl_result.outcome in ("listing_id_conflict", "listing_id_malformed")
@@ -957,8 +985,24 @@ class IntakeWorker:
                 file_runtime_minutes=tl_result.file_runtime_minutes,
             )
 
+        effective_genuine_conflict = final_gate.is_genuine_conflict or has_prev_verified_conflict
+        if final_gate.status != "verified" and has_prev_verified_conflict and not final_gate.is_genuine_conflict:
+            merged_reason = "; ".join(
+                part
+                for part in (final_gate.conflict_reason, "; ".join(prev_verified_conflict_reasons))
+                if part
+            )
+            final_gate = IdentityGateResult(
+                status="evidence_review",
+                verified_movie=None,
+                conflict_reason=merged_reason,
+                is_genuine_conflict=True,
+                checks_passed=final_gate.checks_passed,
+                checks_failed=final_gate.checks_failed + ("prev_verified_metadata_conflict",),
+            )
+
         # Never downgrade an already-verified card on a temporary lookup failure (non-conflict)
-        if prev_verified and final_gate.status != "verified" and not final_gate.is_genuine_conflict:
+        if prev_verified and final_gate.status != "verified" and not effective_genuine_conflict:
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,
@@ -1066,7 +1110,7 @@ class IntakeWorker:
                 verified_year=verified_movie.year if verified_movie else None,
                 radarr_status_snapshot=radarr.to_dict() if radarr else None,
                 evaluation_json=eval_res.payload if eval_res.ok else None,
-                allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
+                allow_downgrade_on_conflict=effective_genuine_conflict,
             )
             return
 
@@ -1090,7 +1134,7 @@ class IntakeWorker:
                 evaluation_json=eval_res.payload if eval_res.ok else None,
                 next_attempt_at=self._retry_next_attempt_iso(),
                 increment_retry=True,
-                allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
+                allow_downgrade_on_conflict=effective_genuine_conflict,
             )
             return
 
@@ -1122,7 +1166,7 @@ class IntakeWorker:
                 next_attempt_at=self._retry_next_attempt_iso(),
                 reset_retry=True,
                 increment_retry=True,
-                allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
+                allow_downgrade_on_conflict=effective_genuine_conflict,
             )
             return
 
@@ -1151,5 +1195,5 @@ class IntakeWorker:
             pending_eval_reply=None,
             radarr_status_snapshot=radarr.to_dict() if radarr else None,
             evaluation_json=eval_res.payload if eval_res.ok else None,
-            allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
+            allow_downgrade_on_conflict=effective_genuine_conflict,
         )
