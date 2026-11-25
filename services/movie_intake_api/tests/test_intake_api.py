@@ -2689,6 +2689,151 @@ Language : German
             self.assertEqual(gate_ww.status, "verified")
             self.assertEqual(gate_ww.verified_movie.tmdb_id, 464052)  # type: ignore[union-attr]
 
+    def test_unusable_delivery_acks_treated_as_ambiguous_never_retried(self) -> None:
+        """Codex Round 8 P1: Unusable card/eval acks must become ambiguous_delivery / ambiguous_reply, never failed+retry."""
+        def _card_transport(request: httpx.Request) -> httpx.Response:
+            mode = json.loads(request.content.decode("utf-8")).get("mode")
+            if mode == "ok":
+                return httpx.Response(200, json={"status": "delivered", "ack_chat_id": "-1001", "ack_message_id": 42})
+            if mode == "delivered_no_msg":
+                return httpx.Response(200, json={"status": "delivered"})
+            if mode == "delivered_nonnumeric_msg":
+                return httpx.Response(200, json={"status": "delivered", "ack_message_id": "abc"})
+            if mode == "delivered_bool_msg":
+                return httpx.Response(200, json={"status": "delivered", "ack_message_id": True})
+            if mode == "invalid_json":
+                return httpx.Response(200, text="<html>not json</html>")
+            if mode == "list_json":
+                return httpx.Response(200, json=[1, 2, 3])
+            if mode == "unknown_status":
+                return httpx.Response(200, json={"status": "accepted_maybe"})
+            if mode == "explicit_failed":
+                return httpx.Response(200, json={"status": "failed", "detail": "rejected_before_send"})
+            if mode == "http_400":
+                return httpx.Response(400, json={"detail": "bad payload"})
+            if mode == "http_502":
+                return httpx.Response(502, text="bad gateway")
+            if mode == "connect":
+                raise httpx.ConnectError("refused")
+            raise httpx.ReadTimeout("timed out")
+
+        async def _check_client() -> None:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_card_transport)) as hc:
+                ac = ActionsApiClient(base_url="http://127.0.0.1:40721", internal_token="tok", http_client=hc)
+                ok_resp = await ac.deliver_card({"mode": "ok"})
+                self.assertEqual(ok_resp.status, "delivered")
+                self.assertEqual(ok_resp.ack_message_id, 42)
+
+                for amb_mode in (
+                    "delivered_no_msg",
+                    "delivered_nonnumeric_msg",
+                    "delivered_bool_msg",
+                    "invalid_json",
+                    "list_json",
+                    "unknown_status",
+                    "http_502",
+                    "timeout",
+                ):
+                    r = await ac.deliver_card({"mode": amb_mode})
+                    self.assertEqual(r.status, "ambiguous_delivery", msg=amb_mode)
+
+                for fail_mode in ("explicit_failed", "http_400", "connect"):
+                    r = await ac.deliver_card({"mode": fail_mode})
+                    self.assertEqual(r.status, "failed", msg=fail_mode)
+
+                # Invalid JSON / unknown status on deliver_evaluation also yields ambiguous_reply (never 'sent')
+                self.assertEqual((await ac.deliver_evaluation({"mode": "invalid_json"})).status, "ambiguous_reply")
+                self.assertEqual((await ac.deliver_evaluation({"mode": "list_json"})).status, "ambiguous_reply")
+                self.assertEqual((await ac.deliver_evaluation({"mode": "unknown_status"})).status, "ambiguous_reply")
+                self.assertEqual((await ac.deliver_evaluation({"mode": "explicit_failed"})).status, "failed")
+
+        asyncio.run(_check_client())
+
+        # End-to-end worker check: HTTP 200 {"status": "delivered"} without ack_message_id enters
+        # ambiguous_delivery (0 retries, 0 eval replies) on both fast and unresolved paths
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024908,
+                title="Unusable Ack Film",
+                original_title="Unusable Ack Film",
+                year=2024,
+                imdb_id="tt2024908",
+                runtime_minutes=110,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024908: movie}, {"tt2024908": [2024908]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda ext, _n: (
+                    TorrentLeechResult(
+                        outcome="listing_id_found",
+                        imdb_id="tt2024908",
+                        file_runtime_minutes=110,
+                        audio_languages=("English",),
+                    )
+                    if ext == "9081"
+                    else TorrentLeechResult(outcome="listing_temporary_http")
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Unusable Ack Film", year=2024, imdb_id="tt2024908", tmdb_id=2024908
+                    ),
+                )
+            )
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"),
+                card_handler=lambda _p: DeliveryCardResponse(status="delivered", ack_message_id=None),
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                r_fast = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Unusable.Ack.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                        external_id="9081",
+                        title="Unusable Ack Film",
+                        year=2024,
+                        meta_imdb="tt2024908",
+                    ),
+                )
+                fast_id = r_fast.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(fast_id)["state"], "ambiguous_delivery")  # type: ignore[index]
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.eval_reply_calls), 0)
+
+                r_unres = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Unusable.Ack.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                        external_id="9082",
+                        title="Unusable Ack Film",
+                        year=2024,
+                        meta_imdb=None,
+                    ),
+                )
+                unres_id = r_unres.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(unres_id)["state"], "ambiguous_delivery")  # type: ignore[index]
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.eval_reply_calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

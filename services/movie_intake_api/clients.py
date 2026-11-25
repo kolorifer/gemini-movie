@@ -189,6 +189,21 @@ class ActionsApiClient:
             if owns_client:
                 await client.aclose()
 
+    @staticmethod
+    def _parse_optional_int(value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text and (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
+                try:
+                    return int(text)
+                except ValueError:
+                    return None
+        return None
+
     async def deliver_card(self, card_payload: dict[str, Any]) -> DeliveryCardResponse:
         owns_client = self._external_client is None
         client = (
@@ -203,25 +218,39 @@ class ActionsApiClient:
                 headers=self._headers(),
             )
             if resp.status_code == 200:
-                data = resp.json()
-                if not isinstance(data, dict):
-                    return DeliveryCardResponse(status="ambiguous_delivery", detail="malformed_card_ack")
-                st = str(data.get("status") or "failed")
-                if st == "delivered" and data.get("ack_message_id") is not None:
-                    return DeliveryCardResponse(
-                        status="delivered",
-                        ack_chat_id=str(data.get("ack_chat_id") or ""),
-                        ack_message_id=int(data["ack_message_id"]),
-                        ack_thread_id=data.get("ack_thread_id"),
-                    )
-                if st == "ambiguous_delivery":
+                try:
+                    data = resp.json()
+                except ValueError:
                     return DeliveryCardResponse(
                         status="ambiguous_delivery",
-                        detail=redact_secrets(str(data.get("detail") or ""), max_chars=200) or None,
+                        detail="invalid_card_ack_json",
                     )
+                if not isinstance(data, dict):
+                    return DeliveryCardResponse(status="ambiguous_delivery", detail="malformed_card_ack")
+                st = str(data.get("status") or "").strip().lower()
+                detail = redact_secrets(str(data.get("detail") or ""), max_chars=200) or None
+                if st == "failed":
+                    return DeliveryCardResponse(status="failed", detail=detail)
+                if st == "delivered":
+                    msg_id = self._parse_optional_int(data.get("ack_message_id"))
+                    if msg_id is None or msg_id <= 0:
+                        return DeliveryCardResponse(
+                            status="ambiguous_delivery",
+                            detail="unusable_delivered_ack_missing_message_id",
+                        )
+                    raw_chat = data.get("ack_chat_id")
+                    chat_id = str(raw_chat).strip() if raw_chat is not None else ""
+                    thread_id = self._parse_optional_int(data.get("ack_thread_id"))
+                    return DeliveryCardResponse(
+                        status="delivered",
+                        ack_chat_id=chat_id,
+                        ack_message_id=msg_id,
+                        ack_thread_id=thread_id,
+                    )
+                # Unknown, empty, or explicit ambiguous_delivery status: never prove non-delivery
                 return DeliveryCardResponse(
-                    status="failed",
-                    detail=redact_secrets(str(data.get("detail") or ""), max_chars=200) or None,
+                    status="ambiguous_delivery",
+                    detail=detail or (f"unexpected_card_ack_status:{st}" if st else "missing_card_ack_status"),
                 )
             if 400 <= resp.status_code < 500:
                 return DeliveryCardResponse(
@@ -236,8 +265,8 @@ class ActionsApiClient:
         except httpx.ConnectError:
             # Connection refused before transmit: definitively not delivered
             return DeliveryCardResponse(status="failed", detail="actions_connect_error")
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            # Lost ack after transmit: MUST treat as ambiguous_delivery (never resend!)
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPError, ValueError, TypeError) as exc:
+            # Lost or unusable ack after transmit: MUST treat as ambiguous_delivery (never resend!)
             return DeliveryCardResponse(
                 status="ambiguous_delivery",
                 detail=redact_secrets(exc.__class__.__name__, max_chars=120),
@@ -263,19 +292,24 @@ class ActionsApiClient:
                 try:
                     data = resp.json()
                 except ValueError:
-                    data = {}
-                st = str(data.get("status") or "sent") if isinstance(data, dict) else "sent"
-                if st == "ambiguous_reply":
-                    return DeliveryEvalResponse(status="ambiguous_reply", detail="actions_ambiguous_reply")
+                    return DeliveryEvalResponse(status="ambiguous_reply", detail="invalid_eval_ack_json")
+                if not isinstance(data, dict):
+                    return DeliveryEvalResponse(status="ambiguous_reply", detail="malformed_eval_ack")
+                st = str(data.get("status") or "").strip().lower()
+                if st == "sent":
+                    return DeliveryEvalResponse(status="sent")
                 if st == "failed":
                     return DeliveryEvalResponse(status="failed", detail="actions_reply_failed")
-                return DeliveryEvalResponse(status="sent")
+                return DeliveryEvalResponse(
+                    status="ambiguous_reply",
+                    detail="actions_ambiguous_reply" if st == "ambiguous_reply" else "unusable_eval_ack",
+                )
             if 400 <= resp.status_code < 500:
                 return DeliveryEvalResponse(status="failed", detail=f"actions_http_{resp.status_code}")
             return DeliveryEvalResponse(status="ambiguous_reply", detail=f"actions_http_{resp.status_code}")
         except httpx.ConnectError:
             return DeliveryEvalResponse(status="failed", detail="actions_connect_error")
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPError, ValueError, TypeError) as exc:
             return DeliveryEvalResponse(
                 status="ambiguous_reply",
                 detail=redact_secrets(exc.__class__.__name__, max_chars=120),

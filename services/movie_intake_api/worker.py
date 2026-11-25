@@ -29,6 +29,15 @@ from .torrentleech import (
 logger = logging.getLogger(__name__)
 
 
+def _is_ambiguous_card_ack(resp: DeliveryCardResponse) -> bool:
+    """Only explicit status=='failed' proves non-delivery; usable 'delivered' requires a positive ack_message_id."""
+    if resp.status == "failed":
+        return False
+    if resp.status == "delivered" and resp.ack_message_id is not None and resp.ack_message_id > 0:
+        return False
+    return True
+
+
 def build_triage_evaluate_request(
     *,
     classified: ClassifiedWebhook,
@@ -305,8 +314,8 @@ class IntakeWorker:
             new_state="delivering",
         )
         card_resp = await self.actions_client.deliver_card(card_payload)
-        if card_resp.status != "delivered" or card_resp.ack_message_id is None:
-            # Never post an unanchored reply when ack_message_id is missing / ambiguous_delivery
+        if card_resp.status != "delivered" or card_resp.ack_message_id is None or card_resp.ack_message_id <= 0:
+            # Never post an unanchored reply when ack_message_id is missing / invalid / ambiguous_delivery
             return card_resp, None, None
 
         reply_body: dict[str, Any] = {
@@ -370,7 +379,7 @@ class IntakeWorker:
             effective_rev = int(supersede_card.get("card_revision") or (int(row.get("card_revision") or 0) + 1))
             conflict_reason = supersede_card.get("conflict_reason")
             sup_resp = await self.actions_client.deliver_card(supersede_card)
-            if sup_resp.status == "ambiguous_delivery":
+            if _is_ambiguous_card_ack(sup_resp):
                 await asyncio.to_thread(
                     self.db.finalize_release,
                     release_id,
@@ -675,7 +684,7 @@ class IntakeWorker:
                     new_state="delivering",
                 )
                 card_resp = await self.actions_client.deliver_card(card_payload)
-                if card_resp.status == "ambiguous_delivery":
+                if _is_ambiguous_card_ack(card_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
                         release_id,
@@ -797,7 +806,7 @@ class IntakeWorker:
                     "error_redacted": None if eval_res.ok else eval_res.error_redacted,
                 }
                 sup_resp = await self.actions_client.deliver_card(supersede_card)
-                if sup_resp.status == "ambiguous_delivery":
+                if _is_ambiguous_card_ack(sup_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
                         release_id,
@@ -1108,7 +1117,7 @@ class IntakeWorker:
                 "evaluation_json": eval_res.payload if eval_res.ok else None,
             },
         )
-        if card_resp.status == "ambiguous_delivery":
+        if _is_ambiguous_card_ack(card_resp):
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,
