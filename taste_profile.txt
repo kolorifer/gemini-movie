@@ -1,1 +1,7 @@
 No strong genre bias yet. Prioritize films with strong craft, originality, or notable festival/critical recognition. Flag derivative blockbusters, slow pacing with weak payoff, or ratings inflated by very low vote counts.
+
+Release quality preference (soft edge-case factor, not a hard rule):
+- Incoming releases are normally Remux-2160p or Remux-1080p.
+- Strongly prefer Remux-2160p over Remux-1080p, and treat Dolby Vision (DV / DoVi) as a notable visual plus.
+- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
+- Let release quality tip the scales on borderline/edge-case films (especially visually driven cinema where 4K Remux + Dolby Vision shines, vs. borderline films in 1080p SDR).

@@ -67,6 +67,13 @@ def build_system_instruction(
         "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
         "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
         "disambiguation_note.",
+        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) as a "
+        "soft edge-case tie-breaker per the user's taste profile: strongly prefer Remux-2160p over "
+        "Remux-1080p and treat Dolby Vision (DV/DoVi) as a meaningful bonus, especially for visually "
+        "rich cinema. Never treat it as a hard rule — do NOT upgrade a clearly weak film to WATCH "
+        "solely for 2160p DV, and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. "
+        "Only mention release quality in verdict_reason or red_flags when it meaningfully tips a "
+        "borderline decision.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),
@@ -89,6 +96,7 @@ def build_user_prompt(
     request: EvaluateRequest,
     tmdb_context: Optional[str] = None,
     torrent_context: Optional[str] = None,
+    release_quality_context: Optional[str] = None,
 ) -> str:
     parts = [f"Release string / query: {request.raw_text}"]
     if request.hint_title:
@@ -97,6 +105,8 @@ def build_user_prompt(
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
         parts.append(f"Extra context: {request.extra_context}")
+    if release_quality_context:
+        parts.append(release_quality_context)
     if torrent_context:
         parts.append("")
         parts.append(torrent_context)
@@ -152,6 +162,7 @@ class GeminiTriageClient:
         system_instruction: str,
         tmdb_context: Optional[str] = None,
         torrent_context: Optional[str] = None,
+        release_quality_context: Optional[str] = None,
     ) -> EvaluationPayload:
         client = self._get_client()
         config = types.GenerateContentConfig(
@@ -166,6 +177,7 @@ class GeminiTriageClient:
                 request,
                 tmdb_context=tmdb_context,
                 torrent_context=torrent_context,
+                release_quality_context=release_quality_context,
             ),
             config=config,
         )
@@ -188,6 +200,7 @@ class GeminiTriageClient:
         *,
         tmdb_context: Optional[str] = None,
         torrent_context: Optional[str] = None,
+        release_quality_context: Optional[str] = None,
     ) -> EvaluationPayload:
         # Dynamically reload taste_profile.txt on every single request
         taste_profile = load_taste_profile(self.taste_profile_path)
@@ -201,6 +214,7 @@ class GeminiTriageClient:
                     system_instruction,
                     tmdb_context,
                     torrent_context,
+                    release_quality_context,
                 ),
                 timeout=self.timeout_seconds,
             )

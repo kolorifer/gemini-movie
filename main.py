@@ -7,7 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 
-from db import TriageDB
+from db import TriageDB, parse_release_quality
 from gemini_client import GeminiClientError, GeminiTimeoutError, GeminiTriageClient
 from schemas import (
     EvaluateRequest,
@@ -67,12 +67,23 @@ async def health() -> HealthResponse:
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
+    tinfo = payload.torrent_info
+    release_quality = parse_release_quality(
+        payload.raw_text,
+        resolution=tinfo.resolution if tinfo else None,
+        source=tinfo.source if tinfo else None,
+        dynamic_range=tinfo.dynamic_range if tinfo else None,
+        media_processing=tinfo.media_processing if tinfo else None,
+        nfo_text=tinfo.nfo_text if tinfo else None,
+    )
+
     if not payload.force_refresh:
         cached = db.get_cached_evaluation(
             payload.raw_text,
             hint_title=payload.hint_title,
             hint_year=payload.hint_year,
             extra_context=payload.extra_context,
+            quality_key=release_quality.cache_key,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached is not None:
@@ -82,6 +93,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     tmdb_movie = lookup.movie
 
     # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
+    # and the cached evaluation matches the incoming release quality tier.
     if (
         not payload.force_refresh
         and lookup.trusted_for_cache
@@ -93,6 +105,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             hint_title=tmdb_movie.canonical_title,
             hint_year=tmdb_movie.year,
             extra_context=tmdb_movie.imdb_id,
+            quality_key=release_quality.cache_key,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached_by_imdb is not None:
@@ -110,6 +123,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             recent_feedback,
             tmdb_context=tmdb_context,
             torrent_context=torrent_context,
+            release_quality_context=release_quality.to_prompt_line(),
         )
     except GeminiTimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
@@ -128,6 +142,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         result_dict,
         hint_title=payload.hint_title,
         hint_year=payload.hint_year,
+        quality_key=release_quality.cache_key,
     )
     return EvaluateResponse(cached=False, **result_dict)
 

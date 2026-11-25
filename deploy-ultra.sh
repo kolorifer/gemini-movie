@@ -53,6 +53,12 @@ EOF_REQUIREMENTS
 
 cat <<'EOF_TASTE_PROFILE' > "$APP_DIR/taste_profile.txt"
 No strong genre bias yet. Prioritize films with strong craft, originality, or notable festival/critical recognition. Flag derivative blockbusters, slow pacing with weak payoff, or ratings inflated by very low vote counts.
+
+Release quality preference (soft edge-case factor, not a hard rule):
+- Incoming releases are normally Remux-2160p or Remux-1080p.
+- Strongly prefer Remux-2160p over Remux-1080p, and treat Dolby Vision (DV / DoVi) as a notable visual plus.
+- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
+- Let release quality tip the scales on borderline/edge-case films (especially visually driven cinema where 4K Remux + Dolby Vision shines, vs. borderline films in 1080p SDR).
 EOF_TASTE_PROFILE
 
 cat <<'EOF_SCHEMAS' > "$APP_DIR/schemas.py"
@@ -85,6 +91,13 @@ class TorrentInfo(BaseModel):
     )
     resolution: Optional[str] = Field(default=None, description="Release resolution (e.g. 2160p, 1080p)")
     source: Optional[str] = Field(default=None, description="Release source (e.g. UHD BluRay REMUX, WEB-DL)")
+    dynamic_range: list[str] = Field(
+        default_factory=list,
+        description="Dynamic range / HDR tags from tracker or MediaInfo (e.g. ['DV', 'HDR10'])",
+    )
+    media_processing: Optional[str] = Field(
+        default=None, description="Release processing tag (e.g. REMUX)"
+    )
     size_gb: Optional[float] = Field(default=None, ge=0, description="Release size in GB")
     freeleech: Optional[bool] = Field(default=None, description="Whether release is freeleech")
     description: Optional[str] = Field(
@@ -105,9 +118,9 @@ class TorrentInfo(BaseModel):
                 return text
         return None
 
-    @field_validator("audio_languages", mode="before")
+    @field_validator("audio_languages", "dynamic_range", mode="before")
     @classmethod
-    def _clean_audio_languages(cls, value: object) -> list[str]:
+    def _clean_string_list(cls, value: object) -> list[str]:
         if value is None:
             return []
         if isinstance(value, str):
@@ -261,6 +274,7 @@ import json
 import os
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -269,6 +283,124 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "triage.db"
 
 IMDB_ID_RE = re.compile(r"\b(tt\d{7,10})\b", re.IGNORECASE)
 YEAR_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
+
+_RES_2160_RE = re.compile(r"(?<![a-z0-9])2160p(?![a-z0-9])", re.IGNORECASE)
+_RES_1080_RE = re.compile(r"(?<![a-z0-9])1080[pi](?![a-z0-9])", re.IGNORECASE)
+_RES_720_RE = re.compile(r"(?<![a-z0-9])720p(?![a-z0-9])", re.IGNORECASE)
+_RES_UHD_RE = re.compile(r"(?<![a-z0-9])(?:4k|uhd)(?![a-z0-9])", re.IGNORECASE)
+_REMUX_RE = re.compile(r"(?<![a-z0-9])remux(?![a-z0-9])", re.IGNORECASE)
+_DV_TAG_RE = re.compile(r"(?<![a-z0-9])(?:dv|dovi|dolby[\s._-]*vision)(?![a-z0-9])", re.IGNORECASE)
+_DV_NFO_RE = re.compile(r"(?<![a-z0-9])(?:dovi|dolby[\s._-]*vision)(?![a-z0-9])", re.IGNORECASE)
+_HDR10PLUS_RE = re.compile(r"(?<![a-z0-9])(?:hdr10\+|hdr10plus|hdr10p)(?![a-z0-9])", re.IGNORECASE)
+_HDR_RE = re.compile(r"(?<![a-z0-9])(?:hdr10|hdr|hlg)(?![a-z0-9])", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ReleaseQuality:
+    resolution: Optional[str] = None
+    is_remux: bool = False
+    dolby_vision: bool = False
+    hdr: bool = False
+    hdr_label: str = "unknown"
+    format_label: str = "unknown"
+    cache_key: str = ""
+
+    def to_prompt_line(self) -> Optional[str]:
+        if not self.cache_key:
+            return None
+        if self.resolution == "2160p" and self.dolby_vision:
+            tier_note = "top preferred tier: 2160p + Dolby Vision bonus (positive tie-breaker on edge cases)"
+        elif self.resolution == "2160p":
+            tier_note = "preferred resolution tier: 2160p (strong preference over 1080p on edge cases)"
+        elif self.resolution == "1080p" and self.dolby_vision:
+            tier_note = "1080p with Dolby Vision (Dolby Vision bonus, though 2160p Remux is preferred)"
+        elif self.resolution == "1080p":
+            tier_note = "1080p tier (less preferred than Remux-2160p / Dolby Vision on borderline edge cases)"
+        else:
+            tier_note = "non-standard quality tier"
+        return (
+            f"Release quality signals: {self.format_label} | Dynamic range: {self.hdr_label} "
+            f"({tier_note})"
+        )
+
+
+def parse_release_quality(
+    raw_text: str,
+    *,
+    resolution: Optional[str] = None,
+    source: Optional[str] = None,
+    dynamic_range: Optional[list[str]] = None,
+    media_processing: Optional[str] = None,
+    nfo_text: Optional[str] = None,
+) -> ReleaseQuality:
+    """Deterministically parse release resolution, remux status, and Dolby Vision/HDR tier."""
+    res_candidates = " ".join(p for p in (resolution or "", raw_text or "", source or "") if p)
+    detected_res: Optional[str] = None
+    if _RES_2160_RE.search(res_candidates):
+        detected_res = "2160p"
+    elif _RES_1080_RE.search(res_candidates):
+        detected_res = "1080p"
+    elif _RES_720_RE.search(res_candidates):
+        detected_res = "720p"
+    elif _RES_UHD_RE.search(res_candidates):
+        detected_res = "2160p"
+
+    remux_text = " ".join(p for p in (media_processing or "", source or "", raw_text or "") if p)
+    is_remux = bool(_REMUX_RE.search(remux_text))
+
+    dr_joined = " ".join(dynamic_range or [])
+    tag_text = " ".join(p for p in (dr_joined, raw_text or "") if p)
+    nfo_str = nfo_text or ""
+
+    has_dv = bool(_DV_TAG_RE.search(tag_text) or _DV_NFO_RE.search(nfo_str))
+    has_hdr10plus = bool(_HDR10PLUS_RE.search(tag_text) or _HDR10PLUS_RE.search(nfo_str))
+    has_hdr = has_hdr10plus or bool(_HDR_RE.search(tag_text) or _HDR_RE.search(nfo_str))
+
+    if has_dv and has_hdr10plus:
+        hdr_label = "Dolby Vision + HDR10+"
+    elif has_dv and has_hdr:
+        hdr_label = "Dolby Vision + HDR"
+    elif has_dv:
+        hdr_label = "Dolby Vision"
+    elif has_hdr10plus:
+        hdr_label = "HDR10+"
+    elif has_hdr:
+        hdr_label = "HDR"
+    elif detected_res in ("2160p", "1080p", "720p"):
+        hdr_label = "SDR"
+    else:
+        hdr_label = "unknown"
+
+    if is_remux and detected_res:
+        format_label = f"Remux-{detected_res}"
+    elif is_remux:
+        format_label = "Remux"
+    elif detected_res:
+        format_label = detected_res
+    elif source:
+        format_label = source.strip()
+    else:
+        format_label = "unknown"
+
+    if not detected_res and not is_remux and not has_dv and not has_hdr:
+        cache_key = ""
+    else:
+        dr_key = "dv" if has_dv else ("hdr" if has_hdr else "sdr")
+        parts = [detected_res or "unknown"]
+        if is_remux:
+            parts.append("remux")
+        parts.append(dr_key)
+        cache_key = "_".join(parts)
+
+    return ReleaseQuality(
+        resolution=detected_res,
+        is_remux=is_remux,
+        dolby_vision=has_dv,
+        hdr=has_hdr or has_dv,
+        hdr_label=hdr_label,
+        format_label=format_label,
+        cache_key=cache_key,
+    )
 
 RELEASE_STOP_TOKENS = frozenset(
     {
@@ -452,6 +584,7 @@ class TriageDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     raw_text_normalized TEXT NOT NULL,
                     release_key TEXT,
+                    quality_key TEXT NOT NULL DEFAULT '',
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
                     canonical_title TEXT NOT NULL,
@@ -486,6 +619,26 @@ class TriageDB:
                     ON feedback (created_at DESC, id DESC);
                 """
             )
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
+            }
+            if "quality_key" not in cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN quality_key TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_quality
+                    ON evaluations (imdb_id, quality_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_quality
+                    ON evaluations (release_key, quality_key, created_at DESC)
+                """
+            )
 
     def get_cached_evaluation(
         self,
@@ -494,6 +647,7 @@ class TriageDB:
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
         extra_context: Optional[str] = None,
+        quality_key: Optional[str] = None,
         ttl_hours: int = 72,
     ) -> Optional[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
@@ -502,17 +656,22 @@ class TriageDB:
         norm_raw = normalize_raw_text(raw_text)
         imdb_id = extract_imdb_id(raw_text, extra_context)
         rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
+        q_key = (
+            quality_key
+            if quality_key is not None
+            else parse_release_quality(raw_text).cache_key
+        )
 
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT response_json
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND created_at >= ?
+                WHERE raw_text_normalized = ? AND quality_key = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, cutoff),
+                (norm_raw, q_key, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
@@ -520,11 +679,11 @@ class TriageDB:
                     """
                     SELECT response_json
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ? AND quality_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), cutoff),
+                    (imdb_id.lower(), q_key, cutoff),
                 ).fetchone()
 
             if row is None and rel_key:
@@ -532,11 +691,11 @@ class TriageDB:
                     """
                     SELECT response_json
                     FROM evaluations
-                    WHERE release_key = ? AND created_at >= ?
+                    WHERE release_key = ? AND quality_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, cutoff),
+                    (rel_key, q_key, cutoff),
                 ).fetchone()
 
         if row is None:
@@ -551,6 +710,7 @@ class TriageDB:
         *,
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
+        quality_key: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> None:
         identification = payload["identification"]
@@ -566,24 +726,29 @@ class TriageDB:
             normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
             or canonical_release_key(canonical_title, year)
         )
+        q_key = (
+            quality_key
+            if quality_key is not None
+            else parse_release_quality(raw_text).cache_key
+        )
         ts = created_at or utc_now_iso()
         serialized = json.dumps(payload, ensure_ascii=False)
 
         with self._connect() as conn:
-            # Replace superseded entries for the exact normalized string or IMDb ID
+            # Replace superseded entries for the same movie AND release quality tier
             conn.execute(
-                "DELETE FROM evaluations WHERE raw_text_normalized = ?",
-                (norm_raw,),
+                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ?",
+                (norm_raw, q_key),
             )
             if imdb_id:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE lower(imdb_id) = ?",
-                    (imdb_id,),
+                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ?",
+                    (imdb_id, q_key),
                 )
             elif rel_key:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE release_key = ?",
-                    (rel_key,),
+                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ?",
+                    (rel_key, q_key),
                 )
 
             conn.execute(
@@ -591,6 +756,7 @@ class TriageDB:
                 INSERT INTO evaluations (
                     raw_text_normalized,
                     release_key,
+                    quality_key,
                     raw_text_original,
                     imdb_id,
                     canonical_title,
@@ -598,11 +764,12 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
                     rel_key,
+                    q_key,
                     raw_text,
                     imdb_id,
                     canonical_title,
@@ -1189,6 +1356,10 @@ def format_torrent_info_for_prompt(
             meta_parts.append(f"resolution={torrent_info.resolution}")
         if torrent_info.source:
             meta_parts.append(f"source={torrent_info.source}")
+        if torrent_info.media_processing:
+            meta_parts.append(f"processing={torrent_info.media_processing}")
+        if torrent_info.dynamic_range:
+            meta_parts.append("dynamic_range=" + "+".join(torrent_info.dynamic_range))
         if torrent_info.size_gb is not None:
             meta_parts.append(f"size={torrent_info.size_gb:.1f} GB")
         if torrent_info.freeleech is not None:
@@ -1624,6 +1795,13 @@ def build_system_instruction(
         "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
         "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
         "disambiguation_note.",
+        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) as a "
+        "soft edge-case tie-breaker per the user's taste profile: strongly prefer Remux-2160p over "
+        "Remux-1080p and treat Dolby Vision (DV/DoVi) as a meaningful bonus, especially for visually "
+        "rich cinema. Never treat it as a hard rule — do NOT upgrade a clearly weak film to WATCH "
+        "solely for 2160p DV, and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. "
+        "Only mention release quality in verdict_reason or red_flags when it meaningfully tips a "
+        "borderline decision.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),
@@ -1646,6 +1824,7 @@ def build_user_prompt(
     request: EvaluateRequest,
     tmdb_context: Optional[str] = None,
     torrent_context: Optional[str] = None,
+    release_quality_context: Optional[str] = None,
 ) -> str:
     parts = [f"Release string / query: {request.raw_text}"]
     if request.hint_title:
@@ -1654,6 +1833,8 @@ def build_user_prompt(
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
         parts.append(f"Extra context: {request.extra_context}")
+    if release_quality_context:
+        parts.append(release_quality_context)
     if torrent_context:
         parts.append("")
         parts.append(torrent_context)
@@ -1709,6 +1890,7 @@ class GeminiTriageClient:
         system_instruction: str,
         tmdb_context: Optional[str] = None,
         torrent_context: Optional[str] = None,
+        release_quality_context: Optional[str] = None,
     ) -> EvaluationPayload:
         client = self._get_client()
         config = types.GenerateContentConfig(
@@ -1723,6 +1905,7 @@ class GeminiTriageClient:
                 request,
                 tmdb_context=tmdb_context,
                 torrent_context=torrent_context,
+                release_quality_context=release_quality_context,
             ),
             config=config,
         )
@@ -1745,6 +1928,7 @@ class GeminiTriageClient:
         *,
         tmdb_context: Optional[str] = None,
         torrent_context: Optional[str] = None,
+        release_quality_context: Optional[str] = None,
     ) -> EvaluationPayload:
         # Dynamically reload taste_profile.txt on every single request
         taste_profile = load_taste_profile(self.taste_profile_path)
@@ -1758,6 +1942,7 @@ class GeminiTriageClient:
                     system_instruction,
                     tmdb_context,
                     torrent_context,
+                    release_quality_context,
                 ),
                 timeout=self.timeout_seconds,
             )
@@ -1781,7 +1966,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 
-from db import TriageDB
+from db import TriageDB, parse_release_quality
 from gemini_client import GeminiClientError, GeminiTimeoutError, GeminiTriageClient
 from schemas import (
     EvaluateRequest,
@@ -1841,12 +2026,23 @@ async def health() -> HealthResponse:
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
+    tinfo = payload.torrent_info
+    release_quality = parse_release_quality(
+        payload.raw_text,
+        resolution=tinfo.resolution if tinfo else None,
+        source=tinfo.source if tinfo else None,
+        dynamic_range=tinfo.dynamic_range if tinfo else None,
+        media_processing=tinfo.media_processing if tinfo else None,
+        nfo_text=tinfo.nfo_text if tinfo else None,
+    )
+
     if not payload.force_refresh:
         cached = db.get_cached_evaluation(
             payload.raw_text,
             hint_title=payload.hint_title,
             hint_year=payload.hint_year,
             extra_context=payload.extra_context,
+            quality_key=release_quality.cache_key,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached is not None:
@@ -1856,6 +2052,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     tmdb_movie = lookup.movie
 
     # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
+    # and the cached evaluation matches the incoming release quality tier.
     if (
         not payload.force_refresh
         and lookup.trusted_for_cache
@@ -1867,6 +2064,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             hint_title=tmdb_movie.canonical_title,
             hint_year=tmdb_movie.year,
             extra_context=tmdb_movie.imdb_id,
+            quality_key=release_quality.cache_key,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached_by_imdb is not None:
@@ -1884,6 +2082,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             recent_feedback,
             tmdb_context=tmdb_context,
             torrent_context=torrent_context,
+            release_quality_context=release_quality.to_prompt_line(),
         )
     except GeminiTimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
@@ -1902,6 +2101,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         result_dict,
         hint_title=payload.hint_title,
         hint_year=payload.hint_year,
+        quality_key=release_quality.cache_key,
     )
     return EvaluateResponse(cached=False, **result_dict)
 

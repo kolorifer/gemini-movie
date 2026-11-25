@@ -214,11 +214,11 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 tmdb_id=915935,
                 runtime_minutes=151,
             ).model_dump()
-            db.save_evaluation("Anatomie.d.une.chute.2023.FRENCH.2160p", payload)
+            db.save_evaluation("Anatomie.d.une.chute.2023.FRENCH.2160p.UHD.BluRay.REMUX.DV", payload)
 
-            # Different language title hits cache when TMDB resolves the IMDb ID
+            # Different language title of the SAME quality tier hits cache via IMDb ID
             hit = db.get_cached_evaluation(
-                "Anatomy.of.a.Fall.2023.1080p.BluRay.x264-GRP",
+                "Anatomy.of.a.Fall.2023.2160p.UHD.BluRay.REMUX.DoVi-GRP",
                 hint_title="Anatomy of a Fall",
                 hint_year=2023,
                 extra_context="tt17009710",
@@ -227,6 +227,59 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             assert hit is not None
             self.assertEqual(hit["identification"]["tmdb_id"], 915935)
             self.assertEqual(hit["identification"]["imdb_id"], "tt17009710")
+
+            # Different quality tier (1080p SDR vs 2160p DV) must NOT share cached verdict
+            miss = db.get_cached_evaluation(
+                "Anatomy.of.a.Fall.2023.1080p.BluRay.REMUX-GRP",
+                hint_title="Anatomy of a Fall",
+                hint_year=2023,
+                extra_context="tt17009710",
+            )
+            self.assertIsNone(miss)
+
+    def test_parse_release_quality_signals(self) -> None:
+        from db import parse_release_quality
+
+        q_4k_dv = parse_release_quality(
+            "28 Years Later 2025 2160p UHD BluRay REMUX DV HDR HEVC Atmos-TRiToN",
+            resolution="2160p",
+            source="UHD.BluRay",
+            dynamic_range=["DV", "HDR"],
+            media_processing="REMUX",
+        )
+        self.assertEqual(q_4k_dv.format_label, "Remux-2160p")
+        self.assertTrue(q_4k_dv.dolby_vision)
+        self.assertEqual(q_4k_dv.cache_key, "2160p_remux_dv")
+        self.assertIn("Dolby Vision bonus", q_4k_dv.to_prompt_line() or "")
+
+        q_1080_sdr = parse_release_quality(
+            "28 Years Later 2025 1080p BluRay Hybrid REMUX AVC Atmos-TRiToN"
+        )
+        self.assertEqual(q_1080_sdr.format_label, "Remux-1080p")
+        self.assertFalse(q_1080_sdr.dolby_vision)
+        self.assertEqual(q_1080_sdr.hdr_label, "SDR")
+        self.assertEqual(q_1080_sdr.cache_key, "1080p_remux_sdr")
+
+        # 1080p downscale from UHD BluRay must be recognized as 1080p, not 2160p
+        q_1080_uhd = parse_release_quality(
+            "Spider-Man Brand New Day 2026 UHD BluRay 1080p DD+Atmos 5 1 DoVi HDR10+ x265-SM737"
+        )
+        self.assertEqual(q_1080_uhd.resolution, "1080p")
+        self.assertTrue(q_1080_uhd.dolby_vision)
+        self.assertEqual(q_1080_uhd.hdr_label, "Dolby Vision + HDR10+")
+
+        # DVDRip must never trigger a false Dolby Vision match
+        q_dvd = parse_release_quality("Naughty but Nice 1939 1080p DVDRIP AVC AAC LC")
+        self.assertFalse(q_dvd.dolby_vision)
+        self.assertEqual(q_dvd.hdr_label, "SDR")
+
+        # NFO MediaInfo Dolby Vision detection
+        q_nfo = parse_release_quality(
+            "Some.Film.2025.2160p.BluRay.REMUX.HEVC-GRP",
+            nfo_text="HDR format : Dolby Vision, Version 1.0 / SMPTE ST 2086, HDR10 compatible",
+        )
+        self.assertTrue(q_nfo.dolby_vision)
+        self.assertEqual(q_nfo.cache_key, "2160p_remux_dv")
 
     def test_evaluate_endpoint_wires_tmdb_grounding_and_cache(self) -> None:
         import main
@@ -272,10 +325,10 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 patch.object(main, "tmdb_client", mock_tmdb),
                 patch.object(main.gemini_client, "evaluate", mock_gemini_eval),
             ):
-                # 1) Uncached evaluation gets TMDB grounding + deterministic enrichment
+                # 1) Uncached 1080p Remux evaluation gets TMDB grounding + release quality context
                 resp1 = asyncio.run(
                     main.evaluate(
-                        EvaluateRequest(raw_text="La.Chimera.2023.1080p.BluRay.x264-GROUP")
+                        EvaluateRequest(raw_text="La.Chimera.2023.1080p.BluRay.REMUX.AVC-GROUP")
                     )
                 )
                 self.assertFalse(resp1.cached)
@@ -285,17 +338,31 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertEqual(resp1.identification.original_title, "La chimera")
                 self.assertEqual(mock_gemini_eval.await_count, 1)
                 passed_ctx = mock_gemini_eval.await_args.kwargs["tmdb_context"]
+                passed_q = mock_gemini_eval.await_args.kwargs["release_quality_context"]
                 self.assertIn("TMDB ID: 837335", passed_ctx)
+                self.assertIn("Remux-1080p", passed_q)
 
-                # 2) Alias release string resolves via TMDB -> IMDb ID -> cache hit (no 2nd Gemini call)
+                # 2) Same quality tier alias hits cache via TMDB -> IMDb ID (no 2nd Gemini call)
                 resp2 = asyncio.run(
                     main.evaluate(
-                        EvaluateRequest(raw_text="The.Chimera.2023.2160p.REMUX-OTHER")
+                        EvaluateRequest(raw_text="The.Chimera.2023.1080p.BluRay.REMUX-OTHER")
                     )
                 )
                 self.assertTrue(resp2.cached)
                 self.assertEqual(resp2.identification.tmdb_id, 837335)
                 self.assertEqual(mock_gemini_eval.await_count, 1)
+
+                # 3) Upgraded 2160p DV Remux misses 1080p cache and passes 2160p DV context to Gemini
+                resp3 = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(raw_text="La.Chimera.2023.2160p.UHD.BluRay.REMUX.DV.HDR-TRiToN")
+                    )
+                )
+                self.assertFalse(resp3.cached)
+                self.assertEqual(mock_gemini_eval.await_count, 2)
+                passed_q3 = mock_gemini_eval.await_args.kwargs["release_quality_context"]
+                self.assertIn("Remux-2160p", passed_q3)
+                self.assertIn("Dolby Vision", passed_q3)
 
     def test_tracker_info_conflict_rejected_and_falls_back_cleanly(self) -> None:
         from schemas import TorrentInfo

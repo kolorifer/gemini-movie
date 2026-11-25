@@ -27,6 +27,13 @@ class TorrentInfo(BaseModel):
     )
     resolution: Optional[str] = Field(default=None, description="Release resolution (e.g. 2160p, 1080p)")
     source: Optional[str] = Field(default=None, description="Release source (e.g. UHD BluRay REMUX, WEB-DL)")
+    dynamic_range: list[str] = Field(
+        default_factory=list,
+        description="Dynamic range / HDR tags from tracker or MediaInfo (e.g. ['DV', 'HDR10'])",
+    )
+    media_processing: Optional[str] = Field(
+        default=None, description="Release processing tag (e.g. REMUX)"
+    )
     size_gb: Optional[float] = Field(default=None, ge=0, description="Release size in GB")
     freeleech: Optional[bool] = Field(default=None, description="Whether release is freeleech")
     description: Optional[str] = Field(
@@ -47,9 +54,9 @@ class TorrentInfo(BaseModel):
                 return text
         return None
 
-    @field_validator("audio_languages", mode="before")
+    @field_validator("audio_languages", "dynamic_range", mode="before")
     @classmethod
-    def _clean_audio_languages(cls, value: object) -> list[str]:
+    def _clean_string_list(cls, value: object) -> list[str]:
         if value is None:
             return []
         if isinstance(value, str):

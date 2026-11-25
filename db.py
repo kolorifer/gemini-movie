@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -12,6 +13,124 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "triage.db"
 
 IMDB_ID_RE = re.compile(r"\b(tt\d{7,10})\b", re.IGNORECASE)
 YEAR_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
+
+_RES_2160_RE = re.compile(r"(?<![a-z0-9])2160p(?![a-z0-9])", re.IGNORECASE)
+_RES_1080_RE = re.compile(r"(?<![a-z0-9])1080[pi](?![a-z0-9])", re.IGNORECASE)
+_RES_720_RE = re.compile(r"(?<![a-z0-9])720p(?![a-z0-9])", re.IGNORECASE)
+_RES_UHD_RE = re.compile(r"(?<![a-z0-9])(?:4k|uhd)(?![a-z0-9])", re.IGNORECASE)
+_REMUX_RE = re.compile(r"(?<![a-z0-9])remux(?![a-z0-9])", re.IGNORECASE)
+_DV_TAG_RE = re.compile(r"(?<![a-z0-9])(?:dv|dovi|dolby[\s._-]*vision)(?![a-z0-9])", re.IGNORECASE)
+_DV_NFO_RE = re.compile(r"(?<![a-z0-9])(?:dovi|dolby[\s._-]*vision)(?![a-z0-9])", re.IGNORECASE)
+_HDR10PLUS_RE = re.compile(r"(?<![a-z0-9])(?:hdr10\+|hdr10plus|hdr10p)(?![a-z0-9])", re.IGNORECASE)
+_HDR_RE = re.compile(r"(?<![a-z0-9])(?:hdr10|hdr|hlg)(?![a-z0-9])", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ReleaseQuality:
+    resolution: Optional[str] = None
+    is_remux: bool = False
+    dolby_vision: bool = False
+    hdr: bool = False
+    hdr_label: str = "unknown"
+    format_label: str = "unknown"
+    cache_key: str = ""
+
+    def to_prompt_line(self) -> Optional[str]:
+        if not self.cache_key:
+            return None
+        if self.resolution == "2160p" and self.dolby_vision:
+            tier_note = "top preferred tier: 2160p + Dolby Vision bonus (positive tie-breaker on edge cases)"
+        elif self.resolution == "2160p":
+            tier_note = "preferred resolution tier: 2160p (strong preference over 1080p on edge cases)"
+        elif self.resolution == "1080p" and self.dolby_vision:
+            tier_note = "1080p with Dolby Vision (Dolby Vision bonus, though 2160p Remux is preferred)"
+        elif self.resolution == "1080p":
+            tier_note = "1080p tier (less preferred than Remux-2160p / Dolby Vision on borderline edge cases)"
+        else:
+            tier_note = "non-standard quality tier"
+        return (
+            f"Release quality signals: {self.format_label} | Dynamic range: {self.hdr_label} "
+            f"({tier_note})"
+        )
+
+
+def parse_release_quality(
+    raw_text: str,
+    *,
+    resolution: Optional[str] = None,
+    source: Optional[str] = None,
+    dynamic_range: Optional[list[str]] = None,
+    media_processing: Optional[str] = None,
+    nfo_text: Optional[str] = None,
+) -> ReleaseQuality:
+    """Deterministically parse release resolution, remux status, and Dolby Vision/HDR tier."""
+    res_candidates = " ".join(p for p in (resolution or "", raw_text or "", source or "") if p)
+    detected_res: Optional[str] = None
+    if _RES_2160_RE.search(res_candidates):
+        detected_res = "2160p"
+    elif _RES_1080_RE.search(res_candidates):
+        detected_res = "1080p"
+    elif _RES_720_RE.search(res_candidates):
+        detected_res = "720p"
+    elif _RES_UHD_RE.search(res_candidates):
+        detected_res = "2160p"
+
+    remux_text = " ".join(p for p in (media_processing or "", source or "", raw_text or "") if p)
+    is_remux = bool(_REMUX_RE.search(remux_text))
+
+    dr_joined = " ".join(dynamic_range or [])
+    tag_text = " ".join(p for p in (dr_joined, raw_text or "") if p)
+    nfo_str = nfo_text or ""
+
+    has_dv = bool(_DV_TAG_RE.search(tag_text) or _DV_NFO_RE.search(nfo_str))
+    has_hdr10plus = bool(_HDR10PLUS_RE.search(tag_text) or _HDR10PLUS_RE.search(nfo_str))
+    has_hdr = has_hdr10plus or bool(_HDR_RE.search(tag_text) or _HDR_RE.search(nfo_str))
+
+    if has_dv and has_hdr10plus:
+        hdr_label = "Dolby Vision + HDR10+"
+    elif has_dv and has_hdr:
+        hdr_label = "Dolby Vision + HDR"
+    elif has_dv:
+        hdr_label = "Dolby Vision"
+    elif has_hdr10plus:
+        hdr_label = "HDR10+"
+    elif has_hdr:
+        hdr_label = "HDR"
+    elif detected_res in ("2160p", "1080p", "720p"):
+        hdr_label = "SDR"
+    else:
+        hdr_label = "unknown"
+
+    if is_remux and detected_res:
+        format_label = f"Remux-{detected_res}"
+    elif is_remux:
+        format_label = "Remux"
+    elif detected_res:
+        format_label = detected_res
+    elif source:
+        format_label = source.strip()
+    else:
+        format_label = "unknown"
+
+    if not detected_res and not is_remux and not has_dv and not has_hdr:
+        cache_key = ""
+    else:
+        dr_key = "dv" if has_dv else ("hdr" if has_hdr else "sdr")
+        parts = [detected_res or "unknown"]
+        if is_remux:
+            parts.append("remux")
+        parts.append(dr_key)
+        cache_key = "_".join(parts)
+
+    return ReleaseQuality(
+        resolution=detected_res,
+        is_remux=is_remux,
+        dolby_vision=has_dv,
+        hdr=has_hdr or has_dv,
+        hdr_label=hdr_label,
+        format_label=format_label,
+        cache_key=cache_key,
+    )
 
 RELEASE_STOP_TOKENS = frozenset(
     {
@@ -195,6 +314,7 @@ class TriageDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     raw_text_normalized TEXT NOT NULL,
                     release_key TEXT,
+                    quality_key TEXT NOT NULL DEFAULT '',
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
                     canonical_title TEXT NOT NULL,
@@ -229,6 +349,26 @@ class TriageDB:
                     ON feedback (created_at DESC, id DESC);
                 """
             )
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
+            }
+            if "quality_key" not in cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN quality_key TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_quality
+                    ON evaluations (imdb_id, quality_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_quality
+                    ON evaluations (release_key, quality_key, created_at DESC)
+                """
+            )
 
     def get_cached_evaluation(
         self,
@@ -237,6 +377,7 @@ class TriageDB:
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
         extra_context: Optional[str] = None,
+        quality_key: Optional[str] = None,
         ttl_hours: int = 72,
     ) -> Optional[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
@@ -245,17 +386,22 @@ class TriageDB:
         norm_raw = normalize_raw_text(raw_text)
         imdb_id = extract_imdb_id(raw_text, extra_context)
         rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
+        q_key = (
+            quality_key
+            if quality_key is not None
+            else parse_release_quality(raw_text).cache_key
+        )
 
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT response_json
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND created_at >= ?
+                WHERE raw_text_normalized = ? AND quality_key = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, cutoff),
+                (norm_raw, q_key, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
@@ -263,11 +409,11 @@ class TriageDB:
                     """
                     SELECT response_json
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ? AND quality_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), cutoff),
+                    (imdb_id.lower(), q_key, cutoff),
                 ).fetchone()
 
             if row is None and rel_key:
@@ -275,11 +421,11 @@ class TriageDB:
                     """
                     SELECT response_json
                     FROM evaluations
-                    WHERE release_key = ? AND created_at >= ?
+                    WHERE release_key = ? AND quality_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, cutoff),
+                    (rel_key, q_key, cutoff),
                 ).fetchone()
 
         if row is None:
@@ -294,6 +440,7 @@ class TriageDB:
         *,
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
+        quality_key: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> None:
         identification = payload["identification"]
@@ -309,24 +456,29 @@ class TriageDB:
             normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
             or canonical_release_key(canonical_title, year)
         )
+        q_key = (
+            quality_key
+            if quality_key is not None
+            else parse_release_quality(raw_text).cache_key
+        )
         ts = created_at or utc_now_iso()
         serialized = json.dumps(payload, ensure_ascii=False)
 
         with self._connect() as conn:
-            # Replace superseded entries for the exact normalized string or IMDb ID
+            # Replace superseded entries for the same movie AND release quality tier
             conn.execute(
-                "DELETE FROM evaluations WHERE raw_text_normalized = ?",
-                (norm_raw,),
+                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ?",
+                (norm_raw, q_key),
             )
             if imdb_id:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE lower(imdb_id) = ?",
-                    (imdb_id,),
+                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ?",
+                    (imdb_id, q_key),
                 )
             elif rel_key:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE release_key = ?",
-                    (rel_key,),
+                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ?",
+                    (rel_key, q_key),
                 )
 
             conn.execute(
@@ -334,6 +486,7 @@ class TriageDB:
                 INSERT INTO evaluations (
                     raw_text_normalized,
                     release_key,
+                    quality_key,
                     raw_text_original,
                     imdb_id,
                     canonical_title,
@@ -341,11 +494,12 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
                     rel_key,
+                    q_key,
                     raw_text,
                     imdb_id,
                     canonical_title,
