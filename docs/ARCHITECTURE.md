@@ -154,6 +154,8 @@ CREATE TABLE deliveries (
     card_revision           INTEGER NOT NULL,
     delivery_kind           TEXT NOT NULL,       -- actionable_grab | alternative_grab | evidence_review
     status                  TEXT NOT NULL,       -- sending | delivered | ambiguous_delivery | failed
+    process_instance_id     TEXT,                -- UUID of movie-actions-api process owning an active send
+    lease_expires_at        TEXT,                -- bounded lease for active Telegram send
     target_chat_id          TEXT NOT NULL,
     target_thread_id        INTEGER,             -- Telegram message_thread_id (topic)
     ack_chat_id             TEXT,                -- strictly populated from Telegram API response
@@ -186,6 +188,7 @@ CREATE TABLE actions (
     bound_rejection_class   TEXT,                 -- required for alternative_grab revalidation
     status                  TEXT NOT NULL,        -- active | superseded | expired | attempting | ambiguous_radarr | completed_radarr | completed_all | rejected_push
     radarr_movie_id         INTEGER,
+    last_reconciled_at      TEXT,
     feedback_status         TEXT NOT NULL DEFAULT 'not_applicable', -- not_applicable | pending | saved | failed
     feedback_decision_saved TEXT,                 -- populated ONLY on matching evaluator ack
     expires_at              TEXT NOT NULL,
@@ -197,8 +200,10 @@ CREATE TABLE write_attempts (
     attempt_id              TEXT PRIMARY KEY,
     action_id               TEXT NOT NULL REFERENCES actions(action_id),
     completion_group        TEXT NOT NULL,
-    phase                   TEXT NOT NULL,        -- radarr_add_and_push | radarr_watched | evaluator_feedback
+    phase                   TEXT NOT NULL,        -- radarr_add_movie | radarr_release_push | radarr_watched | evaluator_feedback
     status                  TEXT NOT NULL,        -- attempting | succeeded | failed_definitive | ambiguous
+    process_instance_id     TEXT NOT NULL,        -- UUID generated at movie-actions-api startup
+    lease_expires_at        TEXT NOT NULL,        -- now + upstream_http_timeout + 30s
     request_fingerprint     TEXT NOT NULL,        -- sanitized parameters (root_folder, quality_profile_id, tmdb_id — NO downloadUrl)
     outcome_summary         TEXT,                 -- sanitized Radarr/evaluator status
     started_at              TEXT NOT NULL,
@@ -208,6 +213,7 @@ CREATE TABLE write_attempts (
 CREATE INDEX idx_actions_group ON actions(completion_group, status);
 CREATE INDEX idx_actions_release_rev ON actions(release_id, card_revision);
 CREATE INDEX idx_attempts_action ON write_attempts(action_id, started_at);
+CREATE INDEX idx_attempts_status ON write_attempts(status, lease_expires_at);
 ```
 
 ---
@@ -367,33 +373,53 @@ Once a movie identity is independently verified (either pre-evaluation on the fa
 
 ### 6.1 Confirmation Flow (`GET` vs `POST`)
 
-- **`GET /action/{token}`:** Read-only private HTML confirmation page. Validates `SHA-256(token)`, expiry, and current action status. Fetches live Radarr root folders, quality profiles, and exact movie state. Zero side effects.
+- **`GET /action/{token}`:** Read-only private HTML confirmation page. Validates `SHA-256(token)`, expiry, and current action status. Fetches live Radarr root folders, quality profiles, and exact movie state. Zero side effects. When an action (or its `completion_group`) is in `ambiguous_radarr`, renders an explicit reconciliation status view with a read-only-until-confirmed `<form method="POST">` button (`"Re-check Radarr Status & Reconcile"`).
 - **`POST /action/{token}`:** Only mutating path. Serializes concurrent submissions via SQLite `BEGIN IMMEDIATE` on `actions` + `completion_group`:
-  - Expired / unknown / superseded token → `410` / `404` (redacted).
+  - Unknown / superseded token → `404` / `410` (redacted).
+  - Expired token (`now > expires_at`) when `status == 'active'` → `410 Gone` (refuses to initiate any new mutation). Once an action has already been initiated (`attempting`, `ambiguous_radarr`, `completed_radarr`, `completed_all`), `GET`/`POST` remains permitted strictly for status inspection, Radarr reconciliation, and isolated `/feedback` retry (never initiating a new Grab/Watched after expiry).
   - Already `completed_radarr` / `completed_all` → returns idempotent completion page (zero external Radarr writes!). If `feedback_status == 'failed'`, offers an isolated **Retry Evaluator Feedback Only** button that never touches Radarr.
-  - Concurrent in-flight (`attempting`) in same `completion_group` → `409 Conflict` ("Action already in progress").
-  - Prior `ambiguous_radarr` → runs **Reconciliation** before permitting any new external write.
+  - Active in-flight attempt (`attempting` with `process_instance_id == current_process_instance_id` AND `lease_expires_at > now`) in the same `completion_group` → `409 Conflict` ("Action already in progress").
+  - Orphaned or expired-lease attempt (`attempting` with `process_instance_id != current_process_instance_id` OR `lease_expires_at <= now`) → atomically promoted to `write_attempts.status = 'ambiguous'` and `actions.status = 'ambiguous_radarr'` (see [§6.4](#64-restart--orphaned-attempt-recovery-movie-actions-api)) and routed straight into **Reconciliation** (never stranded on `409`).
+  - Prior `ambiguous_radarr` (on the action itself or a sibling in the same `completion_group`) → runs **Reconciliation** ([§6.3](#63-ambiguous-outcome-reconciliation--feedback-isolation)) before permitting any new external write.
 
 ### 6.2 Action Semantics
 
 | Action Type | Pre-Write Checks | Write-Ahead & Radarr Operation | Post-Radarr Feedback (`movie-triage-api`) |
 |---|---|---|---|
-| **`Add & Grab`** (`add_grab`) | Validate chosen root folder & quality profile against live Radarr; lookup `/api/v3/movie?tmdbId={bound_tmdb_id}`; fetch ephemeral push payload from `movie-intake-api` (`POST /internal/releases/{release_id}/push-payload`) in memory. *(If any pre-write check fails, abort cleanly before `attempting`.)* | Commit `write_attempts(status='attempting', phase='radarr_add_and_push')` (no `downloadUrl` stored). Reuse exact existing movie OR `POST /api/v3/movie` with `monitored: true, addOptions: {searchForMovie: false}`. Then `POST /api/v3/release/push` with **only the announced release**. Require **exact single decision** (`len == 1`) with `approved === true` and `rejected === false` (HTTP `200` alone is insufficient!). | Only after confirmed acceptance: `POST /feedback` with `{title, imdb_id, tmdb_id, decision: "watch", note: "Grabbed via Telegram"}`. Verify `status == "saved"` & `decision.upper() == "WATCH"`. |
-| **`Alternative Grab`** (`alternative_grab`, optional via `MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG`) | Same as `Add & Grab`, **plus** revalidate exact `bound_existing_movie_id`, `bound_existing_file_id`, and allowed quality-only rejection class against live Radarr. Reject if file changed or any identity conflict exists. | Same write-ahead + single-release `/api/v3/release/push` + strict `approved === true && rejected === false` check (never searches or modifies unrelated movies). | Same as `Add & Grab` (`decision: "watch"`, `note: "Grabbed via Telegram"`). |
-| **`Add as Watched – Good / Bad`** (`watched_good`, `watched_bad`) | Acquire **shared `completion_group`** lock (`watched:<release_id>:<tmdb_id>`) so Good and Bad share a single watched completion. Resolve `watched` tag ID dynamically from live `/api/v3/tag` by label (no hardcoded tag ID). | Commit `write_attempts(status='attempting', phase='radarr_watched')`. Add unmonitored (`monitored: false`, `searchForMovie: false`, `tags: [watched_tag_id]`) OR update existing movie adding `watched_tag_id`, setting `monitored: false`, preserving all existing tags and existing files. **Mandatory read-back:** `GET /api/v3/movie/{id}` and assert BOTH `watched_tag_id in tags` AND `monitored === false`. No search, no push. | Good → `decision: "watch"`; Bad → `decision: "skip"`; both `note: "watched"`. Older unrated watched links send **no** feedback. Report "Rating saved" **only** on matching `status == "saved"` + matching `decision` ack. |
+| **`Add & Grab`** (`add_grab`) | Validate chosen root folder & quality profile against live Radarr; lookup `/api/v3/movie?tmdbId={bound_tmdb_id}`; fetch ephemeral push payload from `movie-intake-api` (`POST /internal/releases/{release_id}/push-payload`) in memory. *(If any pre-write check fails, abort cleanly before `attempting`.)* | **Two explicit write-ahead phases** (neither stores `downloadUrl`):<br>1. *(Only if movie absent)* Commit `write_attempts(phase='radarr_add_movie', status='attempting', process_instance_id, lease_expires_at)`, then `POST /api/v3/movie` (`monitored: true, addOptions: {searchForMovie: false}`), and record `radarr_movie_id`.<br>2. Commit `write_attempts(phase='radarr_release_push', status='attempting', process_instance_id, lease_expires_at)`, then `POST /api/v3/release/push` with **only the announced release**. Require **exact single decision** (`len == 1`) with `approved === true` and `rejected === false` (HTTP `200` alone is insufficient!). | Only after confirmed acceptance: `POST /feedback` with `{title, imdb_id, tmdb_id, decision: "watch", note: "Grabbed via Telegram"}`. Verify `status == "saved"` & `decision.upper() == "WATCH"`. |
+| **`Alternative Grab`** (`alternative_grab`, optional via `MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG`) | Same as `Add & Grab`, **plus** revalidate exact `bound_existing_movie_id`, `bound_existing_file_id`, and allowed quality-only rejection class against live Radarr. Reject if file changed or any identity conflict exists. | Commit `write_attempts(phase='radarr_release_push', status='attempting', process_instance_id, lease_expires_at)` + single-release `/api/v3/release/push` + strict `approved === true && rejected === false` check (never searches or modifies unrelated movies). | Same as `Add & Grab` (`decision: "watch"`, `note: "Grabbed via Telegram"`). |
+| **`Add as Watched – Good / Bad`** (`watched_good`, `watched_bad`) | Acquire **shared `completion_group`** lock (`watched:<release_id>:<tmdb_id>`) so Good and Bad share a single watched completion. Resolve `watched` tag ID dynamically from live `/api/v3/tag` by label (no hardcoded tag ID). | Commit `write_attempts(phase='radarr_watched', status='attempting', process_instance_id, lease_expires_at)`. Add unmonitored (`monitored: false`, `searchForMovie: false`, `tags: [watched_tag_id]`) OR update existing movie adding `watched_tag_id`, setting `monitored: false`, preserving all existing tags and existing files. **Mandatory read-back:** `GET /api/v3/movie/{id}` and assert BOTH `watched_tag_id in tags` AND `monitored === false`. No search, no push. | Good → `decision: "watch"`; Bad → `decision: "skip"`; both `note: "watched"`. Older unrated watched links send **no** feedback. Report "Rating saved" **only** on matching `status == "saved"` + matching `decision` ack. |
 | **`Standalone Skip`** (`skip`, optional behind `MOVIE_INTEL_STANDALONE_SKIP_ENABLED`) | Explicit user `POST` only (never synthesized from ignoring or expiring a card). Distinct from `Watched – Bad` (user has NOT watched the film). | **Zero Radarr mutations.** | `POST /feedback` with `{title, imdb_id, tmdb_id, decision: "skip", note: "Skipped via Telegram"}`. Report saved only on matching ack. |
 
 ### 6.3 Ambiguous Outcome Reconciliation & Feedback Isolation
 
-- **Ambiguous Radarr Add/Push (`ambiguous_radarr`):** If Radarr times out or drops the connection after committing `write_attempts(status='attempting')`, mark the attempt `ambiguous` and action `ambiguous_radarr`. Never blindly retry `POST /api/v3/release/push`. On reconciliation:
-  1. Query live Radarr `/api/v3/movie?tmdbId={bound_tmdb_id}`, `/api/v3/queue/details`, and `/api/v3/history/movie?movieId={id}` matching the announced release name/guid within the attempt window.
-  2. If the grab is already present in queue or grab history → transition directly to `completed_radarr` (zero second push!) and execute only the pending `/feedback` call.
-  3. If the movie exists but no matching grab exists in queue or history → record prior attempt reconciled-absent and safely permit pushing only the announced release (reusing the existing movie).
-  4. If Radarr remains unreachable → stay `ambiguous_radarr` (`503`) and refuse retry.
-- **Ambiguous Radarr Watched (`ambiguous_radarr`):** On reconciliation, `GET /api/v3/movie?tmdbId={bound_tmdb_id}` and resolve the live `watched` tag ID:
-  1. If movie exists with BOTH `watched` tag AND `monitored === false` → transition to `completed_radarr` and execute only the pending rated `/feedback` call.
-  2. If movie exists partially updated (e.g., added but missing tag or still monitored) → apply idempotent `PUT` preserving files/tags and verify read-back.
-- **Feedback Failure Isolation:** Once `actions.status` reaches `completed_radarr`, the Radarr step is **permanently sealed**. A `502`/`504`/network error from `movie-triage-api POST /feedback` sets `feedback_status = 'failed'`, reports honestly to the user that Radarr succeeded while evaluator feedback did not save, and **never** undoes or repeats the Radarr mutation.
+- **Pre-transmit vs ambiguous failures:** Only a definitive pre-transmit transport failure (local DNS failure or TCP `ConnectionRefusedError` before any HTTP request bytes are sent) marks an attempt `failed_definitive` (`not_transmitted`) and returns `actions.status` to `active`. Any write/read timeout, mid-stream disconnect, ambiguous HTTP `5xx`, or process crash after committing `attempting` transitions the attempt to `ambiguous` and the action to `ambiguous_radarr`.
+- **Ambiguous Phase 1 (`radarr_add_movie`, pre-push):** Because `phase == 'radarr_release_push'` has **never** been entered and `searchForMovie` is `false`, reconciliation queries `GET /api/v3/movie?tmdbId={bound_tmdb_id}`:
+  1. If the movie now exists → mark `radarr_add_movie` succeeded and record `radarr_movie_id`. If `now <= expires_at`, re-fetch the ephemeral push payload in memory from `movie-intake-api` (`POST /internal/releases/{release_id}/push-payload`) and proceed to Phase 2 (`radarr_release_push`); if expired, stop cleanly (`expired`) without pushing.
+  2. If absent → if `now > expires_at`, mark `expired` without mutating Radarr; otherwise revalidate root folder & quality profile against live Radarr and retry `POST /api/v3/movie` (`searchForMovie: false`). If a delayed original `POST` wins the race and returns HTTP `400` ("already exists" on unique `tmdbId`), re-read `GET /api/v3/movie?tmdbId={bound_tmdb_id}`, re-fetch the ephemeral push payload in memory, and reuse the movie before proceeding to Phase 2.
+- **Ambiguous Phase 2 (`radarr_release_push`, non-idempotent acquisition):** Because Radarr's `/api/v3/release/push` has no client idempotency key and an unacknowledged request may **still be executing** inside Radarr:
+  1. Query live Radarr `/api/v3/movie?tmdbId={bound_tmdb_id}`, `/api/v3/queue/details?movieId={id}`, and `/api/v3/history/movie?movieId={id}` matching the announced release title/guid within the attempt window (also checking whether a newly imported file on the movie matches the announced release).
+  2. **Match FOUND in queue, grab history, or imported file:** The original push succeeded! Transition `write_attempts.status = 'succeeded'`, `actions.status = 'completed_radarr'` (zero second push!), and execute ONLY the pending isolated `/feedback` call.
+  3. **Match NOT FOUND in queue/history (absent snapshot):** An absent snapshot **does NOT prove** the original `/api/v3/release/push` finished without acceptance — the delayed original request may still complete and appear in queue/history seconds later. Therefore, **`movie-actions-api` MUST retain `actions.status = 'ambiguous_radarr'` and MUST NOT issue a second `/api/v3/release/push`.** Update `last_reconciled_at` and render a clear status page offering only a read-only **"Re-check Radarr Status"** action. If the delayed original push subsequently completes and appears in queue/history, the next re-check transitions cleanly to `completed_radarr` + isolated `/feedback` with **exactly 1 push total**. (No automatic second push is ever permitted once `radarr_release_push` may have been transmitted; if an operator confirms out-of-band in Radarr that the push never landed, they resolve it directly in Radarr rather than bypassing the single-push invariant.)
+  4. **Radarr unreachable during reconciliation:** Stay `ambiguous_radarr` (`503`), zero writes.
+- **Ambiguous Radarr Watched (`radarr_watched`, idempotent desired-state mutation):** On reconciliation (including when a sibling in the same `completion_group` is `ambiguous_radarr`), `GET /api/v3/movie?tmdbId={bound_tmdb_id}` and resolve the live `watched` tag ID:
+  1. If movie exists with BOTH `watched` tag AND `monitored === false` → seal the original attempt/action as `completed_radarr` (preventing duplicate writes from a sibling Good/Bad link) and execute only the pending rated `/feedback` call.
+  2. If movie exists partially updated (e.g., added without tag or still monitored) → apply idempotent `PUT` preserving files and existing tags, then verify mandatory read-back (`watched` tag AND `monitored === false`).
+  3. If movie is absent → retry unmonitored `POST /api/v3/movie` (`monitored: false`, `searchForMovie: false`, `tags: [watched_tag_id]`); if a delayed original `POST` wins the race with HTTP `400` ("already exists" on unique `tmdbId`), re-read `GET /api/v3/movie?tmdbId=...`, apply idempotent `PUT` if needed, and verify mandatory read-back.
+- **Feedback Failure Isolation:** Once `actions.status` reaches `completed_radarr`, the Radarr step is **permanently sealed**. A `502`/`504`/network error or restart during `phase == 'evaluator_feedback'` sets `feedback_status = 'failed'`, reports honestly to the user that Radarr succeeded while evaluator feedback did not save, and **never** undoes or repeats the Radarr mutation.
+
+### 6.4 Restart & Orphaned-Attempt Recovery (`movie-actions-api`)
+
+At process startup, `movie-actions-api` generates a fresh `process_instance_id` (UUID) and runs a synchronous SQLite `BEGIN IMMEDIATE` recovery sweep inside FastAPI's `lifespan` **before** accepting HTTP traffic:
+
+1. **Orphaned `write_attempts` (`status = 'attempting'` and `process_instance_id != current_process_instance_id`):**
+   - Mark `write_attempts.status = 'ambiguous'`, `outcome_summary = 'orphaned_attempt_after_process_restart'`, `finished_at = now`.
+   - For `phase IN ('radarr_add_movie', 'radarr_release_push', 'radarr_watched')`: transition parent `actions.status` from `'attempting'` → `'ambiguous_radarr'`, so the next `GET` shows reconciliation status and `POST` enters [§6.3](#63-ambiguous-outcome-reconciliation--feedback-isolation) instead of returning `409 Conflict` indefinitely.
+   - For `phase == 'evaluator_feedback'`: leave `actions.status = 'completed_radarr'` intact and mark `feedback_status = 'failed'` (eligible for isolated feedback-only retry without touching Radarr).
+2. **Orphaned `deliveries` (`status = 'sending'` or `eval_reply_status = 'sending'` with `process_instance_id != current_process_instance_id`):**
+   - Transition `deliveries.status` → `'ambiguous_delivery'` (`last_error_redacted = 'orphaned_send_after_process_restart'`), preserving the no-blind-resend invariant.
+   - Transition `deliveries.eval_reply_status` → `'ambiguous_reply'`.
+3. **Runtime stale-lease safeguard:** Even without a process restart, if a handler wedges beyond `lease_expires_at` (`now + upstream_http_timeout + 30s`), the next `BEGIN IMMEDIATE` check promotes the expired `attempting` row to `ambiguous_radarr` and enters reconciliation rather than stranding the action on `409`.
 
 ---
 
@@ -499,19 +525,21 @@ Before any Nginx or autobrr cutover, `movie-intake-api` and `movie-actions-api` 
   - *4c:* Archived & recorded as `suppressed (already_owned)`; **0** Telegram sends.
   - *4d:* Radarr failure does **NOT** establish absence; release is NOT treated as confirmed absent and surfaces unverified Radarr state cleanly (`evidence_review` / Radarr-unavailable status).
 
-### Mandatory Case 5: Lost Radarr / Telegram Acknowledgment & Feedback Failure Isolation
+### Mandatory Case 5: Lost Radarr / Telegram Acknowledgment, Process-Kill Recovery & Feedback Failure Isolation
 - **Inputs & Fault Injections (sanitized):**
   - *5a (Lost Telegram ack):* Telegram stub accepts `sendPhoto`/`sendMessage` then drops connection before returning HTTP response.
-  - *5b (Lost Radarr ack on `Add & Grab`):* User submits `POST /action/{token}`; Radarr stub records push internally then drops connection before responding; user (or reconciliation trigger) submits `POST /action/{token}` again.
+  - *5b (Lost Radarr ack + delayed original push):* User submits `POST /action/{token}` for `Add & Grab`. Radarr stub accepts `POST /api/v3/release/push`, drops the HTTP response (timeout), and **delays** recording the grab in queue/history until **after** the first reconciliation read completes. User submits `POST /action/{token}` once while queue/history is still empty, then again after the delayed original push lands in queue/history.
   - *5c (HTTP 200 rejected Radarr push):* Radarr `/api/v3/release/push` returns HTTP `200` with `[{"approved": false, "rejected": true, "rejections": ["Quality cutoff met"]}]`.
   - *5d (Watched Good/Bad shared completion + `/feedback` failure):* Concurrent `POST`s to `watched_good` and `watched_bad` tokens for the same release; Radarr stub succeeds and passes read-back; evaluator `/feedback` stub returns HTTP `502`.
   - *5e (Poster send failure):* Telegram `sendPhoto` stub returns HTTP `400`; `sendMessage` stub returns `200`.
+  - *5f (Process kill / restart after committing `attempting`):* Hard-kill `movie-actions-api` immediately after `write_attempts(status='attempting')` is committed to `actions.db` and before the Radarr response is persisted — covering both (i) `radarr_release_push` where Radarr already applied the grab, (ii) `radarr_watched` where Radarr already applied `watched` + `monitored=false`, and (iii) an orphaned `deliveries.status='sending'` — then start a fresh `movie-actions-api` process (new `process_instance_id`) and submit `POST /action/{token}`.
 - **Assertions:**
   - *5a:* `deliveries.status == "ambiguous_delivery"`, `ack_message_id IS NULL`; **0** duplicate grab card retries; `/internal/deliver/evaluation` refuses unanchored send.
-  - *5b:* `write_attempts` persisted `attempting` before Radarr call, transitioned to `ambiguous_radarr`; second `POST` reconciles via Radarr queue/history, sees grab already exists, marks `completed_radarr` with **exactly 1** Radarr push total (no duplicate push!), and posts `/feedback` once.
+  - *5b:* `write_attempts(phase='radarr_release_push')` persisted `attempting` before Radarr call, transitioned to `ambiguous_radarr`; **first reconciliation** observes absent queue/history and **retains `ambiguous_radarr` with 0 second pushes** (never treating an absent snapshot as proof of non-acceptance); after the delayed push lands, **second reconciliation** confirms the grab, seals `completed_radarr` with **exactly 1** Radarr push total, and posts `/feedback` once.
   - *5c:* Push is marked `rejected_push` (not accepted); **0** `/feedback` calls; clear rejection shown to user.
   - *5d:* Shared `completion_group` serializes both requests into **exactly 1** Radarr update + **1** read-back check (`watched` tag + `monitored == false`); `/feedback` failure does **NOT** retry or undo Radarr; response confirms Radarr watched succeeded and explicitly states rating was **not** saved (never claims saved without matching ack).
   - *5e:* Falls back to `sendMessage` with identical inline buttons preserved; evaluator is called **exactly once** (never re-queued by poster failure).
+  - *5f:* Startup recovery immediately promotes orphaned `attempting` rows (`process_instance_id != current_process_instance_id`) to `ambiguous_radarr` and orphaned `sending` deliveries to `ambiguous_delivery`; subsequent `POST /action/{token}` does **NOT** return `409 Conflict` forever — it reconciles against live Radarr, transitions both applied Grab and applied Watched cases cleanly to `completed_radarr` with **0** duplicate Radarr writes, and runs isolated `/feedback` once.
 
 ---
 
