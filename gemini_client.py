@@ -67,13 +67,15 @@ def build_system_instruction(
         "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
         "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
         "disambiguation_note.",
-        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) as a "
-        "soft edge-case tie-breaker per the user's taste profile: strongly prefer Remux-2160p over "
-        "Remux-1080p and treat Dolby Vision (DV/DoVi) as a meaningful bonus, especially for visually "
-        "rich cinema. Never treat it as a hard rule — do NOT upgrade a clearly weak film to WATCH "
-        "solely for 2160p DV, and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. "
-        "Only mention release quality in verdict_reason or red_flags when it meaningfully tips a "
-        "borderline decision.",
+        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) and "
+        "FAVORITE RELEASE GROUP (e.g., CiNEPHiLES) as soft edge-case tie-breakers per the user's "
+        "taste profile: strongly prefer Remux-2160p over Remux-1080p, treat Dolby Vision (DV/DoVi) "
+        "as a meaningful visual bonus, and treat releases from a favorite group like CiNEPHiLES as "
+        "a strong positive signal for both technical care and curated selection. Never treat these "
+        "as hard rules — do NOT upgrade a clearly weak film to WATCH solely for 2160p DV or group, "
+        "and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. Only mention "
+        "release quality or release group in verdict_reason or red_flags when it meaningfully "
+        "influences the decision.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),

@@ -57,8 +57,9 @@ No strong genre bias yet. Prioritize films with strong craft, originality, or no
 Release quality preference (soft edge-case factor, not a hard rule):
 - Incoming releases are normally Remux-2160p or Remux-1080p.
 - Strongly prefer Remux-2160p over Remux-1080p, and treat Dolby Vision (DV / DoVi) as a notable visual plus.
-- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
-- Let release quality tip the scales on borderline/edge-case films (especially visually driven cinema where 4K Remux + Dolby Vision shines, vs. borderline films in 1080p SDR).
+- Favorite release group: CiNEPHiLES. Treat releases from CiNEPHiLES as a meaningful positive signal (both for technical/remux quality and curated film selection), especially on borderline/edge-case titles.
+- Never turn a clearly weak or derivative movie into WATCH just because it is 2160p DV or from a favorite group, and never downgrade a clearly great movie to SKIP just because it is 1080p SDR.
+- Let release quality and favorite release group tip the scales on borderline/edge-case films (especially visually driven cinema where 4K Remux + Dolby Vision shines, vs. borderline films in 1080p SDR).
 EOF_TASTE_PROFILE
 
 cat <<'EOF_SCHEMAS' > "$APP_DIR/schemas.py"
@@ -97,6 +98,9 @@ class TorrentInfo(BaseModel):
     )
     media_processing: Optional[str] = Field(
         default=None, description="Release processing tag (e.g. REMUX)"
+    )
+    group: Optional[str] = Field(
+        default=None, description="Release group name (e.g. CiNEPHiLES)"
     )
     size_gb: Optional[float] = Field(default=None, ge=0, description="Release size in GB")
     freeleech: Optional[bool] = Field(default=None, description="Whether release is freeleech")
@@ -293,6 +297,75 @@ _DV_TAG_RE = re.compile(r"(?<![a-z0-9])(?:dv|dovi|dolby[\s._-]*vision)(?![a-z0-9
 _DV_NFO_RE = re.compile(r"(?<![a-z0-9])(?:dovi|dolby[\s._-]*vision)(?![a-z0-9])", re.IGNORECASE)
 _HDR10PLUS_RE = re.compile(r"(?<![a-z0-9])(?:hdr10\+|hdr10plus|hdr10p)(?![a-z0-9])", re.IGNORECASE)
 _HDR_RE = re.compile(r"(?<![a-z0-9])(?:hdr10|hdr|hlg)(?![a-z0-9])", re.IGNORECASE)
+_TRAILING_EXT_RE = re.compile(r"\.(?:mkv|mp4|m2ts|iso|torrent)$", re.IGNORECASE)
+_TRAILING_GROUP_RE = re.compile(r"-([A-Za-z0-9]{2,24})$")
+_TRAILING_BRACKET_GROUP_RE = re.compile(r"\[([A-Za-z0-9]{2,24})\]$")
+_NON_GROUP_SUFFIXES = frozenset(
+    {
+        "dl",
+        "hd",
+        "ray",
+        "ma",
+        "264",
+        "265",
+        "rip",
+        "atmos",
+        "hevc",
+        "avc",
+        "hdr",
+        "hdr10",
+        "dv",
+        "sdr",
+        "remux",
+    }
+)
+FAVORITE_RELEASE_GROUPS = frozenset({"cinephiles"})
+
+
+def _get_favorite_groups() -> frozenset[str]:
+    env_val = os.getenv("FAVORITE_RELEASE_GROUPS", "").strip()
+    if not env_val:
+        return FAVORITE_RELEASE_GROUPS
+    parsed = {
+        tok.strip().lower()
+        for tok in re.split(r"[,;\s]+", env_val)
+        if tok.strip()
+    }
+    return frozenset(parsed) if parsed else FAVORITE_RELEASE_GROUPS
+
+
+def extract_release_group(raw_text: str, *, group: Optional[str] = None) -> Optional[str]:
+    """Extract release group name from explicit tracker field or trailing -GROUP tag."""
+    if group and group.strip():
+        cleaned = group.strip().lstrip("-").strip()
+        return cleaned or None
+
+    text = _TRAILING_EXT_RE.sub("", (raw_text or "").strip()).strip()
+    if not text:
+        return None
+
+    # Only parse trailing -GROUP when the string looks like a release name
+    # (contains a year, resolution, remux, or common release marker)
+    tokens_lower = [
+        t.lower()
+        for t in re.split(r"[\s._\-\[\]\(\)\{\}/\\,:;]+", text)
+        if t
+    ]
+    has_release_marker = any(
+        YEAR_RE.match(t)
+        or t in ("2160p", "1080p", "1080i", "720p", "4k", "uhd", "remux", "bluray", "web", "webdl", "webrip", "hevc", "avc", "x264", "x265", "h264", "h265")
+        for t in tokens_lower
+    )
+    if not has_release_marker:
+        return None
+
+    match = _TRAILING_GROUP_RE.search(text) or _TRAILING_BRACKET_GROUP_RE.search(text)
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    if candidate.lower() in _NON_GROUP_SUFFIXES or YEAR_RE.match(candidate):
+        return None
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -303,10 +376,12 @@ class ReleaseQuality:
     hdr: bool = False
     hdr_label: str = "unknown"
     format_label: str = "unknown"
+    release_group: Optional[str] = None
+    is_favorite_group: bool = False
     cache_key: str = ""
 
     def to_prompt_line(self) -> Optional[str]:
-        if not self.cache_key:
+        if not self.cache_key and not self.release_group:
             return None
         if self.resolution == "2160p" and self.dolby_vision:
             tier_note = "top preferred tier: 2160p + Dolby Vision bonus (positive tie-breaker on edge cases)"
@@ -317,11 +392,17 @@ class ReleaseQuality:
         elif self.resolution == "1080p":
             tier_note = "1080p tier (less preferred than Remux-2160p / Dolby Vision on borderline edge cases)"
         else:
-            tier_note = "non-standard quality tier"
-        return (
-            f"Release quality signals: {self.format_label} | Dynamic range: {self.hdr_label} "
-            f"({tier_note})"
-        )
+            tier_note = "unspecified quality tier"
+
+        parts = [f"Release quality signals: {self.format_label}", f"Dynamic range: {self.hdr_label}"]
+        if self.release_group:
+            if self.is_favorite_group:
+                parts.append(
+                    f"Release group: {self.release_group} (FAVORITE RELEASE GROUP — strong positive signal on edge cases)"
+                )
+            else:
+                parts.append(f"Release group: {self.release_group}")
+        return " | ".join(parts) + f" ({tier_note})"
 
 
 def parse_release_quality(
@@ -331,9 +412,10 @@ def parse_release_quality(
     source: Optional[str] = None,
     dynamic_range: Optional[list[str]] = None,
     media_processing: Optional[str] = None,
+    group: Optional[str] = None,
     nfo_text: Optional[str] = None,
 ) -> ReleaseQuality:
-    """Deterministically parse release resolution, remux status, and Dolby Vision/HDR tier."""
+    """Deterministically parse release resolution, remux status, Dolby Vision/HDR, and release group."""
     res_candidates = " ".join(p for p in (resolution or "", raw_text or "", source or "") if p)
     detected_res: Optional[str] = None
     if _RES_2160_RE.search(res_candidates):
@@ -382,7 +464,11 @@ def parse_release_quality(
     else:
         format_label = "unknown"
 
-    if not detected_res and not is_remux and not has_dv and not has_hdr:
+    release_group = extract_release_group(raw_text, group=group)
+    fav_groups = _get_favorite_groups()
+    is_favorite_group = bool(release_group and release_group.lower() in fav_groups)
+
+    if not detected_res and not is_remux and not has_dv and not has_hdr and not is_favorite_group:
         cache_key = ""
     else:
         dr_key = "dv" if has_dv else ("hdr" if has_hdr else "sdr")
@@ -390,6 +476,8 @@ def parse_release_quality(
         if is_remux:
             parts.append("remux")
         parts.append(dr_key)
+        if is_favorite_group and release_group:
+            parts.append(f"fav_{release_group.lower()}")
         cache_key = "_".join(parts)
 
     return ReleaseQuality(
@@ -399,6 +487,8 @@ def parse_release_quality(
         hdr=has_hdr or has_dv,
         hdr_label=hdr_label,
         format_label=format_label,
+        release_group=release_group,
+        is_favorite_group=is_favorite_group,
         cache_key=cache_key,
     )
 
@@ -1360,6 +1450,8 @@ def format_torrent_info_for_prompt(
             meta_parts.append(f"processing={torrent_info.media_processing}")
         if torrent_info.dynamic_range:
             meta_parts.append("dynamic_range=" + "+".join(torrent_info.dynamic_range))
+        if torrent_info.group:
+            meta_parts.append(f"group={torrent_info.group}")
         if torrent_info.size_gb is not None:
             meta_parts.append(f"size={torrent_info.size_gb:.1f} GB")
         if torrent_info.freeleech is not None:
@@ -1795,13 +1887,15 @@ def build_system_instruction(
         "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
         "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
         "disambiguation_note.",
-        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) as a "
-        "soft edge-case tie-breaker per the user's taste profile: strongly prefer Remux-2160p over "
-        "Remux-1080p and treat Dolby Vision (DV/DoVi) as a meaningful bonus, especially for visually "
-        "rich cinema. Never treat it as a hard rule — do NOT upgrade a clearly weak film to WATCH "
-        "solely for 2160p DV, and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. "
-        "Only mention release quality in verdict_reason or red_flags when it meaningfully tips a "
-        "borderline decision.",
+        "6. Factor RELEASE QUALITY (Remux-2160p vs Remux-1080p, Dolby Vision / HDR vs SDR) and "
+        "FAVORITE RELEASE GROUP (e.g., CiNEPHiLES) as soft edge-case tie-breakers per the user's "
+        "taste profile: strongly prefer Remux-2160p over Remux-1080p, treat Dolby Vision (DV/DoVi) "
+        "as a meaningful visual bonus, and treat releases from a favorite group like CiNEPHiLES as "
+        "a strong positive signal for both technical care and curated selection. Never treat these "
+        "as hard rules — do NOT upgrade a clearly weak film to WATCH solely for 2160p DV or group, "
+        "and do NOT downgrade a clearly great film to SKIP solely for 1080p SDR. Only mention "
+        "release quality or release group in verdict_reason or red_flags when it meaningfully "
+        "influences the decision.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),
@@ -2033,6 +2127,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         source=tinfo.source if tinfo else None,
         dynamic_range=tinfo.dynamic_range if tinfo else None,
         media_processing=tinfo.media_processing if tinfo else None,
+        group=tinfo.group if tinfo else None,
         nfo_text=tinfo.nfo_text if tinfo else None,
     )
 

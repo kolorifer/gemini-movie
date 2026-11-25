@@ -74,6 +74,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         source=tinfo.source if tinfo else None,
         dynamic_range=tinfo.dynamic_range if tinfo else None,
         media_processing=tinfo.media_processing if tinfo else None,
+        group=tinfo.group if tinfo else None,
         nfo_text=tinfo.nfo_text if tinfo else None,
     )
 

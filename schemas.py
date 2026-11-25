@@ -34,6 +34,9 @@ class TorrentInfo(BaseModel):
     media_processing: Optional[str] = Field(
         default=None, description="Release processing tag (e.g. REMUX)"
     )
+    group: Optional[str] = Field(
+        default=None, description="Release group name (e.g. CiNEPHiLES)"
+    )
     size_gb: Optional[float] = Field(default=None, ge=0, description="Release size in GB")
     freeleech: Optional[bool] = Field(default=None, description="Whether release is freeleech")
     description: Optional[str] = Field(

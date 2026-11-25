@@ -280,6 +280,30 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         )
         self.assertTrue(q_nfo.dolby_vision)
         self.assertEqual(q_nfo.cache_key, "2160p_remux_dv")
+        self.assertEqual(q_nfo.release_group, "GRP")
+        self.assertFalse(q_nfo.is_favorite_group)
+
+        # Favorite release group (CiNEPHiLES) detection from raw_text and cache separation
+        q_cine = parse_release_quality(
+            "Sharkys Machine 1981 2160p UHD Blu-ray Remux DV HDR HEVC DTS-HD MA 5 1-CiNEPHiLES"
+        )
+        self.assertEqual(q_cine.release_group, "CiNEPHiLES")
+        self.assertTrue(q_cine.is_favorite_group)
+        self.assertEqual(q_cine.cache_key, "2160p_remux_dv_fav_cinephiles")
+        self.assertIn("FAVORITE RELEASE GROUP", q_cine.to_prompt_line() or "")
+
+        # Explicit tracker group field overrides/supplements raw_text
+        q_cine_explicit = parse_release_quality(
+            "Some Film 1985 1080p BluRay REMUX AVC",
+            group="cinephiles",
+        )
+        self.assertTrue(q_cine_explicit.is_favorite_group)
+        self.assertEqual(q_cine_explicit.cache_key, "1080p_remux_sdr_fav_cinephiles")
+
+        # Non-group suffixes and hyphenated titles are NOT misparsed as release groups
+        self.assertIsNone(parse_release_quality("Spider-Man").release_group)
+        self.assertIsNone(parse_release_quality("Movie 2025 1080p WEB-DL").release_group)
+        self.assertIsNone(parse_release_quality("Movie 2025 2160p UHD Blu-ray").release_group)
 
     def test_evaluate_endpoint_wires_tmdb_grounding_and_cache(self) -> None:
         import main

@@ -493,6 +493,8 @@ def format_torrent_info_for_prompt(
             meta_parts.append(f"processing={torrent_info.media_processing}")
         if torrent_info.dynamic_range:
             meta_parts.append("dynamic_range=" + "+".join(torrent_info.dynamic_range))
+        if torrent_info.group:
+            meta_parts.append(f"group={torrent_info.group}")
         if torrent_info.size_gb is not None:
             meta_parts.append(f"size={torrent_info.size_gb:.1f} GB")
         if torrent_info.freeleech is not None:
