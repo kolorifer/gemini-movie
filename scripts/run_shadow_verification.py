@@ -946,27 +946,64 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                     )
                     assert r5a_eval.status_code == 409
 
-                    # 5f: Process-kill startup orphan recovery + clean post-restart reconciliation (not 409 forever)
-                    dead_tok = "shadow-5f-orphan-token"
-                    all_raw_action_tokens.append(dead_tok)
-                    orphan_act_id = generate_uuid7()
+                    # 5f: Seed orphaned sending delivery + orphaned radarr_watched & radarr_release_push attempts,
+                    # then shut down actions_app and boot a FRESH create_actions_app() with a new process_instance_id
+                    # so the real ASGI lifespan performs startup orphan recovery and clean reconciliation (never 409 forever).
+                    dead_watched_tok = "shadow-5f-orphan-watched-token"
+                    dead_grab_tok = "shadow-5f-orphan-grab-token"
+                    all_raw_action_tokens.extend([dead_watched_tok, dead_grab_tok])
+                    orphan_watched_id = generate_uuid7()
+                    orphan_grab_id = generate_uuid7()
+                    orphan_grab_release = "Example.Film.2024.2160p.UHD.BluRay.REMUX.DV-5F-ORPHAN"
+
+                    # Seed Radarr state representing already-applied Grab for Example Film (tmdb 100100)
+                    radarr_stub.movies[44] = {
+                        "id": 44,
+                        "tmdbId": 100100,
+                        "imdbId": "tt1001000",
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    radarr_stub.history.append(
+                        {
+                            "movieId": 44,
+                            "eventType": "grabbed",
+                            "sourceTitle": orphan_grab_release,
+                            "date": utc_now_iso(),
+                        }
+                    )
+
+                    # Orphan 1: deliveries.status = 'sending' left mid-flight by crashed process
                     actions_app.state.db.begin_card_delivery(
-                        release_id="shadow-5f",
+                        release_id="shadow-5f-sending",
                         card_revision=1,
                         delivery_kind="actionable_grab",
                         target_chat_id="-100111222333",
                         target_thread_id=20,
-                        process_instance_id="shadow-dead-proc",
+                        process_instance_id="shadow-proc-1",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=300)),
+                        new_actions=[],
+                    )
+
+                    # Orphan 2: radarr_watched attempt left 'attempting' after Radarr already applied watched+unmonitored
+                    actions_app.state.db.begin_card_delivery(
+                        release_id="shadow-5f-watched",
+                        card_revision=1,
+                        delivery_kind="actionable_grab",
+                        target_chat_id="-100111222333",
+                        target_thread_id=20,
+                        process_instance_id="shadow-proc-1",
                         lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=300)),
                         new_actions=[
                             NewActionRecord(
-                                action_id=orphan_act_id,
-                                token_sha256=hash_token(dead_tok),
-                                release_id="shadow-5f",
+                                action_id=orphan_watched_id,
+                                token_sha256=hash_token(dead_watched_tok),
+                                release_id="shadow-5f-watched",
                                 card_revision=1,
-                                source_occurrence_id="occ-5f",
+                                source_occurrence_id="occ-5f-watched",
                                 action_type="watched_good",
-                                completion_group="watched:shadow-5f:400401",
+                                completion_group="watched:shadow-5f-watched:400401",
                                 bound_tmdb_id=400401,
                                 bound_imdb_id="tt4004010",
                                 bound_title="Already Watched",
@@ -980,50 +1017,151 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                             )
                         ],
                     )
+                    actions_app.state.db.finish_card_delivery_success(
+                        "shadow-5f-watched",
+                        card_revision=1,
+                        delivery_kind="actionable_grab",
+                        ack_chat_id="-100111222333",
+                        ack_message_id=9501,
+                        ack_thread_id=20,
+                        used_poster=False,
+                        is_edit=False,
+                    )
                     actions_app.state.db.begin_write_attempt(
-                        action_id=orphan_act_id,
-                        completion_group="watched:shadow-5f:400401",
+                        action_id=orphan_watched_id,
+                        completion_group="watched:shadow-5f-watched:400401",
                         phase="radarr_watched",
-                        process_instance_id="shadow-dead-proc",
+                        process_instance_id="shadow-proc-1",
                         lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=300)),
                         request_fingerprint='{"tmdb_id":400401}',
                         allowed_action_statuses=frozenset({"active"}),
                     )
-                    rec_counts = actions_app.state.db.recover_orphaned_state("shadow-restarted-proc")
-                    assert rec_counts["promoted_attempts"] >= 1
-                    assert actions_app.state.db.get_delivery("shadow-5f")["status"] == "ambiguous_delivery"
-                    assert actions_app.state.db.get_action_group_readonly(hash_token(dead_tok)).action["status"] == "ambiguous_radarr"
-                    # Subsequent POST reconciles against live Radarr (movie 41 already watched+unmonitored) with 0 new Radarr writes
-                    updates_before_5f = len(radarr_stub.update_calls)
-                    r5f_post = await ac.post(f"/action/{dead_tok}", data={"confirm": "1", "reconcile": "1"})
-                    assert r5f_post.status_code == 200
-                    assert len(radarr_stub.update_calls) == updates_before_5f
-                    assert actions_app.state.db.get_action_group_readonly(hash_token(dead_tok)).action["status"] == "completed_all"
-                    cases["case_5_lost_acks_and_recovery"] = {
-                        "passed": True,
-                        "subcases": ["5a", "5b", "5c", "5d", "5e", "5f"],
-                    }
 
-                    # ---------------------------------------------------------
-                    # ZERO-SECRET & PERMISSION HYGIENE AUDIT (SQLite + Archive)
-                    # ---------------------------------------------------------
-                    archive_files = list(intake_cfg.webhook_archive_dir.rglob("*.json"))
-                    assert len(archive_files) >= 10
-                    for af in archive_files:
-                        assert (os.lstat(af).st_mode & 0o077) == 0, f"Unsafe archive mode on {af}"
-                    for db_path in (intake_cfg.intake_db_path, actions_cfg.actions_db_path, triage_db_path):
-                        assert (os.lstat(db_path).st_mode & 0o077) == 0, f"Unsafe mode on {db_path}"
-                        raw = db_path.read_bytes()
-                        assert synthetic_passkey.encode("utf-8") not in raw
-                        assert b"SHADOW_RADARR_KEY" not in raw
-                        assert b"SHADOW_TELEGRAM_BOT_TOKEN_DO_NOT_LEAK" not in raw
-                        for tok in all_raw_action_tokens:
-                            assert tok.encode("utf-8") not in raw
-                    cases["zero_secret_and_permission_audit"] = {
-                        "passed": True,
-                        "checked_tokens": len(all_raw_action_tokens),
-                        "checked_archives": len(archive_files),
-                    }
+                    # Orphan 3: radarr_release_push attempt left 'attempting' after Radarr already grabbed release
+                    actions_app.state.db.begin_card_delivery(
+                        release_id="shadow-5f-grab",
+                        card_revision=1,
+                        delivery_kind="actionable_grab",
+                        target_chat_id="-100111222333",
+                        target_thread_id=20,
+                        process_instance_id="shadow-proc-1",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=300)),
+                        new_actions=[
+                            NewActionRecord(
+                                action_id=orphan_grab_id,
+                                token_sha256=hash_token(dead_grab_tok),
+                                release_id="shadow-5f-grab",
+                                card_revision=1,
+                                source_occurrence_id="occ-5f-grab",
+                                action_type="add_grab",
+                                completion_group="grab:shadow-5f-grab:100100",
+                                bound_tmdb_id=100100,
+                                bound_imdb_id="tt1001000",
+                                bound_title="Example Film",
+                                bound_year=2024,
+                                bound_release_name=orphan_grab_release,
+                                bound_existing_movie_id=None,
+                                bound_existing_file_id=None,
+                                bound_existing_file_quality=None,
+                                bound_rejection_class=None,
+                                expires_at=utc_now_iso(utc_now() + timedelta(hours=1)),
+                            )
+                        ],
+                    )
+                    actions_app.state.db.finish_card_delivery_success(
+                        "shadow-5f-grab",
+                        card_revision=1,
+                        delivery_kind="actionable_grab",
+                        ack_chat_id="-100111222333",
+                        ack_message_id=9502,
+                        ack_thread_id=20,
+                        used_poster=False,
+                        is_edit=False,
+                    )
+                    actions_app.state.db.begin_write_attempt(
+                        action_id=orphan_grab_id,
+                        completion_group="grab:shadow-5f-grab:100100",
+                        phase="radarr_release_push",
+                        process_instance_id="shadow-proc-1",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=300)),
+                        request_fingerprint='{"tmdb_id":100100,"release":"' + orphan_grab_release + '"}',
+                        allowed_action_statuses=frozenset({"active"}),
+                    )
+
+        # Boot a brand-new movie-actions-api instance with a new process_instance_id against the same actions.db
+        restarted_actions_app = create_actions_app(
+            actions_cfg,
+            process_instance_id="shadow-proc-2-restarted",
+            radarr_client=radarr_stub,
+            telegram_client=tg_stub,
+            intake_push_client=IntakePushClient(
+                base_url="http://intake.local", internal_token=internal_secret, http_client=a2i_http
+            ),
+            triage_feedback_client=feedback_client,
+        )
+        async with restarted_actions_app.router.lifespan_context(restarted_actions_app):
+            # Startup lifespan MUST have automatically promoted all 3 orphaned records (no manual DB call!)
+            assert restarted_actions_app.state.db.get_delivery("shadow-5f-sending")["status"] == "ambiguous_delivery"
+            assert (
+                restarted_actions_app.state.db.get_action_group_readonly(hash_token(dead_watched_tok)).action["status"]
+                == "ambiguous_radarr"
+            )
+            assert (
+                restarted_actions_app.state.db.get_action_group_readonly(hash_token(dead_grab_tok)).action["status"]
+                == "ambiguous_radarr"
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=restarted_actions_app), base_url="http://actions.local"
+            ) as rac:
+                updates_before_5f = len(radarr_stub.update_calls)
+                pushes_before_5f = len(radarr_stub.push_calls)
+                feedback_before_5f = len(triage_main.db.get_recent_feedback())
+
+                # Reconcile applied Watched via fresh restarted process -> 0 new Radarr updates, 1 /feedback
+                r5f_watched = await rac.post(f"/action/{dead_watched_tok}", data={"confirm": "1", "reconcile": "1"})
+                assert r5f_watched.status_code == 200
+                assert len(radarr_stub.update_calls) == updates_before_5f
+                assert (
+                    restarted_actions_app.state.db.get_action_group_readonly(hash_token(dead_watched_tok)).action["status"]
+                    == "completed_all"
+                )
+
+                # Reconcile applied Grab via fresh restarted process -> 0 new Radarr pushes, 1 /feedback
+                r5f_grab = await rac.post(f"/action/{dead_grab_tok}", data={"confirm": "1", "reconcile": "1"})
+                assert r5f_grab.status_code == 200
+                assert len(radarr_stub.push_calls) == pushes_before_5f
+                assert (
+                    restarted_actions_app.state.db.get_action_group_readonly(hash_token(dead_grab_tok)).action["status"]
+                    == "completed_all"
+                )
+                assert len(triage_main.db.get_recent_feedback()) == feedback_before_5f + 2
+
+        cases["case_5_lost_acks_and_recovery"] = {
+            "passed": True,
+            "subcases": ["5a", "5b", "5c", "5d", "5e", "5f"],
+            "restarted_process_verified": True,
+        }
+
+        # ---------------------------------------------------------
+        # ZERO-SECRET & PERMISSION HYGIENE AUDIT (SQLite + Archive)
+        # ---------------------------------------------------------
+        archive_files = list(intake_cfg.webhook_archive_dir.rglob("*.json"))
+        assert len(archive_files) >= 10
+        for af in archive_files:
+            assert (os.lstat(af).st_mode & 0o077) == 0, f"Unsafe archive mode on {af}"
+        for db_path in (intake_cfg.intake_db_path, actions_cfg.actions_db_path, triage_db_path):
+            assert (os.lstat(db_path).st_mode & 0o077) == 0, f"Unsafe mode on {db_path}"
+            raw = db_path.read_bytes()
+            assert synthetic_passkey.encode("utf-8") not in raw
+            assert b"SHADOW_RADARR_KEY" not in raw
+            assert b"SHADOW_TELEGRAM_BOT_TOKEN_DO_NOT_LEAK" not in raw
+            for tok in all_raw_action_tokens:
+                assert tok.encode("utf-8") not in raw
+        cases["zero_secret_and_permission_audit"] = {
+            "passed": True,
+            "checked_tokens": len(all_raw_action_tokens),
+            "checked_archives": len(archive_files),
+        }
 
         await triage_http.aclose()
         await i2a_http.aclose()

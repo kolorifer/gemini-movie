@@ -383,7 +383,7 @@ wait_for_health() {
   local port="$2"
   local attempt body
   for attempt in $(seq 1 15); do
-    if body="$(curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
+    if body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
       printf '%s\n' "$body" | python3 -m json.tool
       return 0
     fi

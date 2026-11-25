@@ -3,13 +3,17 @@
 # deploy/deploy-suite-ultra.sh (from `app-ports free`).
 #
 # SECURITY INVARIANTS (docs/ARCHITECTURE.md §7.3):
-# - Disable access logging on BOTH secret-bearing routes (/webhook/ and /action/).
+# - Disable access logging AND suppress error logging to /dev/null on BOTH secret-bearing
+#   routes (/webhook/ and /action/) so neither access logs nor upstream failure error logs
+#   (ngx_http_log_error_handler request/upstream URI lines) ever persist secrets or tokens.
+#   (Note: in Nginx, `error_log off;` writes a file named `off`; use `/dev/null emerg;`.)
 # - Preserve prefix stripping so backend apps see /webhook/{secret} and /action/{token}.
 # - Enforce 1m max webhook body size and timeout within autobrr's 30s webhook window.
 # - NEVER proxy /internal/, /replay, /health, /evaluate, or /feedback publicly.
 
 location ^~ /movie-intel/webhook/ {
     access_log off;
+    error_log /dev/null emerg;
     client_max_body_size 1m;
     proxy_connect_timeout 5s;
     proxy_send_timeout 15s;
@@ -22,6 +26,7 @@ location ^~ /movie-intel/webhook/ {
 
 location ^~ /movie-intel/action/ {
     access_log off;
+    error_log /dev/null emerg;
     client_max_body_size 32k;
     proxy_connect_timeout 5s;
     proxy_send_timeout 15s;

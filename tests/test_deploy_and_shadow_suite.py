@@ -189,6 +189,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--no-access-log", suite_text)
         self.assertIn("app-ports free", suite_text)
         self.assertIn('systemctl --user restart "$ACTIONS_SERVICE" "$INTAKE_SERVICE"', suite_text)
+        self.assertIn("--max-time", suite_text)
+        self.assertIn("--connect-timeout", suite_text)
         # Never stops or disables legacy movie-intel.service
         self.assertNotIn("disable movie-intel.service", suite_text)
         self.assertNotIn("stop movie-intel.service", suite_text)
@@ -231,6 +233,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
         # Nginx template security invariants (§7.3)
         nginx_text = nginx_tpl.read_text(encoding="utf-8")
         self.assertEqual(nginx_text.count("access_log off;"), 2)
+        self.assertEqual(nginx_text.count("error_log /dev/null emerg;"), 2)
+        self.assertNotIn("\n    error_log off;", nginx_text)
         self.assertIn("client_max_body_size 1m;", nginx_text)
         self.assertIn("proxy_pass http://127.0.0.1:<PORT_INTAKE>/webhook/;", nginx_text)
         self.assertIn("proxy_pass http://127.0.0.1:<PORT_ACTIONS>/action/;", nginx_text)
@@ -241,6 +245,7 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(prefix="shadow-test-") as tmpdir:
             res = await run_shadow_suite(Path(tmpdir))
             self.assertTrue(res.passed, f"Shadow suite failed: {res.cases}")
+            self.assertTrue(res.cases["case_5_lost_acks_and_recovery"].get("restarted_process_verified"))
             self.assertEqual(
                 set(res.cases.keys()),
                 {

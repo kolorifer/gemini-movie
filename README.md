@@ -58,6 +58,6 @@ The installer:
 4. Runs loopback `GET /health` smoke checks against both services without stopping legacy `movie-intel.service`.
 
 ### 4. User Nginx Proxy Cutover & Rollback
-1. Adapt [deploy/nginx-movie-intel.conf.example](deploy/nginx-movie-intel.conf.example) with the selected `<PORT_INTAKE>` and `<PORT_ACTIONS>`, preserving prefix stripping, `access_log off;` on both `/webhook/` and `/action/`, and `client_max_body_size 1m;` on `/webhook/`. **Never** expose `/internal/`, `/replay`, `/health`, `/evaluate`, or `/feedback`.
+1. Adapt [deploy/nginx-movie-intel.conf.example](deploy/nginx-movie-intel.conf.example) with the selected `<PORT_INTAKE>` and `<PORT_ACTIONS>`, preserving prefix stripping, `access_log off;` and `error_log /dev/null emerg;` on both `/webhook/` and `/action/` (so neither access logs nor upstream failure error logs ever record secrets/tokens), and `client_max_body_size 1m;` on `/webhook/`. **Never** expose `/internal/`, `/replay`, `/health`, `/evaluate`, or `/feedback`.
 2. Reload user Nginx and verify autobrr webhook delivery and Telegram confirmation pages.
 3. Only after live verification succeeds, stop/disable legacy `movie-intel.service`. To roll back at any point, revert the two Nginx `proxy_pass` ports to legacy `127.0.0.1:40714` and reload Nginx.
