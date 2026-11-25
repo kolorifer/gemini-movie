@@ -1514,23 +1514,30 @@ class ActionsDB:
         feedback_decision_saved: Optional[str] = None,
         last_reconciled_at: Optional[str] = None,
         last_error_redacted: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
+        """Finalize an active attempting write_attempt; returns False if the attempt claim was already promoted/closed."""
         now_iso = utc_now_iso()
         clean_outcome = redact_secrets(outcome_summary, max_chars=300) if outcome_summary else None
         clean_err = redact_secrets(last_error_redacted, max_chars=300) if last_error_redacted else None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE write_attempts
                 SET status = ?,
                     outcome_summary = ?,
                     finished_at = ?
                 WHERE attempt_id = ?
+                  AND action_id = ?
+                  AND status = 'attempting'
                 """,
-                (attempt_status, clean_outcome, now_iso, attempt_id),
+                (attempt_status, clean_outcome, now_iso, attempt_id, action_id),
             )
+            if cur.rowcount != 1:
+                conn.execute("COMMIT;")
+                return False
+
             updates: list[str] = ["updated_at = ?"]
             params: list[Any] = [now_iso]
             if action_status is not None:
@@ -1555,10 +1562,11 @@ class ActionsDB:
                 updates.append("last_error_redacted = NULL")
             params.append(action_id)
             conn.execute(
-                f"UPDATE actions SET {', '.join(updates)} WHERE action_id = ?",
+                f"UPDATE actions SET {', '.join(updates)} WHERE action_id = ? AND status != 'completed_all'",
                 params,
             )
             conn.execute("COMMIT;")
+            return True
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1573,7 +1581,12 @@ class ActionsDB:
         radarr_movie_id: Optional[int],
         outcome_summary: str,
         needs_feedback: bool,
-    ) -> None:
+    ) -> bool:
+        """
+        Atomically transition an `ambiguous_radarr` action to `completed_radarr`/`completed_all`.
+        Returns False if the action (or a completion_group sibling) is no longer `ambiguous_radarr`,
+        preserving terminal completion states and preventing duplicate feedback posts.
+        """
         now_iso = utc_now_iso()
         clean_outcome = redact_secrets(outcome_summary, max_chars=300)
         new_action_status = "completed_radarr" if needs_feedback else "completed_all"
@@ -1581,6 +1594,27 @@ class ActionsDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            act_row = conn.execute(
+                "SELECT status, completion_group FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if act_row is None or str(act_row["status"]) != "ambiguous_radarr":
+                conn.execute("COMMIT;")
+                return False
+
+            sib_done = conn.execute(
+                """
+                SELECT action_id FROM actions
+                WHERE completion_group = ?
+                  AND status IN ('completed_radarr', 'completed_all')
+                LIMIT 1
+                """,
+                (str(act_row["completion_group"]),),
+            ).fetchone()
+            if sib_done is not None:
+                conn.execute("COMMIT;")
+                return False
+
             if attempt_id:
                 conn.execute(
                     """
@@ -1588,11 +1622,11 @@ class ActionsDB:
                     SET status = 'succeeded',
                         outcome_summary = ?,
                         finished_at = COALESCE(finished_at, ?)
-                    WHERE attempt_id = ?
+                    WHERE attempt_id = ? AND action_id = ? AND status = 'ambiguous'
                     """,
-                    (clean_outcome, now_iso, attempt_id),
+                    (clean_outcome, now_iso, attempt_id, action_id),
                 )
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE actions
                 SET status = ?,
@@ -1605,6 +1639,7 @@ class ActionsDB:
                     last_error_redacted = NULL,
                     updated_at = ?
                 WHERE action_id = ?
+                  AND status = 'ambiguous_radarr'
                 """,
                 (
                     new_action_status,
@@ -1616,6 +1651,7 @@ class ActionsDB:
                 ),
             )
             conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1679,7 +1715,7 @@ class ActionsDB:
                     last_reconciled_at = ?,
                     last_error_redacted = NULL,
                     updated_at = ?
-                WHERE action_id = ?
+                WHERE action_id = ? AND status = 'ambiguous_radarr'
                 """,
                 (radarr_movie_id, now_iso, now_iso, action_id),
             )
@@ -1696,13 +1732,17 @@ class ActionsDB:
         *,
         action_id: str,
         detail: str,
-    ) -> None:
+    ) -> bool:
+        """
+        Record an absent reconciliation check ONLY while the action is still `ambiguous_radarr`.
+        Never downgrades a concurrently completed (`completed_radarr`/`completed_all`) action.
+        """
         now_iso = utc_now_iso()
         clean = redact_secrets(detail, max_chars=300)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE actions
                 SET status = 'ambiguous_radarr',
@@ -1710,10 +1750,12 @@ class ActionsDB:
                     last_error_redacted = ?,
                     updated_at = ?
                 WHERE action_id = ?
+                  AND status = 'ambiguous_radarr'
                 """,
                 (now_iso, clean, now_iso, action_id),
             )
             conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise

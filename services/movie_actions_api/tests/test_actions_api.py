@@ -1741,6 +1741,113 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(del_final["eval_reply_status"], "sent")
                     self.assertEqual(del_final["eval_reply_message_id"], tg.sent_messages[-1]["message_id"])
 
+    async def test_stale_reconciliation_preserves_completed_all_and_never_reopens_feedback(self) -> None:
+        """Codex Round 2 P1: Stale empty or positive reconciliation finishing after completed_all must never downgrade or re-post feedback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+
+            rel_name = "Completed.Race.2025.2160p.REMUX-CiNEPHiLES"
+            empty_entered = asyncio.Event()
+            release_empty = asyncio.Event()
+            orig_get_history = radarr.get_movie_history
+            history_call = 0
+
+            async def _interleaved_history(movie_id: int) -> RadarrReadResult:
+                nonlocal history_call
+                history_call += 1
+                if history_call == 1:
+                    # Caller #1 observes an EMPTY history snapshot, then pauses until Caller #2 completes!
+                    empty_entered.set()
+                    await asyncio.wait_for(release_empty.wait(), timeout=5.0)
+                    return RadarrReadResult(ok=True, data=[], status_code=200)
+                return await orig_get_history(movie_id)
+
+            radarr.get_movie_history = _interleaved_history  # type: ignore[method-assign]
+
+            app = create_actions_app(
+                cfg,
+                radarr_client=radarr,
+                telegram_client=tg,
+                intake_push_client=ShadowStubIntakePushClient(),
+                triage_feedback_client=fb,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. Deliver card & make push go ambiguous
+                    r_card = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-r2-stale", tmdb_id=620101, title="Completed Race", release_name=rel_name
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_card.status_code, 200)
+                    add_tok = _extract_tokens_from_markup(tg.sent_photos[-1]["reply_markup"])["add_grab"]
+
+                    radarr.push_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_push_ambiguous:ReadTimeout")
+                    )
+                    r_init = await client.post(
+                        f"/action/{add_tok}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_init.status_code, 503)
+                    movie_id = next(iter(radarr.movies.keys()))
+
+                    # 2. Caller #1 starts reconciliation (sees empty history and pauses)
+                    stale_task = asyncio.create_task(
+                        client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    )
+                    await asyncio.wait_for(empty_entered.wait(), timeout=5.0)
+
+                    # 3. Delayed push lands in Radarr history; Caller #2 reconciles -> completed_all + feedback saved!
+                    radarr.history.append(
+                        {
+                            "movieId": movie_id,
+                            "eventType": "grabbed",
+                            "sourceTitle": rel_name,
+                            "date": utc_now_iso(),
+                        }
+                    )
+                    r_winner = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_winner.status_code, 200)
+                    self.assertIn("evaluator rating saved (WATCH)", r_winner.text)
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(add_tok)).action["status"],
+                        "completed_all",
+                    )
+
+                    # 4. Now let stale Caller #1 finish its empty-snapshot reconciliation
+                    release_empty.set()
+                    r_stale = await stale_task
+                    self.assertEqual(r_stale.status_code, 200)
+                    # Persisted status MUST remain completed_all (NOT downgraded to ambiguous_radarr!)
+                    snap_after_stale = app.state.db.get_action_group_readonly(hash_token(add_tok))
+                    self.assertEqual(snap_after_stale.action["status"], "completed_all")
+                    self.assertIn("evaluator rating saved (WATCH)", r_stale.text)
+
+                    # 5. Direct seal_reconciled_attempt call on completed_all MUST return False (never reopens feedback!)
+                    reopened = app.state.db.seal_reconciled_attempt(
+                        attempt_id=None,
+                        action_id=str(snap_after_stale.action["action_id"]),
+                        radarr_movie_id=movie_id,
+                        outcome_summary="duplicate_seal_attempt",
+                        needs_feedback=True,
+                    )
+                    self.assertFalse(reopened)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(add_tok)).action["status"],
+                        "completed_all",
+                    )
+                    self.assertEqual(len(fb.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

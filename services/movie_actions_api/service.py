@@ -1505,7 +1505,7 @@ class ActionsService:
         if is_reconciliation and existing is not None:
             m_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
             if watched_tag_id in m_tags and existing.get("monitored") is False:
-                await asyncio.to_thread(
+                sealed = await asyncio.to_thread(
                     self.db.seal_reconciled_attempt,
                     attempt_id=existing_ambiguous_attempt_id,
                     action_id=str(action["action_id"]),
@@ -1516,10 +1516,13 @@ class ActionsService:
                 refreshed = await asyncio.to_thread(
                     self.db.get_action_group_readonly, str(action["token_sha256"])
                 )
-                target = refreshed.action or action
-                if needs_feedback:
-                    target = await self._run_isolated_feedback(target)
-                return self._render_completion_html(target, action)
+                done_sib = next(
+                    (a for a in refreshed.group_actions if a["status"] in ("completed_all", "completed_radarr")),
+                    refreshed.action or action,
+                )
+                if sealed and needs_feedback and done_sib["status"] == "completed_radarr":
+                    done_sib = await self._run_isolated_feedback(done_sib)
+                return self._render_completion_html(done_sib, action)
 
         selected_root: Optional[str] = None
         selected_profile: Optional[int] = None
@@ -2589,7 +2592,7 @@ class ActionsService:
                             break
 
         if match_found:
-            await asyncio.to_thread(
+            sealed = await asyncio.to_thread(
                 self.db.seal_reconciled_attempt,
                 attempt_id=att_id,
                 action_id=str(amb_act["action_id"]),
@@ -2598,15 +2601,26 @@ class ActionsService:
                 needs_feedback=True,
             )
             refreshed = await asyncio.to_thread(self.db.get_action_group_readonly, str(amb_act["token_sha256"]))
-            updated = await self._run_isolated_feedback(refreshed.action or amb_act)
-            return self._render_completion_html(updated, amb_act)
+            current = refreshed.action or amb_act
+            if sealed and current["status"] == "completed_radarr":
+                current = await self._run_isolated_feedback(current)
+            return self._render_completion_html(current, amb_act)
 
-        # Match NOT FOUND (absent snapshot) -> MUST retain ambiguous_radarr and NEVER issue a 2nd push!
-        await asyncio.to_thread(
+        # Match NOT FOUND (absent snapshot) -> MUST retain ambiguous_radarr (never 2nd push),
+        # AND must NEVER downgrade an action that another reconciler already completed!
+        still_ambiguous = await asyncio.to_thread(
             self.db.mark_action_reconciled_still_ambiguous,
             action_id=str(amb_act["action_id"]),
             detail="reconcile_snapshot_absent_no_second_push",
         )
+        if not still_ambiguous:
+            refreshed = await asyncio.to_thread(self.db.get_action_group_readonly, str(amb_act["token_sha256"]))
+            done_act = next(
+                (a for a in refreshed.group_actions if a["status"] in ("completed_all", "completed_radarr")),
+                None,
+            )
+            if done_act is not None:
+                return self._render_completion_html(done_act, amb_act)
         return HtmlResponseData(
             status_code=200,
             html=render_simple_status_page(
