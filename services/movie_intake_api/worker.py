@@ -566,8 +566,20 @@ class IntakeWorker:
             file_runtime_minutes=tl_result.file_runtime_minutes,
         )
 
+        has_acknowledged_card = (
+            prev_card_revision >= 1
+            and row.get("ack_message_id") is not None
+            and int(row["ack_message_id"]) > 0
+        )
+        resuming_pending_eval_for_ack = (
+            has_acknowledged_card
+            and str(row.get("ack_incoming_digest") or "") == expected_digest
+            and str(row.get("eval_reply_status") or "") == "pending"
+        )
+        has_acknowledged_verified_card = prev_verified and has_acknowledged_card
+
         prev_verified_conflict_reasons: list[str] = []
-        if prev_verified:
+        if has_acknowledged_verified_card:
             prev_imdb = str(row.get("verified_imdb_id") or "").strip().lower() or None
             prev_tmdb = row.get("verified_tmdb_id")
             if prev_imdb and classified.meta_imdb and classified.meta_imdb.lower() != prev_imdb:
@@ -591,16 +603,30 @@ class IntakeWorker:
 
         next_card_rev = prev_card_revision + 1
 
-        # Guard: if already verified previously and this correction pass had only a
-        # transient TL lookup failure (never a genuine tracker conflict or metadata
-        # contradiction against the verified identity), preserve the verified release.
+        # Guard: if a verified card was already acknowledged previously and this pass had
+        # only a transient TL lookup failure (never a genuine tracker conflict or metadata
+        # contradiction against the verified identity), preserve that card.
         if (
-            prev_verified
+            has_acknowledged_verified_card
             and pre_gate.status != "verified"
             and not pre_gate.is_genuine_conflict
             and not has_prev_verified_conflict
             and tl_result.outcome in TL_TRANSIENT_FAILURE_OUTCOMES
         ):
+            if resuming_pending_eval_for_ack:
+                # Card ack was recorded for this digest before crashing mid-/evaluate;
+                # re-queue rather than completing without sending the initial evaluation reply.
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="queued" if retry_count < 4 else "failed_terminal",
+                    expected_incoming_digest=expected_digest,
+                    tl_outcome=tl_result.outcome,
+                    next_attempt_at=self._retry_next_attempt_iso(),
+                    increment_retry=True,
+                )
+                return
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,
@@ -1026,8 +1052,21 @@ class IntakeWorker:
                 checks_failed=merged_failed,
             )
 
-        # Never downgrade an already-verified card on a temporary lookup failure (non-conflict)
-        if prev_verified and final_gate.status != "verified" and not effective_genuine_conflict:
+        # Never downgrade an already-acknowledged verified card on a temporary lookup failure (non-conflict)
+        if has_acknowledged_verified_card and final_gate.status != "verified" and not effective_genuine_conflict:
+            if resuming_pending_eval_for_ack:
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="queued" if retry_count < 4 else "failed_terminal",
+                    expected_incoming_digest=expected_digest,
+                    full_evidence_digest=full_digest,
+                    tl_outcome=tl_result.outcome,
+                    next_attempt_at=self._retry_next_attempt_iso(),
+                    increment_retry=True,
+                )
+                return
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,

@@ -2834,6 +2834,210 @@ Language : German
                 self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
                 self.assertEqual(len(actions.eval_reply_calls), 0)
 
+    def test_failed_initial_card_followed_by_transient_tl_or_tmdb_outage_does_not_complete_empty(self) -> None:
+        """Codex Round 9 P1: Preservation shortcuts must require an acknowledged card and never complete without delivery."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024909,
+                title="Retry Delivery Film",
+                original_title="Retry Delivery Film",
+                year=2024,
+                imdb_id="tt2024909",
+                runtime_minutes=114,
+            )
+
+            reverse_box: dict[str, Optional[list[int]]] = {"res": [2024909]}
+
+            class ToggleTmdbClient(StubTmdbClient):
+                async def find_movies_by_imdb_id(self, imdb_id: str) -> Optional[list[int]]:
+                    return reverse_box["res"]
+
+            tmdb = ToggleTmdbClient(cfg.tmdb_cache_path, {2024909: movie}, {"tt2024909": [2024909]})
+            tl_box = {
+                "res": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024909",
+                    file_runtime_minutes=114,
+                    audio_languages=("English",),
+                )
+            }
+            tl = StubTlScraper(db, cfg.tl_cookie_file, lambda _e, _n: tl_box["res"])
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Retry Delivery Film",
+                        year=2024,
+                        imdb_id="tt2024909",
+                        tmdb_id=2024909,
+                        confidence="high",
+                    ),
+                )
+            )
+            card_fail_box = {"fail": True, "next_id": 910}
+
+            def _card_handler(payload: dict[str, Any]) -> DeliveryCardResponse:
+                if card_fail_box["fail"]:
+                    card_fail_box["fail"] = False
+                    return DeliveryCardResponse(status="failed", detail="actions_connect_error")
+                card_fail_box["next_id"] += 1
+                return DeliveryCardResponse(
+                    status="delivered",
+                    ack_chat_id="-100909",
+                    ack_message_id=card_fail_box["next_id"],
+                    ack_thread_id=9,
+                )
+
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"),
+                card_handler=_card_handler,
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Exact Codex Round 9 repro: initial card definitively fails (rev 0, ack None),
+                #    then retry hits transient TL failure -> MUST deliver rev 1 card + eval reply
+                w1 = _make_autobrr_movie_webhook(
+                    release_name="Retry.Delivery.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="909001",
+                    title="Retry Delivery Film",
+                    year=2024,
+                    meta_imdb="tt2024909",
+                    meta_tmdb=2024909,
+                )
+                rel1_id = client.post("/webhook/test-webhook-secret", json=w1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                mid1 = db.get_release(rel1_id)
+                assert mid1 is not None
+                self.assertEqual(mid1["state"], "queued")
+                self.assertEqual(mid1["card_revision"], 0)
+                self.assertIsNone(mid1["ack_message_id"])
+
+                # Attempt 2: TL has transient HTTP outage while actions recovers
+                tl_box["res"] = TorrentLeechResult(outcome="listing_temporary_http")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                done1 = db.get_release(rel1_id)
+                assert done1 is not None
+                self.assertEqual(done1["state"], "completed")
+                self.assertEqual(done1["card_revision"], 1)
+                self.assertIsNotNone(done1["ack_message_id"])
+                self.assertEqual(done1["identity_gate_status"], "evidence_review")
+                self.assertIsNone(done1["verified_tmdb_id"])
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+
+                # 2) Same sequence hitting transient TMDB reverse-lookup outage on retry
+                #    (exercises post-eval preservation guard too) -> MUST deliver rev 1 card + eval reply
+                tl_box["res"] = TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024909",
+                    file_runtime_minutes=114,
+                    audio_languages=("English",),
+                )
+                reverse_box["res"] = [2024909]
+                card_fail_box["fail"] = True
+                w2 = _make_autobrr_movie_webhook(
+                    release_name="Retry.Delivery.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="909002",
+                    title="Retry Delivery Film",
+                    year=2024,
+                    meta_imdb="tt2024909",
+                    meta_tmdb=2024909,
+                )
+                rel2_id = client.post("/webhook/test-webhook-secret", json=w2).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel2_id)["state"], "queued")  # type: ignore[index]
+
+                reverse_box["res"] = None
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                done2 = db.get_release(rel2_id)
+                assert done2 is not None
+                self.assertEqual(done2["state"], "completed")
+                self.assertEqual(done2["card_revision"], 1)
+                self.assertIsNotNone(done2["ack_message_id"])
+                self.assertEqual(done2["identity_gate_status"], "evidence_review")
+                self.assertIsNone(done2["verified_tmdb_id"])
+                self.assertEqual(len(actions.eval_reply_calls), 2)
+
+                # 3) Crash mid-evaluation AFTER rev 1 verified card ack, followed by transient TL outage:
+                #    re-queues without downgrading or completing empty, then sends reply once TL recovers
+                reverse_box["res"] = [2024909]
+                card_fail_box["fail"] = False
+                w3 = _make_autobrr_movie_webhook(
+                    release_name="Retry.Delivery.Film.2024.2160p.UHD.BluRay.REMUX-GRP3",
+                    external_id="909003",
+                    title="Retry Delivery Film",
+                    year=2024,
+                    meta_imdb="tt2024909",
+                    meta_tmdb=2024909,
+                )
+                rel3_id = client.post("/webhook/test-webhook-secret", json=w3).json()["release_id"]
+                rel3_row = db.get_release(rel3_id)
+                assert rel3_row is not None
+                # Simulate mid-eval crash after rev 1 verified card ack was persisted
+                with sqlite3.connect(str(cfg.intake_db_path)) as conn:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET identity_gate_status='verified',
+                            verified_tmdb_id=2024909,
+                            verified_imdb_id='tt2024909',
+                            verified_title='Retry Delivery Film',
+                            verified_year=2024,
+                            card_revision=1,
+                            ack_chat_id='-100909',
+                            ack_message_id=955,
+                            ack_thread_id=9,
+                            ack_incoming_digest=incoming_evidence_digest,
+                            eval_reply_status='pending',
+                            state='queued'
+                        WHERE release_id=?
+                        """,
+                        (rel3_id,),
+                    )
+                cards_before = len(actions.card_calls)
+                replies_before = len(actions.eval_reply_calls)
+                tl_box["res"] = TorrentLeechResult(outcome="listing_temporary_http")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                mid3 = db.get_release(rel3_id)
+                assert mid3 is not None
+                self.assertEqual(mid3["state"], "queued")
+                self.assertEqual(mid3["identity_gate_status"], "verified")
+                self.assertEqual(mid3["card_revision"], 1)
+                self.assertEqual(len(actions.card_calls), cards_before)
+                self.assertEqual(len(actions.eval_reply_calls), replies_before)
+
+                # Once TL recovers, finishes evaluation + bound reply reusing ack_message_id=955 (0 extra cards)
+                tl_box["res"] = TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024909",
+                    file_runtime_minutes=114,
+                    audio_languages=("English",),
+                )
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                done3 = db.get_release(rel3_id)
+                assert done3 is not None
+                self.assertEqual(done3["state"], "completed")
+                self.assertEqual(done3["card_revision"], 1)
+                self.assertEqual(done3["eval_reply_status"], "sent")
+                self.assertEqual(len(actions.card_calls), cards_before)
+                self.assertEqual(len(actions.eval_reply_calls), replies_before + 1)
+                self.assertEqual(actions.eval_reply_calls[-1]["ack_message_id"], 955)
+
 
 if __name__ == "__main__":
     unittest.main()

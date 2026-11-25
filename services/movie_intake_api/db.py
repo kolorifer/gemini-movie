@@ -770,9 +770,14 @@ class IntakeDB:
                 or str(cur_row["incoming_evidence_digest"]) != expected_incoming_digest
             )
 
-            # Never downgrade an already-verified identity on a temporary lookup failure;
+            # Never downgrade an already-delivered verified card on a temporary lookup failure;
             # only allow superseding to evidence_review on a genuine verified conflict.
-            prev_verified = str(cur_row["identity_gate_status"]) == "verified"
+            prev_verified = (
+                str(cur_row["identity_gate_status"]) == "verified"
+                and int(cur_row["card_revision"] or 0) >= 1
+                and cur_row["ack_message_id"] is not None
+                and int(cur_row["ack_message_id"]) > 0
+            )
             final_gate = identity_gate_status or str(cur_row["identity_gate_status"])
             final_suppression = (
                 cur_row["suppression_reason"] if suppression_reason is ... else suppression_reason
