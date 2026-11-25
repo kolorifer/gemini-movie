@@ -2973,10 +2973,18 @@ Language : German
                 self.assertIsNone(done2["verified_tmdb_id"])
                 self.assertEqual(len(actions.eval_reply_calls), 2)
 
-                # 3) Crash mid-evaluation AFTER rev 1 verified card ack, followed by transient TL outage:
-                #    re-queues without downgrading or completing empty, then sends reply once TL recovers
+                # 3) Real fast-path ack + crash mid-evaluation, followed by lease recovery & transient TL outage:
+                #    proves record_card_ack atomically persists identity_gate_status='verified' + movie IDs
+                #    so recovery preserves rev 1 without downgrading, then finishes the reply once TL recovers.
                 reverse_box["res"] = [2024909]
                 card_fail_box["fail"] = False
+                orig_triage_handler = triage._handler
+
+                def _crash_once(body: dict[str, Any]) -> TriageEvalResult:
+                    triage._handler = orig_triage_handler
+                    raise RuntimeError("simulated_worker_crash_mid_evaluate")
+
+                triage._handler = _crash_once
                 w3 = _make_autobrr_movie_webhook(
                     release_name="Retry.Delivery.Film.2024.2160p.UHD.BluRay.REMUX-GRP3",
                     external_id="909003",
@@ -2986,57 +2994,67 @@ Language : German
                     meta_tmdb=2024909,
                 )
                 rel3_id = client.post("/webhook/test-webhook-secret", json=w3).json()["release_id"]
-                rel3_row = db.get_release(rel3_id)
-                assert rel3_row is not None
-                # Simulate mid-eval crash after rev 1 verified card ack was persisted
-                with sqlite3.connect(str(cfg.intake_db_path)) as conn:
-                    conn.execute(
-                        """
-                        UPDATE releases
-                        SET identity_gate_status='verified',
-                            verified_tmdb_id=2024909,
-                            verified_imdb_id='tt2024909',
-                            verified_title='Retry Delivery Film',
-                            verified_year=2024,
-                            card_revision=1,
-                            ack_chat_id='-100909',
-                            ack_message_id=955,
-                            ack_thread_id=9,
-                            ack_incoming_digest=incoming_evidence_digest,
-                            eval_reply_status='pending',
-                            state='queued'
-                        WHERE release_id=?
-                        """,
-                        (rel3_id,),
-                    )
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(app.state.worker.process_next_queued())
+
+                # Immediately after the crash (BEFORE recovery), rev 1 receipt + verified identity MUST exist
+                crashed3 = db.get_release(rel3_id)
+                assert crashed3 is not None
+                self.assertEqual(crashed3["state"], "evaluating")
+                self.assertEqual(crashed3["card_revision"], 1)
+                self.assertEqual(crashed3["identity_gate_status"], "verified")
+                self.assertEqual(crashed3["verified_tmdb_id"], 2024909)
+                self.assertEqual(crashed3["verified_imdb_id"], "tt2024909")
+                ack_msg_3 = crashed3["ack_message_id"]
+                self.assertIsNotNone(ack_msg_3)
+
+                # Simulate fresh worker process startup recovering the orphaned lease during a transient TL outage
+                recovered_worker = IntakeWorker(
+                    config=cfg,
+                    db=db,
+                    tl_scraper=tl,
+                    tmdb_client=tmdb,
+                    triage_client=triage,
+                    actions_client=actions,
+                    worker_id="recovered-fastpath-worker",
+                )
+                self.assertEqual(
+                    db.recover_orphaned_leases(
+                        active_worker_id="recovered-fastpath-worker",
+                        recover_dead_owners=True,
+                    ),
+                    1,
+                )
                 cards_before = len(actions.card_calls)
                 replies_before = len(actions.eval_reply_calls)
                 tl_box["res"] = TorrentLeechResult(outcome="listing_temporary_http")
-                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertTrue(asyncio.run(recovered_worker.process_next_queued()))
                 mid3 = db.get_release(rel3_id)
                 assert mid3 is not None
                 self.assertEqual(mid3["state"], "queued")
                 self.assertEqual(mid3["identity_gate_status"], "verified")
+                self.assertEqual(mid3["verified_tmdb_id"], 2024909)
                 self.assertEqual(mid3["card_revision"], 1)
                 self.assertEqual(len(actions.card_calls), cards_before)
                 self.assertEqual(len(actions.eval_reply_calls), replies_before)
 
-                # Once TL recovers, finishes evaluation + bound reply reusing ack_message_id=955 (0 extra cards)
+                # Once TL recovers, finishes evaluation + bound reply reusing ack_msg_3 (0 extra cards)
                 tl_box["res"] = TorrentLeechResult(
                     outcome="listing_id_found",
                     imdb_id="tt2024909",
                     file_runtime_minutes=114,
                     audio_languages=("English",),
                 )
-                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertTrue(asyncio.run(recovered_worker.process_next_queued()))
                 done3 = db.get_release(rel3_id)
                 assert done3 is not None
                 self.assertEqual(done3["state"], "completed")
                 self.assertEqual(done3["card_revision"], 1)
+                self.assertEqual(done3["identity_gate_status"], "verified")
                 self.assertEqual(done3["eval_reply_status"], "sent")
                 self.assertEqual(len(actions.card_calls), cards_before)
                 self.assertEqual(len(actions.eval_reply_calls), replies_before + 1)
-                self.assertEqual(actions.eval_reply_calls[-1]["ack_message_id"], 955)
+                self.assertEqual(actions.eval_reply_calls[-1]["ack_message_id"], ack_msg_3)
 
 
 if __name__ == "__main__":

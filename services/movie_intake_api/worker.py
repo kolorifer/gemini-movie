@@ -745,7 +745,8 @@ class IntakeWorker:
                     )
                     return
 
-                # Persist card ack receipt immediately so crash during /evaluate never loses receipt
+                # Persist card ack receipt + verified identity atomically so a crash during
+                # /evaluate preserves the delivered verified card across recovery & transient outages.
                 await asyncio.to_thread(
                     self.db.record_card_ack,
                     release_id,
@@ -755,6 +756,14 @@ class IntakeWorker:
                     ack_message_id=card_resp.ack_message_id,
                     ack_thread_id=card_resp.ack_thread_id,
                     ack_incoming_digest=expected_digest,
+                    tl_outcome=tl_result.outcome,
+                    identity_gate_status="verified",
+                    identity_conflict_reason=None,
+                    verified_tmdb_id=movie.tmdb_id,
+                    verified_imdb_id=movie.imdb_id,
+                    verified_title=movie.title,
+                    verified_year=movie.year,
+                    radarr_status_snapshot=radarr.to_dict(),
                 )
 
             # Now call movie-triage-api /evaluate and post bound reply

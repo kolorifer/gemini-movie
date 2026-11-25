@@ -592,113 +592,95 @@ class IntakeDB:
         radarr_status_snapshot: Optional[dict[str, Any]] = None,
         evaluation_json: Optional[dict[str, Any]] = None,
     ) -> bool:
-        """Persist acknowledged Telegram card receipt (and optional pre-reply metadata) immediately after delivery."""
+        """Persist acknowledged Telegram card receipt and pre-reply identity/snapshot metadata atomically."""
         now_iso = utc_now_iso()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if pending_eval_reply is ...:
-                cur = conn.execute(
-                    """
-                    UPDATE releases
-                    SET card_revision = ?,
-                        ack_chat_id = ?,
-                        ack_message_id = ?,
-                        ack_thread_id = ?,
-                        ack_incoming_digest = ?,
-                        updated_at = ?
-                    WHERE release_id = ? AND lease_owner = ?
-                    """,
-                    (
-                        card_revision,
-                        ack_chat_id,
-                        ack_message_id,
-                        ack_thread_id,
-                        ack_incoming_digest,
-                        now_iso,
-                        release_id,
-                        worker_id,
-                    ),
-                )
-            else:
-                cur_row = conn.execute(
-                    """
-                    SELECT identity_gate_status, identity_conflict_reason,
-                           verified_tmdb_id, verified_imdb_id, verified_title, verified_year
-                    FROM releases
-                    WHERE release_id = ? AND lease_owner = ?
-                    """,
-                    (release_id, worker_id),
-                ).fetchone()
-                if cur_row is None:
-                    conn.execute("COMMIT")
-                    return False
-                pending_reply_json = (
+            cur_row = conn.execute(
+                """
+                SELECT identity_gate_status, identity_conflict_reason,
+                       verified_tmdb_id, verified_imdb_id, verified_title, verified_year,
+                       pending_eval_reply_json
+                FROM releases
+                WHERE release_id = ? AND lease_owner = ?
+                """,
+                (release_id, worker_id),
+            ).fetchone()
+            if cur_row is None:
+                conn.execute("COMMIT")
+                return False
+
+            final_pending_reply = (
+                cur_row["pending_eval_reply_json"]
+                if pending_eval_reply is ...
+                else (
                     json.dumps(pending_eval_reply, ensure_ascii=False)
                     if pending_eval_reply is not None
                     else None
                 )
-                final_gate = identity_gate_status or str(cur_row["identity_gate_status"])
-                final_conflict = (
-                    cur_row["identity_conflict_reason"]
-                    if identity_conflict_reason is ...
-                    else identity_conflict_reason
-                )
-                final_tmdb = cur_row["verified_tmdb_id"] if verified_tmdb_id is ... else verified_tmdb_id
-                final_imdb = cur_row["verified_imdb_id"] if verified_imdb_id is ... else verified_imdb_id
-                final_title = cur_row["verified_title"] if verified_title is ... else verified_title
-                final_year = cur_row["verified_year"] if verified_year is ... else verified_year
-                cur = conn.execute(
-                    """
-                    UPDATE releases
-                    SET card_revision = ?,
-                        ack_chat_id = ?,
-                        ack_message_id = ?,
-                        ack_thread_id = ?,
-                        ack_incoming_digest = ?,
-                        eval_reply_status = 'pending',
-                        pending_eval_reply_json = ?,
-                        full_evidence_digest = COALESCE(?, full_evidence_digest),
-                        last_evaluated_digest = COALESCE(?, last_evaluated_digest),
-                        tl_outcome = COALESCE(?, tl_outcome),
-                        identity_gate_status = ?,
-                        identity_conflict_reason = ?,
-                        verified_tmdb_id = ?,
-                        verified_imdb_id = ?,
-                        verified_title = ?,
-                        verified_year = ?,
-                        radarr_status_snapshot = COALESCE(?, radarr_status_snapshot),
-                        evaluation_json = COALESCE(?, evaluation_json),
-                        updated_at = ?
-                    WHERE release_id = ? AND lease_owner = ?
-                    """,
-                    (
-                        card_revision,
-                        ack_chat_id,
-                        ack_message_id,
-                        ack_thread_id,
-                        ack_incoming_digest,
-                        pending_reply_json,
-                        full_evidence_digest,
-                        last_evaluated_digest,
-                        tl_outcome,
-                        final_gate,
-                        final_conflict,
-                        final_tmdb,
-                        final_imdb,
-                        final_title,
-                        final_year,
-                        json.dumps(radarr_status_snapshot, ensure_ascii=False)
-                        if radarr_status_snapshot is not None
-                        else None,
-                        json.dumps(evaluation_json, ensure_ascii=False)
-                        if evaluation_json is not None
-                        else None,
-                        now_iso,
-                        release_id,
-                        worker_id,
-                    ),
-                )
+            )
+            final_gate = identity_gate_status or str(cur_row["identity_gate_status"])
+            final_conflict = (
+                cur_row["identity_conflict_reason"]
+                if identity_conflict_reason is ...
+                else identity_conflict_reason
+            )
+            final_tmdb = cur_row["verified_tmdb_id"] if verified_tmdb_id is ... else verified_tmdb_id
+            final_imdb = cur_row["verified_imdb_id"] if verified_imdb_id is ... else verified_imdb_id
+            final_title = cur_row["verified_title"] if verified_title is ... else verified_title
+            final_year = cur_row["verified_year"] if verified_year is ... else verified_year
+            cur = conn.execute(
+                """
+                UPDATE releases
+                SET card_revision = ?,
+                    ack_chat_id = ?,
+                    ack_message_id = ?,
+                    ack_thread_id = ?,
+                    ack_incoming_digest = ?,
+                    eval_reply_status = 'pending',
+                    pending_eval_reply_json = ?,
+                    full_evidence_digest = COALESCE(?, full_evidence_digest),
+                    last_evaluated_digest = COALESCE(?, last_evaluated_digest),
+                    tl_outcome = COALESCE(?, tl_outcome),
+                    identity_gate_status = ?,
+                    identity_conflict_reason = ?,
+                    verified_tmdb_id = ?,
+                    verified_imdb_id = ?,
+                    verified_title = ?,
+                    verified_year = ?,
+                    radarr_status_snapshot = COALESCE(?, radarr_status_snapshot),
+                    evaluation_json = COALESCE(?, evaluation_json),
+                    updated_at = ?
+                WHERE release_id = ? AND lease_owner = ?
+                """,
+                (
+                    card_revision,
+                    ack_chat_id,
+                    ack_message_id,
+                    ack_thread_id,
+                    ack_incoming_digest,
+                    final_pending_reply,
+                    full_evidence_digest,
+                    last_evaluated_digest,
+                    tl_outcome,
+                    final_gate,
+                    final_conflict,
+                    final_tmdb,
+                    final_imdb,
+                    final_title,
+                    final_year,
+                    json.dumps(radarr_status_snapshot, ensure_ascii=False)
+                    if radarr_status_snapshot is not None
+                    else None,
+                    json.dumps(evaluation_json, ensure_ascii=False)
+                    if evaluation_json is not None
+                    else None,
+                    now_iso,
+                    release_id,
+                    worker_id,
+                ),
+            )
             conn.execute("COMMIT")
             return cur.rowcount == 1
         except Exception:
