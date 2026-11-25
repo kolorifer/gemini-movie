@@ -38,6 +38,8 @@ from .telegram_format import (
 logger = logging.getLogger(__name__)
 
 _NORM_SPACE_RE = re.compile(r"[\s._-]+")
+_MEDIA_EXT_RE = re.compile(r"\.(?:mkv|mp4|m2ts|iso|avi|ts|mov|wmv|torrent)$", re.IGNORECASE)
+_SAFE_GUID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[a-z0-9][a-z0-9._-]{0,127}$", re.IGNORECASE)
 
 
 class DeliveryValidationError(ValueError):
@@ -57,8 +59,17 @@ class HtmlResponseData:
 def _normalize_release_match_key(name: Optional[str]) -> str:
     if not name:
         return ""
-    cleaned = _NORM_SPACE_RE.sub(" ", str(name).strip().lower()).strip()
-    return cleaned
+    stripped = _MEDIA_EXT_RE.sub("", str(name).strip())
+    return _NORM_SPACE_RE.sub(" ", stripped.lower()).strip()
+
+
+def _extract_safe_guid(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if _SAFE_GUID_RE.fullmatch(cleaned):
+        return cleaned.lower()
+    return None
 
 
 def _extract_existing_quality(movie: dict[str, Any]) -> Optional[str]:
@@ -1868,16 +1879,17 @@ class ActionsService:
         """
         attempt_id: Optional[str] = preopened_attempt_id
         if attempt_id is None:
-            fp = json.dumps(
-                {
-                    "tmdb_id": action.get("bound_tmdb_id"),
-                    "radarr_movie_id": radarr_movie_id,
-                    "release_name": action.get("bound_release_name"),
-                    "indexer": push_payload.get("indexer"),
-                    "action_type": action["action_type"],
-                },
-                sort_keys=True,
-            )
+            fp_obj: dict[str, Any] = {
+                "tmdb_id": action.get("bound_tmdb_id"),
+                "radarr_movie_id": radarr_movie_id,
+                "release_name": action.get("bound_release_name"),
+                "indexer": push_payload.get("indexer"),
+                "action_type": action["action_type"],
+            }
+            safe_guid = _extract_safe_guid(push_payload.get("guid"))
+            if safe_guid:
+                fp_obj["guid"] = safe_guid
+            fp = json.dumps(fp_obj, sort_keys=True)
             ok_lock, attempt_id, conflict = await asyncio.to_thread(
                 self.db.begin_write_attempt,
                 action_id=str(action["action_id"]),
@@ -2200,16 +2212,17 @@ class ActionsService:
 
             # Atomically close Phase 1 and open Phase 2 in ONE transaction (zero dangling gap!)
             assert radarr_movie_id is not None
-            fp2 = json.dumps(
-                {
-                    "tmdb_id": tmdb_id,
-                    "radarr_movie_id": radarr_movie_id,
-                    "release_name": action.get("bound_release_name"),
-                    "indexer": push_payload.get("indexer"),
-                    "action_type": action["action_type"],
-                },
-                sort_keys=True,
-            )
+            fp2_obj: dict[str, Any] = {
+                "tmdb_id": tmdb_id,
+                "radarr_movie_id": radarr_movie_id,
+                "release_name": action.get("bound_release_name"),
+                "indexer": push_payload.get("indexer"),
+                "action_type": action["action_type"],
+            }
+            safe_guid2 = _extract_safe_guid(push_payload.get("guid"))
+            if safe_guid2:
+                fp2_obj["guid"] = safe_guid2
+            fp2 = json.dumps(fp2_obj, sort_keys=True)
             preopened_phase2_attempt_id = await asyncio.to_thread(
                 self.db.complete_phase1_and_begin_phase2,
                 phase1_attempt_id=att1_id,
@@ -2285,20 +2298,12 @@ class ActionsService:
     # 5. Ambiguous Radarr Reconciliation (§6.3 & Mandatory Case 5b / 5f)
     # =========================================================================
 
-    def _matches_announced_release(
+    def _within_attempt_window(
         self,
         *,
-        expected_release_name: str,
-        candidate_title: Optional[str],
         candidate_timestamp: Optional[str],
         attempt_started_at: Optional[str],
     ) -> bool:
-        exp_norm = _normalize_release_match_key(expected_release_name)
-        cand_norm = _normalize_release_match_key(candidate_title)
-        if not exp_norm or not cand_norm:
-            return False
-        if cand_norm != exp_norm and exp_norm not in cand_norm:
-            return False
         if candidate_timestamp and attempt_started_at:
             cand_dt = parse_iso_utc(candidate_timestamp)
             start_dt = parse_iso_utc(attempt_started_at)
@@ -2306,6 +2311,54 @@ class ActionsService:
                 if cand_dt < (start_dt - timedelta(seconds=60)):
                     return False
         return True
+
+    def _matches_announced_release(
+        self,
+        *,
+        expected_release_name: str,
+        candidate_value: Optional[str],
+        candidate_timestamp: Optional[str],
+        attempt_started_at: Optional[str],
+        is_path: bool = False,
+    ) -> bool:
+        """
+        Require EXACT normalized release identity (never substring containment):
+        - For titles/sceneName: strip only a known trailing media/torrent extension and compare exact equality.
+        - For filesystem paths: split path segments and require exact equality against a full path component
+          (release folder name or filename stem), rejecting variants like `-REPACK` / `-PROPER`.
+        """
+        exp_norm = _normalize_release_match_key(expected_release_name)
+        if not exp_norm or not candidate_value or not isinstance(candidate_value, str):
+            return False
+        if not self._within_attempt_window(
+            candidate_timestamp=candidate_timestamp,
+            attempt_started_at=attempt_started_at,
+        ):
+            return False
+
+        if is_path:
+            segments = [seg for seg in re.split(r"[\\/]+", candidate_value.strip()) if seg]
+            return any(_normalize_release_match_key(seg) == exp_norm for seg in segments)
+
+        return _normalize_release_match_key(candidate_value) == exp_norm
+
+    def _matches_guid(
+        self,
+        *,
+        expected_guid: Optional[str],
+        candidate_guid: Any,
+        candidate_timestamp: Optional[str],
+        attempt_started_at: Optional[str],
+    ) -> bool:
+        if not expected_guid:
+            return False
+        cand = _extract_safe_guid(candidate_guid)
+        if not cand or cand != expected_guid:
+            return False
+        return self._within_attempt_window(
+            candidate_timestamp=candidate_timestamp,
+            attempt_started_at=attempt_started_at,
+        )
 
     async def _reconcile_ambiguous_action(
         self,
@@ -2342,6 +2395,14 @@ class ActionsService:
         )
         att_id = str(radarr_att["attempt_id"]) if radarr_att else None
         att_started = str(radarr_att["started_at"]) if radarr_att else None
+        expected_guid: Optional[str] = None
+        if radarr_att and isinstance(radarr_att.get("request_fingerprint"), str):
+            try:
+                fp_parsed = json.loads(radarr_att["request_fingerprint"])
+                if isinstance(fp_parsed, dict):
+                    expected_guid = _extract_safe_guid(fp_parsed.get("guid"))
+            except ValueError:
+                expected_guid = None
 
         # --- Phase C: radarr_watched (idempotent desired-state mutation) ---
         if phase == "radarr_watched":
@@ -2534,21 +2595,27 @@ class ActionsService:
                     ),
                 )
 
-            # 1. Check queue details
+            # 1. Check queue details (exact title or exact GUID)
             for q_item in q_res.data:
                 if not isinstance(q_item, dict):
                     continue
-                if self._matches_announced_release(
-                    expected_release_name=expected_release,
-                    candidate_title=q_item.get("title") or q_item.get("sourceTitle"),
+                if self._matches_guid(
+                    expected_guid=expected_guid,
+                    candidate_guid=q_item.get("guid"),
                     candidate_timestamp=q_item.get("added"),
                     attempt_started_at=att_started,
+                ) or self._matches_announced_release(
+                    expected_release_name=expected_release,
+                    candidate_value=q_item.get("title") or q_item.get("sourceTitle"),
+                    candidate_timestamp=q_item.get("added"),
+                    attempt_started_at=att_started,
+                    is_path=False,
                 ):
                     match_found = True
                     match_source = "queue"
                     break
 
-            # 2. Check grab/import history
+            # 2. Check grab/import history (exact GUID, exact sourceTitle, or exact path component)
             if not match_found:
                 for h_item in h_res.data:
                     if not isinstance(h_item, dict):
@@ -2557,16 +2624,26 @@ class ActionsService:
                     if ev not in ("grabbed", "downloadfolderimported", "grab"):
                         continue
                     h_data = h_item.get("data") if isinstance(h_item.get("data"), dict) else {}
-                    for cand_field in (
-                        h_item.get("sourceTitle"),
-                        h_data.get("droppedPath"),
-                        h_data.get("importedPath"),
+                    if self._matches_guid(
+                        expected_guid=expected_guid,
+                        candidate_guid=h_data.get("guid"),
+                        candidate_timestamp=h_item.get("date"),
+                        attempt_started_at=att_started,
+                    ):
+                        match_found = True
+                        match_source = f"history_guid:{ev}"
+                        break
+                    for cand_field, field_is_path in (
+                        (h_item.get("sourceTitle"), False),
+                        (h_data.get("droppedPath"), True),
+                        (h_data.get("importedPath"), True),
                     ):
                         if self._matches_announced_release(
                             expected_release_name=expected_release,
-                            candidate_title=cand_field,
+                            candidate_value=cand_field,
                             candidate_timestamp=h_item.get("date"),
                             attempt_started_at=att_started,
+                            is_path=field_is_path,
                         ):
                             match_found = True
                             match_source = f"history:{ev}"
@@ -2580,12 +2657,16 @@ class ActionsService:
                 mf_id = mf.get("id")
                 is_old_file = bound_old_file_id is not None and mf_id == bound_old_file_id
                 if not is_old_file:
-                    for cand_field in (mf.get("sceneName"), mf.get("relativePath")):
+                    for cand_field, field_is_path in (
+                        (mf.get("sceneName"), False),
+                        (mf.get("relativePath"), True),
+                    ):
                         if self._matches_announced_release(
                             expected_release_name=expected_release,
-                            candidate_title=cand_field,
+                            candidate_value=cand_field,
                             candidate_timestamp=mf.get("dateAdded"),
                             attempt_started_at=att_started,
+                            is_path=field_is_path,
                         ):
                             match_found = True
                             match_source = "imported_file"

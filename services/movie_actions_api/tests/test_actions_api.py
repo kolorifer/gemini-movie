@@ -1848,6 +1848,121 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(len(fb.calls), 1)
 
+    async def test_push_reconciliation_requires_exact_release_identity_rejecting_repack_substring(self) -> None:
+        """Codex Round 3 P1: Containing release like -REPACK must NOT resolve an ambiguous push; exact component or GUID does."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+
+            announced = "Film.2025.1080p.BluRay.x264-GROUP"
+            repack = "Film.2025.1080p.BluRay.x264-GROUP-REPACK"
+
+            class _GuidIntakePush(ShadowStubIntakePushClient):
+                async def fetch_push_payload(
+                    self, *, release_id: str, source_occurrence_id: str
+                ) -> IntakePushPayloadResult:
+                    return IntakePushPayloadResult(
+                        ok=True,
+                        push_payload={
+                            "title": announced,
+                            "downloadUrl": "https://shadow-tracker.invalid/dl/630101",
+                            "protocol": "torrent",
+                            "publishDate": utc_now_iso(),
+                            "indexer": "torrentleech",
+                            "guid": "torrentleech:630101",
+                        },
+                        status_code=200,
+                    )
+
+            app = create_actions_app(
+                cfg,
+                radarr_client=radarr,
+                telegram_client=tg,
+                intake_push_client=_GuidIntakePush(),
+                triage_feedback_client=fb,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. Trigger ambiguous push for Film.2025.1080p.BluRay.x264-GROUP
+                    r_card = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-r3-exact", tmdb_id=630101, title="Film", release_name=announced
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_card.status_code, 200)
+                    add_tok = _extract_tokens_from_markup(tg.sent_photos[-1]["reply_markup"])["add_grab"]
+
+                    radarr.push_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_push_ambiguous:ReadTimeout")
+                    )
+                    r_init = await client.post(
+                        f"/action/{add_tok}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_init.status_code, 503)
+                    movie_id = next(iter(radarr.movies.keys()))
+
+                    # 2. Another release containing the announced name (-REPACK) appears in queue, history, and imported path
+                    radarr.queue.append({"movieId": movie_id, "title": repack, "added": utc_now_iso()})
+                    radarr.history.append(
+                        {
+                            "movieId": movie_id,
+                            "eventType": "grabbed",
+                            "sourceTitle": repack,
+                            "date": utc_now_iso(),
+                            "data": {
+                                "guid": "torrentleech:999999",
+                                "droppedPath": f"/downloads/{repack}/{repack}.mkv",
+                            },
+                        }
+                    )
+                    radarr.movies[movie_id]["movieFile"] = {
+                        "id": 910,
+                        "sceneName": repack,
+                        "relativePath": f"{repack}/{repack}.mkv",
+                        "dateAdded": utc_now_iso(),
+                    }
+
+                    # Reconcile -> MUST NOT match -REPACK! Must stay ambiguous_radarr with 0 feedback calls!
+                    r_rec_repack = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_repack.status_code, 200)
+                    self.assertIn("NO second release push", r_rec_repack.text)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(add_tok)).action["status"],
+                        "ambiguous_radarr",
+                    )
+                    self.assertEqual(len(fb.calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 1)
+
+                    # 3. Exact release path wrapper (or exact GUID) DOES resolve cleanly!
+                    radarr.history.append(
+                        {
+                            "movieId": movie_id,
+                            "eventType": "downloadFolderImported",
+                            "sourceTitle": "unrelated-display-label",
+                            "date": utc_now_iso(),
+                            "data": {
+                                "importedPath": f"/downloads/{announced}/{announced}.mkv",
+                            },
+                        }
+                    )
+                    r_rec_exact = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_exact.status_code, 200)
+                    self.assertIn("evaluator rating saved (WATCH)", r_rec_exact.text)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(add_tok)).action["status"],
+                        "completed_all",
+                    )
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(len(radarr.push_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
