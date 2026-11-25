@@ -93,6 +93,7 @@ class EvalReplyPlan:
     ack_message_id: Optional[int] = None
     ack_thread_id: Optional[int] = None
     existing_eval_reply_message_id: Optional[int] = None
+    reply_attempt_id: Optional[str] = None
     detail: Optional[str] = None
 
 
@@ -159,6 +160,7 @@ class ActionsDB:
                     used_poster                     INTEGER NOT NULL DEFAULT 0,
                     eval_reply_status               TEXT NOT NULL DEFAULT 'pending',
                     eval_reply_card_revision        INTEGER NOT NULL DEFAULT 0,
+                    eval_reply_attempt_id           TEXT,
                     eval_reply_process_instance_id  TEXT,
                     eval_reply_lease_expires_at     TEXT,
                     eval_reply_message_id           INTEGER,
@@ -169,6 +171,12 @@ class ActionsDB:
                 );
                 """
             )
+            existing_del_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(deliveries)").fetchall()
+            }
+            if "eval_reply_attempt_id" not in existing_del_cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN eval_reply_attempt_id TEXT;")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS actions (
@@ -411,6 +419,7 @@ class ActionsDB:
                 """
                 UPDATE deliveries
                 SET eval_reply_status = 'ambiguous_reply',
+                    eval_reply_attempt_id = NULL,
                     eval_reply_process_instance_id = NULL,
                     eval_reply_lease_expires_at = NULL,
                     last_error_redacted = 'orphaned_reply_after_process_restart',
@@ -812,6 +821,7 @@ class ActionsDB:
                         used_poster = ?,
                         eval_reply_status = 'pending',
                         eval_reply_card_revision = ?,
+                        eval_reply_attempt_id = NULL,
                         eval_reply_process_instance_id = NULL,
                         eval_reply_lease_expires_at = NULL,
                         eval_reply_message_id = NULL,
@@ -1022,6 +1032,7 @@ class ActionsDB:
                         """
                         UPDATE deliveries
                         SET eval_reply_status = 'ambiguous_reply',
+                            eval_reply_attempt_id = NULL,
                             eval_reply_process_instance_id = NULL,
                             eval_reply_lease_expires_at = NULL,
                             last_error_redacted = 'stale_reply_lease_promoted_to_ambiguous',
@@ -1101,11 +1112,13 @@ class ActionsDB:
                 # Fresh revision: clear any stale message IDs from earlier revision
                 existing_reply_msg_id = None
 
+            reply_attempt_id = generate_uuid7()
             conn.execute(
                 """
                 UPDATE deliveries
                 SET eval_reply_status = 'sending',
                     eval_reply_card_revision = ?,
+                    eval_reply_attempt_id = ?,
                     eval_reply_process_instance_id = ?,
                     eval_reply_lease_expires_at = ?,
                     eval_reply_message_id = ?,
@@ -1114,6 +1127,7 @@ class ActionsDB:
                 """,
                 (
                     card_revision,
+                    reply_attempt_id,
                     process_instance_id,
                     lease_expires_at,
                     existing_reply_msg_id,
@@ -1128,6 +1142,7 @@ class ActionsDB:
                 ack_message_id=int(ack_msg),
                 ack_thread_id=int(ack_thread) if ack_thread is not None else None,
                 existing_eval_reply_message_id=existing_reply_msg_id,
+                reply_attempt_id=reply_attempt_id,
             )
         except Exception:
             conn.execute("ROLLBACK;")
@@ -1135,21 +1150,33 @@ class ActionsDB:
         finally:
             conn.close()
 
-    def record_eval_reply_text_sent(self, release_id: str, *, reply_message_id: int) -> None:
+    def record_eval_reply_text_sent(
+        self,
+        release_id: str,
+        *,
+        card_revision: int,
+        reply_attempt_id: str,
+        reply_message_id: int,
+    ) -> bool:
+        """Persist reply_message_id ONLY if (card_revision, reply_attempt_id) still owns the sending claim."""
         now_iso = utc_now_iso()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE deliveries
                 SET eval_reply_message_id = ?,
                     updated_at = ?
                 WHERE release_id = ?
+                  AND eval_reply_card_revision = ?
+                  AND eval_reply_attempt_id = ?
+                  AND eval_reply_status = 'sending'
                 """,
-                (reply_message_id, now_iso, release_id),
+                (reply_message_id, now_iso, release_id, card_revision, reply_attempt_id),
             )
             conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1160,20 +1187,24 @@ class ActionsDB:
         self,
         release_id: str,
         *,
+        card_revision: int,
+        reply_attempt_id: str,
         status: str,
         reply_message_id: Optional[int] = None,
         doc_message_id: Optional[int] = None,
         error_redacted: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
+        """Finalize eval reply ONLY if (card_revision, reply_attempt_id) still owns the sending claim."""
         now_iso = utc_now_iso()
         clean_err = redact_secrets(error_redacted, max_chars=240) if error_redacted else None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE deliveries
                 SET eval_reply_status = ?,
+                    eval_reply_attempt_id = NULL,
                     eval_reply_process_instance_id = NULL,
                     eval_reply_lease_expires_at = NULL,
                     eval_reply_message_id = COALESCE(?, eval_reply_message_id),
@@ -1181,10 +1212,23 @@ class ActionsDB:
                     last_error_redacted = ?,
                     updated_at = ?
                 WHERE release_id = ?
+                  AND eval_reply_card_revision = ?
+                  AND eval_reply_attempt_id = ?
+                  AND eval_reply_status = 'sending'
                 """,
-                (status, reply_message_id, doc_message_id, clean_err, now_iso, release_id),
+                (
+                    status,
+                    reply_message_id,
+                    doc_message_id,
+                    clean_err,
+                    now_iso,
+                    release_id,
+                    card_revision,
+                    reply_attempt_id,
+                ),
             )
             conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1367,6 +1411,24 @@ class ActionsDB:
                 if sib_amb is not None:
                     conn.execute("COMMIT;")
                     return False, None, "group_ambiguous_radarr"
+
+            # Hard single-push invariant (Codex Round 1 P1 #1):
+            # Once ANY radarr_release_push in this completion_group has entered attempting,
+            # ambiguous, or succeeded, NEVER permit a second push or re-entering Phase 1.
+            if phase in ("radarr_release_push", "radarr_add_movie"):
+                prior_push = conn.execute(
+                    """
+                    SELECT attempt_id, status FROM write_attempts
+                    WHERE completion_group = ?
+                      AND phase = 'radarr_release_push'
+                      AND status IN ('attempting', 'ambiguous', 'succeeded')
+                    LIMIT 1
+                    """,
+                    (completion_group,),
+                ).fetchone()
+                if prior_push is not None:
+                    conn.execute("COMMIT;")
+                    return False, None, f"prior_release_push:{prior_push['status']}"
 
             # Update parent action state atomically with write_attempts insert
             if phase in RADARR_PHASES:
@@ -1565,15 +1627,40 @@ class ActionsDB:
         *,
         attempt_id: Optional[str],
         action_id: str,
+        completion_group: str,
         radarr_movie_id: int,
         outcome_summary: str,
-    ) -> None:
-        """Mark ambiguous Phase 1 (radarr_add_movie) succeeded before entering Phase 2."""
+    ) -> bool:
+        """
+        Mark ambiguous Phase 1 (radarr_add_movie) succeeded before entering Phase 2.
+        Returns False if a prior radarr_release_push attempt already exists (attempting/ambiguous/succeeded)
+        or if the action is no longer ambiguous_radarr.
+        """
         now_iso = utc_now_iso()
         clean_outcome = redact_secrets(outcome_summary, max_chars=300)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            act_row = conn.execute(
+                "SELECT status FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if act_row is None or str(act_row["status"]) != "ambiguous_radarr":
+                conn.execute("COMMIT;")
+                return False
+            prior_push = conn.execute(
+                """
+                SELECT attempt_id FROM write_attempts
+                WHERE completion_group = ?
+                  AND phase = 'radarr_release_push'
+                  AND status IN ('attempting', 'ambiguous', 'succeeded')
+                LIMIT 1
+                """,
+                (completion_group,),
+            ).fetchone()
+            if prior_push is not None:
+                conn.execute("COMMIT;")
+                return False
             if attempt_id:
                 conn.execute(
                     """
@@ -1581,7 +1668,7 @@ class ActionsDB:
                     SET status = 'succeeded',
                         outcome_summary = ?,
                         finished_at = COALESCE(finished_at, ?)
-                    WHERE attempt_id = ?
+                    WHERE attempt_id = ? AND status IN ('ambiguous', 'succeeded')
                     """,
                     (clean_outcome, now_iso, attempt_id),
                 )
@@ -1597,6 +1684,7 @@ class ActionsDB:
                 (radarr_movie_id, now_iso, now_iso, action_id),
             )
             conn.execute("COMMIT;")
+            return True
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1643,8 +1731,12 @@ class ActionsDB:
         process_instance_id: str,
         phase2_lease_expires_at: str,
         phase2_request_fingerprint: str,
-    ) -> str:
-        """Atomically mark Phase 1 (radarr_add_movie) succeeded and open Phase 2 (radarr_release_push)."""
+    ) -> Optional[str]:
+        """
+        Atomically mark Phase 1 (radarr_add_movie) succeeded and open Phase 2 (radarr_release_push).
+        Returns None if a prior radarr_release_push attempt already exists in completion_group
+        or if phase1_attempt_id no longer owns the active attempting claim.
+        """
         now_iso = utc_now_iso()
         phase2_attempt_id = generate_uuid7()
         clean_outcome = redact_secrets(phase1_outcome, max_chars=300)
@@ -1652,6 +1744,31 @@ class ActionsDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            p1_row = conn.execute(
+                """
+                SELECT status FROM write_attempts
+                WHERE attempt_id = ? AND action_id = ? AND phase = 'radarr_add_movie'
+                """,
+                (phase1_attempt_id, action_id),
+            ).fetchone()
+            if p1_row is None or str(p1_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            prior_push = conn.execute(
+                """
+                SELECT attempt_id FROM write_attempts
+                WHERE completion_group = ?
+                  AND phase = 'radarr_release_push'
+                  AND status IN ('attempting', 'ambiguous', 'succeeded')
+                LIMIT 1
+                """,
+                (completion_group,),
+            ).fetchone()
+            if prior_push is not None:
+                conn.execute("COMMIT;")
+                return None
+
             conn.execute(
                 """
                 UPDATE write_attempts
@@ -1704,13 +1821,14 @@ class ActionsDB:
         *,
         action_id: str,
         detail: str = "expired",
-    ) -> None:
+    ) -> bool:
+        """Mark action expired ONLY if still active/ambiguous_radarr and no release push may have landed."""
         now_iso = utc_now_iso()
         clean = redact_secrets(detail, max_chars=300)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE actions
                 SET status = 'expired',
@@ -1718,10 +1836,18 @@ class ActionsDB:
                     last_error_redacted = ?,
                     updated_at = ?
                 WHERE action_id = ?
+                  AND status IN ('active', 'ambiguous_radarr')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM write_attempts wa
+                      WHERE wa.completion_group = actions.completion_group
+                        AND wa.phase = 'radarr_release_push'
+                        AND wa.status IN ('attempting', 'ambiguous', 'succeeded')
+                  )
                 """,
                 (now_iso, clean, now_iso, action_id),
             )
             conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise

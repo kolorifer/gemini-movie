@@ -1537,6 +1537,210 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 triage_main.db = orig_triage_db
                 triage_main.INTERNAL_API_SECRET = orig_triage_secret
 
+    async def test_concurrent_phase1_reconciliation_never_issues_second_push_after_ambiguous_push(self) -> None:
+        """Codex Round 1 P1 #1: Concurrent Phase 1 reconcilers cannot issue a 2nd push once 1st push is ambiguous."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+
+            # Controllable intake push client synchronizing two concurrent Phase 1 reconcilers
+            gate_active = False
+            p1_first_done = asyncio.Event()
+            both_at_fetch = asyncio.Event()
+            entered_count = 0
+
+            class _GatedIntakePush(ShadowStubIntakePushClient):
+                async def fetch_push_payload(
+                    self, *, release_id: str, source_occurrence_id: str
+                ) -> IntakePushPayloadResult:
+                    nonlocal entered_count
+                    if gate_active:
+                        entered_count += 1
+                        idx = entered_count
+                        if entered_count == 2:
+                            both_at_fetch.set()
+                        else:
+                            await asyncio.wait_for(both_at_fetch.wait(), timeout=5.0)
+                        if idx == 2:
+                            # Hold caller #2 until caller #1's push has finished with ambiguous_radarr!
+                            await asyncio.wait_for(p1_first_done.wait(), timeout=5.0)
+                    return await super().fetch_push_payload(
+                        release_id=release_id, source_occurrence_id=source_occurrence_id
+                    )
+
+            intake_push = _GatedIntakePush()
+            app = create_actions_app(
+                cfg,
+                radarr_client=radarr,
+                telegram_client=tg,
+                intake_push_client=intake_push,
+                triage_feedback_client=ControllableFeedbackStub(),
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # Deliver card and trigger Phase 1 (radarr_add_movie) timeout -> ambiguous_radarr
+                    r_card = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(release_id="rel-race-p1", tmdb_id=610101, title="Race Film"),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_card.status_code, 200)
+                    add_tok = _extract_tokens_from_markup(tg.sent_photos[-1]["reply_markup"])["add_grab"]
+
+                    radarr.add_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_add_ambiguous:ReadTimeout")
+                    )
+                    r_init = await client.post(
+                        f"/action/{add_tok}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_init.status_code, 503)
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # Movie actually DID land in Radarr during the timed-out Phase 1 add
+                    radarr.movies[610] = {
+                        "id": 610,
+                        "tmdbId": 610101,
+                        "imdbId": "tt5501010",
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    # First Phase 2 push will time out (ambiguous!)
+                    radarr.push_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_push_ambiguous:ReadTimeout")
+                    )
+                    gate_active = True
+
+                    async def _run_reconciler() -> httpx.Response:
+                        try:
+                            return await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                        finally:
+                            p1_first_done.set()
+
+                    r1, r2 = await asyncio.gather(_run_reconciler(), _run_reconciler())
+                    # Caller #1 issued the single push (timed out -> 503); caller #2 MUST be refused (409) with ZERO 2nd push!
+                    self.assertEqual({r1.status_code, r2.status_code}, {503, 409})
+                    self.assertEqual(len(radarr.push_calls), 1)
+                    snap = app.state.db.get_action_group_readonly(hash_token(add_tok))
+                    self.assertEqual(snap.action["status"], "ambiguous_radarr")
+
+    async def test_in_flight_rev1_eval_reply_cannot_clobber_rev2_pending_eval_state(self) -> None:
+        """Codex Round 1 P1 #2: Rev 1 reply finishing after Rev 2 card edit must not mark Rev 2 evaluation sent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            rev1_entered_send = asyncio.Event()
+            allow_rev1_send_finish = asyncio.Event()
+            orig_send_message = tg.send_message
+
+            async def _gated_send_message(**kwargs: Any) -> TelegramSendResult:
+                # Gate ONLY the rev 1 evaluation reply (has reply_to_message_id and "Rev1 Reason")
+                if kwargs.get("reply_to_message_id") and "Rev1 Reason" in str(kwargs.get("text_html") or ""):
+                    rev1_entered_send.set()
+                    await allow_rev1_send_finish.wait()
+                return await orig_send_message(**kwargs)
+
+            tg.send_message = _gated_send_message  # type: ignore[method-assign]
+
+            app = create_actions_app(
+                cfg,
+                radarr_client=ControllableRadarrStub(),
+                telegram_client=tg,
+                intake_push_client=ShadowStubIntakePushClient(),
+                triage_feedback_client=ControllableFeedbackStub(),
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. Deliver rev 1 text card
+                    r_card1 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(release_id="rel-eval-race", card_revision=1, poster_path=None),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_card1.status_code, 200)
+                    ack1 = r_card1.json()
+
+                    # 2. Start rev 1 evaluation reply (pauses inside Telegram sendMessage)
+                    rev1_eval_task = asyncio.create_task(
+                        client.post(
+                            "/internal/deliver/evaluation",
+                            json={
+                                "release_id": "rel-eval-race",
+                                "card_revision": 1,
+                                "ack_chat_id": ack1["ack_chat_id"],
+                                "ack_message_id": ack1["ack_message_id"],
+                                "evaluation": {
+                                    "identification": {"canonical_title": "Film", "year": 2025, "director": "D", "match_confidence": "high"},
+                                    "ratings": {},
+                                    "recognition": {"awards_highlights": [], "critic_consensus": "OK"},
+                                    "decision_aid": {"one_line_pitch": "P", "verdict": "MAYBE", "verdict_reason": "Rev1 Reason", "similar_to": [], "red_flags": []},
+                                },
+                            },
+                            headers=headers,
+                        )
+                    )
+                    await rev1_entered_send.wait()
+
+                    # 3. While rev 1 reply is in flight, rev 2 card edit succeeds (resets eval reply to rev 2 pending)
+                    r_card2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-eval-race",
+                            card_revision=2,
+                            delivery_kind="evidence_review",
+                            extra={"conflict_reason": "corrected_conflict"},
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_card2.status_code, 200)
+
+                    # 4. Now let rev 1 reply finish Telegram sendMessage & call finish_eval_reply
+                    allow_rev1_send_finish.set()
+                    r_eval1 = await rev1_eval_task
+                    self.assertEqual(r_eval1.status_code, 200)
+                    self.assertEqual(r_eval1.json().get("detail"), "superseded_during_send")
+
+                    # Verify rev 2 eval_reply_status is STILL 'pending' (NOT clobbered to 'sent'!)
+                    del_row = app.state.db.get_delivery("rel-eval-race")
+                    self.assertEqual(del_row["eval_reply_card_revision"], 2)
+                    self.assertEqual(del_row["eval_reply_status"], "pending")
+                    self.assertIsNone(del_row["eval_reply_message_id"])
+
+                    # 5. Rev 2 evaluation reply MUST ACTUALLY SEND (NOT return already_sent!)
+                    sent_before_rev2 = len(tg.sent_messages)
+                    r_eval2 = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-eval-race",
+                            "card_revision": 2,
+                            "ack_chat_id": ack1["ack_chat_id"],
+                            "ack_message_id": ack1["ack_message_id"],
+                            "evaluation": {
+                                "identification": {"canonical_title": "Corrected Film", "year": 2025, "director": "D", "match_confidence": "high"},
+                                "ratings": {},
+                                "recognition": {"awards_highlights": [], "critic_consensus": "Great"},
+                                "decision_aid": {"one_line_pitch": "P2", "verdict": "WATCH", "verdict_reason": "Rev2 Corrected Reason", "similar_to": [], "red_flags": []},
+                            },
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval2.status_code, 200)
+                    self.assertEqual(r_eval2.json()["status"], "sent")
+                    self.assertNotEqual(r_eval2.json().get("detail"), "already_sent")
+                    self.assertEqual(len(tg.sent_messages), sent_before_rev2 + 1)
+                    self.assertIn("Rev2 Corrected Reason", tg.sent_messages[-1]["text_html"])
+                    del_final = app.state.db.get_delivery("rel-eval-race")
+                    self.assertEqual(del_final["eval_reply_status"], "sent")
+                    self.assertEqual(del_final["eval_reply_message_id"], tg.sent_messages[-1]["message_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -608,6 +608,8 @@ class ActionsService:
             return {"status": "ambiguous_reply", "detail": plan.detail or plan.mode}
 
         assert plan.ack_chat_id is not None and plan.ack_message_id is not None
+        assert plan.reply_attempt_id is not None
+        reply_attempt_id = plan.reply_attempt_id
         formatted = format_evaluation_reply(
             release_id=release_id,
             evaluation=eval_payload.get("evaluation") if isinstance(eval_payload.get("evaluation"), dict) else None,
@@ -626,6 +628,8 @@ class ActionsService:
                 await asyncio.to_thread(
                     self.db.finish_eval_reply,
                     release_id,
+                    card_revision=card_revision,
+                    reply_attempt_id=reply_attempt_id,
                     status="failed",
                     error_redacted=msg_res.error_redacted or "telegram_reply_failed",
                 )
@@ -634,17 +638,27 @@ class ActionsService:
                 await asyncio.to_thread(
                     self.db.finish_eval_reply,
                     release_id,
+                    card_revision=card_revision,
+                    reply_attempt_id=reply_attempt_id,
                     status="ambiguous_reply",
                     error_redacted=msg_res.error_redacted or "telegram_reply_ambiguous",
                 )
                 return {"status": "ambiguous_reply", "detail": msg_res.error_redacted}
             reply_msg_id = msg_res.ack_message_id
             if formatted.attach_txt:
-                await asyncio.to_thread(
+                still_owner = await asyncio.to_thread(
                     self.db.record_eval_reply_text_sent,
                     release_id,
+                    card_revision=card_revision,
+                    reply_attempt_id=reply_attempt_id,
                     reply_message_id=reply_msg_id,
                 )
+                if not still_owner:
+                    return {
+                        "status": "sent",
+                        "reply_message_id": reply_msg_id,
+                        "detail": "superseded_during_send",
+                    }
 
         doc_msg_id: Optional[int] = None
         if formatted.attach_txt and formatted.txt_content and formatted.txt_filename:
@@ -660,6 +674,8 @@ class ActionsService:
                 await asyncio.to_thread(
                     self.db.finish_eval_reply,
                     release_id,
+                    card_revision=card_revision,
+                    reply_attempt_id=reply_attempt_id,
                     status="failed",
                     reply_message_id=reply_msg_id,
                     error_redacted=doc_res.error_redacted or "telegram_doc_failed",
@@ -669,6 +685,8 @@ class ActionsService:
                 await asyncio.to_thread(
                     self.db.finish_eval_reply,
                     release_id,
+                    card_revision=card_revision,
+                    reply_attempt_id=reply_attempt_id,
                     status="ambiguous_reply",
                     reply_message_id=reply_msg_id,
                     error_redacted=doc_res.error_redacted or "telegram_doc_ambiguous",
@@ -676,14 +694,21 @@ class ActionsService:
                 return {"status": "ambiguous_reply", "detail": doc_res.error_redacted}
             doc_msg_id = doc_res.ack_message_id
 
-        await asyncio.to_thread(
+        updated = await asyncio.to_thread(
             self.db.finish_eval_reply,
             release_id,
+            card_revision=card_revision,
+            reply_attempt_id=reply_attempt_id,
             status="sent",
             reply_message_id=reply_msg_id,
             doc_message_id=doc_msg_id,
         )
-        return {"status": "sent", "reply_message_id": reply_msg_id, "doc_message_id": doc_msg_id}
+        return {
+            "status": "sent",
+            "reply_message_id": reply_msg_id,
+            "doc_message_id": doc_msg_id,
+            **({"detail": "superseded_during_send"} if not updated else {}),
+        }
 
     # =========================================================================
     # 3. Private Action Confirmation (GET /action/{token} — strictly read-only)
@@ -2193,6 +2218,16 @@ class ActionsService:
                 phase2_lease_expires_at=self._lease_iso(self.config.radarr_timeout_seconds),
                 phase2_request_fingerprint=fp2,
             )
+            if preopened_phase2_attempt_id is None:
+                return HtmlResponseData(
+                    status_code=409,
+                    html=render_simple_status_page(
+                        title="Push Conflict",
+                        badge="409",
+                        message="Another release push attempt already exists or Phase 1 claim was superseded; refusing duplicate push.",
+                        tone="warn",
+                    ),
+                )
 
         # Phase 2: radarr_release_push (ONLY announced release)
         assert radarr_movie_id is not None
@@ -2341,19 +2376,45 @@ class ActionsService:
             movies = [m for m in movies_res.data if isinstance(m, dict)]
             if len(movies) == 1:
                 movie_id = int(movies[0]["id"])
-                await asyncio.to_thread(
+                advanced = await asyncio.to_thread(
                     self.db.mark_phase1_add_movie_reconciled,
                     attempt_id=att_id,
                     action_id=str(amb_act["action_id"]),
+                    completion_group=str(amb_act["completion_group"]),
                     radarr_movie_id=movie_id,
                     outcome_summary=f"reconciled_movie_present:{movie_id}",
                 )
+                if not advanced:
+                    return HtmlResponseData(
+                        status_code=409,
+                        html=render_simple_status_page(
+                            title="Reconciliation State Changed",
+                            badge="409",
+                            message=(
+                                "Another reconciliation already advanced this action (or a release push was already "
+                                "attempted). Refresh and re-check Radarr status rather than issuing a second push."
+                            ),
+                            tone="warn",
+                            post_button_label="Re-check Radarr Status",
+                            hidden_fields={"confirm": "1", "reconcile": "1"},
+                        ),
+                    )
                 if self._is_expired(amb_act):
-                    await asyncio.to_thread(
+                    expired_ok = await asyncio.to_thread(
                         self.db.mark_action_expired,
                         action_id=str(amb_act["action_id"]),
                         detail="expired_before_phase2_push",
                     )
+                    if not expired_ok:
+                        return HtmlResponseData(
+                            status_code=409,
+                            html=render_simple_status_page(
+                                title="Reconciliation State Changed",
+                                badge="409",
+                                message="Action state changed concurrently; refresh to view current status.",
+                                tone="warn",
+                            ),
+                        )
                     return HtmlResponseData(
                         status_code=410,
                         html=render_simple_status_page(
@@ -2388,11 +2449,21 @@ class ActionsService:
 
             if len(movies) == 0:
                 if self._is_expired(amb_act):
-                    await asyncio.to_thread(
+                    expired_ok = await asyncio.to_thread(
                         self.db.mark_action_expired,
                         action_id=str(amb_act["action_id"]),
                         detail="expired_with_movie_absent",
                     )
+                    if not expired_ok:
+                        return HtmlResponseData(
+                            status_code=409,
+                            html=render_simple_status_page(
+                                title="Reconciliation State Changed",
+                                badge="409",
+                                message="Action state changed concurrently; refresh to view current status.",
+                                tone="warn",
+                            ),
+                        )
                     return HtmlResponseData(
                         status_code=410,
                         html=render_simple_status_page(
