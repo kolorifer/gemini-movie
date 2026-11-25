@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 
 from schemas import EvaluateRequest, EvaluationPayload
+from tmdb_client import sanitize_tracker_text
 
 DEFAULT_TASTE_PROFILE_PATH = Path(__file__).resolve().parent / "taste_profile.txt"
 DEFAULT_TASTE_PROFILE = (
@@ -89,7 +90,8 @@ def build_system_instruction(
         lines.append("RECENT USER FEEDBACK HISTORY (most recent first):")
         for row in recent_feedback[:20]:
             imdb_part = f" [{row['imdb_id']}]" if row.get("imdb_id") else ""
-            note_part = f" — {row['note']}" if row.get("note") else ""
+            clean_note = sanitize_tracker_text(row.get("note"), max_chars=200)
+            note_part = f" — {clean_note}" if clean_note else ""
             lines.append(
                 f"- {row['decision']}: {row['title']}{imdb_part}{note_part}"
             )
@@ -109,7 +111,9 @@ def build_user_prompt(
     if request.hint_year is not None:
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
-        parts.append(f"Extra context: {request.extra_context}")
+        clean_extra = sanitize_tracker_text(request.extra_context, max_chars=500)
+        if clean_extra:
+            parts.append(f"Extra context: {clean_extra}")
     if release_quality_context:
         parts.append(release_quality_context)
     if torrent_context:
@@ -207,8 +211,8 @@ class GeminiTriageClient:
         torrent_context: Optional[str] = None,
         release_quality_context: Optional[str] = None,
     ) -> EvaluationPayload:
-        # Dynamically reload taste_profile.txt on every single request
-        taste_profile = load_taste_profile(self.taste_profile_path)
+        # Dynamically reload taste_profile.txt off the event loop on every request
+        taste_profile = await asyncio.to_thread(load_taste_profile, self.taste_profile_path)
         system_instruction = build_system_instruction(taste_profile, recent_feedback)
 
         try:
@@ -230,4 +234,5 @@ class GeminiTriageClient:
         except GeminiClientError:
             raise
         except Exception as exc:
-            raise GeminiClientError(f"Gemini evaluation failed: {exc}") from exc
+            redacted = sanitize_tracker_text(str(exc), max_chars=400) or exc.__class__.__name__
+            raise GeminiClientError(f"Gemini evaluation failed: {redacted}") from exc
