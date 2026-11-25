@@ -444,7 +444,16 @@ async def run_independent_identity_gate(
 
     # Confirm reverse /find/{imdb_id} agrees uniquely with movie.tmdb_id
     reverse_ids = await tmdb_client.find_movies_by_imdb_id(movie.imdb_id)
-    if reverse_ids is None or len(reverse_ids) != 1 or reverse_ids[0] != movie.tmdb_id:
+    if reverse_ids is None:
+        failed.append("tmdb_reverse_find_failed")
+        return IdentityGateResult(
+            status="evidence_review",
+            conflict_reason=f"Reverse TMDB lookup for {movie.imdb_id} failed transiently",
+            is_genuine_conflict=False,
+            checks_passed=tuple(passed),
+            checks_failed=tuple(failed),
+        )
+    if len(reverse_ids) != 1 or reverse_ids[0] != movie.tmdb_id:
         failed.append("imdb_reverse_find_disagreement")
         return IdentityGateResult(
             status="evidence_review",

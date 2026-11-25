@@ -2129,6 +2129,130 @@ Language : German
                 )
                 self.assertEqual(r_tamper.status_code, 409)
 
+    def test_reverse_tmdb_lookup_outage_preserves_verified_card_while_disagreement_supersedes(self) -> None:
+        """Codex Round 3 P1: Reverse TMDB /find outage (None) must NOT downgrade a verified card, while real disagreement must supersede."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024903,
+                title="Reverse Check Film",
+                original_title="Reverse Check Film",
+                year=2024,
+                imdb_id="tt2024903",
+                runtime_minutes=118,
+            )
+
+            reverse_mode: dict[str, Optional[list[int]]] = {"result": [2024903]}
+
+            class FaultyReverseTmdbClient(StubTmdbClient):
+                async def find_movies_by_imdb_id(self, imdb_id: str) -> Optional[list[int]]:
+                    return reverse_mode["result"]
+
+            tmdb = FaultyReverseTmdbClient(cfg.tmdb_cache_path, {2024903: movie}, {"tt2024903": [2024903]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _e, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024903",
+                    file_runtime_minutes=118,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Reverse Check Film",
+                        year=2024,
+                        imdb_id="tt2024903",
+                        tmdb_id=2024903,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Initial release verifies cleanly with actionable rev 1 card
+                w1 = _make_autobrr_movie_webhook(
+                    release_name="Reverse.Check.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="903001",
+                    title="Reverse Check Film",
+                    year=2024,
+                    meta_imdb="tt2024903",
+                    meta_tmdb=2024903,
+                    freeleech=False,
+                )
+                rel_id = client.post("/webhook/test-webhook-secret", json=w1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(db.get_release(rel_id)["identity_gate_status"], "verified")  # type: ignore[index]
+
+                # 2) Correction arrives supplying meta_tmdb while reverse /find/{imdb_id} fails transiently (None)
+                #    -> MUST preserve verified rev 1 card (0 supersession cards)
+                reverse_mode["result"] = None
+                w2_outage = _make_autobrr_movie_webhook(
+                    release_name="Reverse.Check.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="903001",
+                    title="Reverse Check Film",
+                    year=2024,
+                    meta_imdb="tt2024903",
+                    meta_tmdb=2024903,
+                    freeleech=True,
+                )
+                self.assertEqual(
+                    client.post("/webhook/test-webhook-secret", json=w2_outage).json()["status"],
+                    "updated_correction",
+                )
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_after_outage = db.get_release(rel_id)
+                assert rel_after_outage is not None
+                self.assertEqual(rel_after_outage["state"], "completed")
+                self.assertEqual(rel_after_outage["identity_gate_status"], "verified")
+                self.assertEqual(rel_after_outage["verified_tmdb_id"], 2024903)
+                self.assertEqual(rel_after_outage["card_revision"], 1)
+                self.assertEqual(len(actions.card_calls), 1)
+
+                # 3) Correction arrives where reverse /find/{imdb_id} actually disagrees ([9999999])
+                #    -> MUST supersede verified rev 1 card to evidence_review rev 2
+                reverse_mode["result"] = [9999999]
+                w3_disagree = _make_autobrr_movie_webhook(
+                    release_name="Reverse.Check.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="903001",
+                    title="Reverse Check Film",
+                    year=2024,
+                    meta_imdb="tt2024903",
+                    meta_tmdb=2024903,
+                    freeleech=False,
+                    size=69_500_000_000,
+                )
+                client.post("/webhook/test-webhook-secret", json=w3_disagree)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_after_disagree = db.get_release(rel_id)
+                assert rel_after_disagree is not None
+                self.assertEqual(rel_after_disagree["state"], "completed")
+                self.assertEqual(rel_after_disagree["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_after_disagree["verified_tmdb_id"])
+                self.assertEqual(rel_after_disagree["card_revision"], 2)
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
