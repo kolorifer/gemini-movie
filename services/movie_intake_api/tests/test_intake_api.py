@@ -2403,6 +2403,103 @@ Language : German
                 self.assertEqual(rel_tl_after["card_revision"], 2)
                 self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
 
+    def test_pre_gate_runtime_conflict_preserved_when_evaluator_returns_low_confidence(self) -> None:
+        """Codex Round 5 P1: Pre-gate runtime conflict must supersede verified card even if evaluator returns low confidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024905,
+                title="Runtime Drift Film",
+                original_title="Runtime Drift Film",
+                year=2024,
+                imdb_id="tt2024905",
+                runtime_minutes=118,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024905: movie}, {"tt2024905": [2024905]})
+            tl_runtime = {"minutes": 118}
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _e, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024905",
+                    file_runtime_minutes=tl_runtime["minutes"],
+                    audio_languages=("English",),
+                ),
+            )
+            eval_conf = {"level": "high"}
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Runtime Drift Film",
+                        year=2024,
+                        imdb_id="tt2024905",
+                        tmdb_id=2024905,
+                        confidence=eval_conf["level"],
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Initial 118-minute movie verifies cleanly at rev 1
+                w1 = _make_autobrr_movie_webhook(
+                    release_name="Runtime.Drift.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="905001",
+                    title="Runtime Drift Film",
+                    year=2024,
+                    meta_imdb="tt2024905",
+                    meta_tmdb=2024905,
+                    freeleech=False,
+                )
+                rel_id = client.post("/webhook/test-webhook-secret", json=w1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel_id)["identity_gate_status"], "verified")  # type: ignore[index]
+                self.assertEqual(len(actions.card_calls), 1)
+
+                # 2) Correction exposes a 195-minute MediaInfo runtime conflict while evaluator returns
+                #    matching IDs with low confidence -> MUST supersede rev 1 with rev 2 evidence_review
+                #    and preserve the MediaInfo runtime conflict reason!
+                tl_runtime["minutes"] = 195
+                eval_conf["level"] = "low"
+                w2 = _make_autobrr_movie_webhook(
+                    release_name="Runtime.Drift.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="905001",
+                    title="Runtime Drift Film",
+                    year=2024,
+                    meta_imdb="tt2024905",
+                    meta_tmdb=2024905,
+                    freeleech=True,
+                )
+                client.post("/webhook/test-webhook-secret", json=w2)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+
+                rel_after = db.get_release(rel_id)
+                assert rel_after is not None
+                self.assertEqual(rel_after["state"], "completed")
+                self.assertEqual(rel_after["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_after["verified_tmdb_id"])
+                self.assertEqual(rel_after["card_revision"], 2)
+                self.assertIn("195m", str(rel_after["identity_conflict_reason"] or ""))
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+                self.assertIn("195m", str(actions.card_calls[-1]["conflict_reason"] or ""))
+
 
 if __name__ == "__main__":
     unittest.main()

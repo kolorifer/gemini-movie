@@ -985,20 +985,36 @@ class IntakeWorker:
                 file_runtime_minutes=tl_result.file_runtime_minutes,
             )
 
-        effective_genuine_conflict = final_gate.is_genuine_conflict or has_prev_verified_conflict
-        if final_gate.status != "verified" and has_prev_verified_conflict and not final_gate.is_genuine_conflict:
-            merged_reason = "; ".join(
-                part
-                for part in (final_gate.conflict_reason, "; ".join(prev_verified_conflict_reasons))
-                if part
+        effective_genuine_conflict = (
+            final_gate.is_genuine_conflict
+            or pre_gate.is_genuine_conflict
+            or has_prev_verified_conflict
+        )
+        if effective_genuine_conflict and (
+            final_gate.status == "verified" or not final_gate.is_genuine_conflict
+        ):
+            reason_parts: list[str] = []
+            if pre_gate.is_genuine_conflict and pre_gate.conflict_reason:
+                reason_parts.append(pre_gate.conflict_reason)
+            if final_gate.conflict_reason and final_gate.conflict_reason not in reason_parts:
+                reason_parts.append(final_gate.conflict_reason)
+            for reason in prev_verified_conflict_reasons:
+                if reason not in reason_parts:
+                    reason_parts.append(reason)
+            merged_failed = tuple(
+                dict.fromkeys(
+                    (pre_gate.checks_failed if pre_gate.is_genuine_conflict else ())
+                    + final_gate.checks_failed
+                    + (("prev_verified_metadata_conflict",) if has_prev_verified_conflict else ())
+                )
             )
             final_gate = IdentityGateResult(
                 status="evidence_review",
                 verified_movie=None,
-                conflict_reason=merged_reason,
+                conflict_reason="; ".join(reason_parts) or "Unresolved identity conflict",
                 is_genuine_conflict=True,
                 checks_passed=final_gate.checks_passed,
-                checks_failed=final_gate.checks_failed + ("prev_verified_metadata_conflict",),
+                checks_failed=merged_failed,
             )
 
         # Never downgrade an already-verified card on a temporary lookup failure (non-conflict)
