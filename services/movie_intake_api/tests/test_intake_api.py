@@ -1,0 +1,1353 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sqlite3
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+from fastapi.testclient import TestClient
+
+from services.movie_intake_api.app import create_app
+from services.movie_intake_api.archive import archive_raw_webhook
+from services.movie_intake_api.classifier import classify_webhook_payload
+from services.movie_intake_api.clients import (
+    ActionsApiClient,
+    DeliveryCardResponse,
+    RadarrStatusResponse,
+    TriageApiClient,
+    TriageEvalResult,
+)
+from services.movie_intake_api.config import AlternativeGrabPolicy, IntakeConfig
+from services.movie_intake_api.db import IntakeDB, utc_now_iso
+from services.movie_intake_api.security import PrivateFileError, redact_secrets
+from services.movie_intake_api.tmdb_verifier import (
+    TmdbIndependentClient,
+    TmdbMovieRecord,
+)
+from services.movie_intake_api.torrentleech import (
+    TorrentLeechResult,
+    TorrentLeechScraper,
+    build_canonical_tl_url,
+    load_tl_cookies,
+    parse_mediainfo_file_signals,
+    parse_tl_listing_html,
+)
+from services.movie_intake_api.worker import IntakeWorker
+
+
+def _make_autobrr_movie_webhook(
+    *,
+    release_name: str = "Example.Film.2024.2160p.UHD.BluRay.REMUX.DV.HDR10-CiNEPHiLES",
+    indexer: str = "TorrentLeech",
+    external_id: str = "9001001",
+    category: str = "Movies :: 4K",
+    release_type: str = "movie",
+    title: Optional[str] = "Example Film",
+    year: Optional[int] = 2024,
+    meta_imdb: Optional[str] = "tt2024001",
+    meta_tmdb: Optional[int] = None,
+    size: int = 68_500_000_000,
+    freeleech: Optional[bool] = False,
+    action_rejected: bool = False,
+    rejections: Optional[list[str]] = None,
+    download_url: str = "https://tracker.invalid/download/9001001/passkey=SUPER_SECRET_PASSKEY_VALUE",
+    event: str = "PUSH_APPROVED",
+) -> dict[str, Any]:
+    rel: dict[str, Any] = {
+        "name": release_name,
+        "type": release_type,
+        "category": category,
+        "external_id": external_id,
+        "size": size,
+        "resolution": "2160p" if "2160p" in release_name else "1080p",
+        "source": "UHD.BluRay",
+        "hdr": ["DV", "HDR10"] if "DV" in release_name else [],
+        "media_processing": "REMUX",
+        "group": "CiNEPHiLES" if "CiNEPHiLES" in release_name else "FraMeSToR",
+        "download_url": download_url,
+        "protocol": "torrent",
+        "timestamp": "2026-11-25T12:00:00Z",
+    }
+    if title is not None:
+        rel["title"] = title
+    if year is not None:
+        rel["year"] = year
+    if meta_imdb is not None:
+        rel["meta_imdb"] = meta_imdb
+    if meta_tmdb is not None:
+        rel["meta_tmdb"] = meta_tmdb
+    if freeleech is not None:
+        rel["freeleech"] = freeleech
+
+    return {
+        "event": event,
+        "action": {"rejected": action_rejected},
+        "data": {
+            "indexer": indexer,
+            "result": {"rejections": rejections or []},
+            "release": rel,
+        },
+    }
+
+
+def _make_eval_payload(
+    *,
+    title: str,
+    year: int,
+    imdb_id: Optional[str],
+    tmdb_id: Optional[int],
+    confidence: str = "high",
+    verdict: str = "WATCH",
+) -> dict[str, Any]:
+    return {
+        "cached": False,
+        "identification": {
+            "canonical_title": title,
+            "original_title": title,
+            "year": year,
+            "director": "Director Name",
+            "imdb_id": imdb_id,
+            "tmdb_id": tmdb_id,
+            "runtime_minutes": 118,
+            "genres": ["Drama"],
+            "match_confidence": confidence,
+            "disambiguation_note": None,
+        },
+        "ratings": {
+            "rotten_tomatoes_critics": 91,
+            "rotten_tomatoes_audience": 84,
+            "metacritic": 82,
+            "imdb": 7.6,
+            "letterboxd": 4.0,
+            "missing_sources": [],
+        },
+        "recognition": {
+            "awards_highlights": ["Cannes Competition"],
+            "critic_consensus": "Sharp and memorable.",
+        },
+        "decision_aid": {
+            "one_line_pitch": "A compelling thriller.",
+            "similar_to": ["Film A", "Film B"],
+            "red_flags": [],
+            "verdict": verdict,
+            "verdict_reason": "Strong acclaim and 2160p DV remux.",
+        },
+    }
+
+
+class StubTmdbClient(TmdbIndependentClient):
+    def __init__(self, tmp_cache: Path, movies: dict[int, TmdbMovieRecord], imdb_map: dict[str, list[int]]) -> None:
+        super().__init__(api_token="stub-token", cache_path=tmp_cache)
+        self._movies = movies
+        self._imdb_map = imdb_map
+
+    async def get_movie_by_tmdb_id(self, tmdb_id: int) -> Optional[TmdbMovieRecord]:
+        return self._movies.get(tmdb_id)
+
+    async def find_movies_by_imdb_id(self, imdb_id: str) -> Optional[list[int]]:
+        return self._imdb_map.get(imdb_id.lower(), [])
+
+
+class StubTlScraper(TorrentLeechScraper):
+    def __init__(self, db: IntakeDB, cookie_file: Path, handler: Any) -> None:
+        super().__init__(db=db, cookie_file=cookie_file, enabled=True, min_interval_seconds=0.0)
+        self._handler = handler
+        self.calls: list[dict[str, str]] = []
+
+    async def fetch_listing(
+        self,
+        *,
+        indexer_norm: str,
+        external_id: str,
+        exact_release_name: str,
+    ) -> TorrentLeechResult:
+        if indexer_norm != "torrentleech":
+            return TorrentLeechResult(outcome="not_applicable")
+        self.calls.append(
+            {
+                "indexer_norm": indexer_norm,
+                "external_id": external_id,
+                "exact_release_name": exact_release_name,
+            }
+        )
+        return self._handler(external_id, exact_release_name)
+
+
+class StubTriageClient(TriageApiClient):
+    def __init__(self, handler: Any) -> None:
+        super().__init__(base_url="http://127.0.0.1:40716", internal_token="stub")
+        self._handler = handler
+        self.calls: list[dict[str, Any]] = []
+
+    async def evaluate(self, request_body: dict[str, Any]) -> TriageEvalResult:
+        self.calls.append(request_body)
+        return self._handler(request_body)
+
+
+class StubActionsClient(ActionsApiClient):
+    def __init__(
+        self,
+        *,
+        radarr_handler: Any,
+        card_handler: Optional[Any] = None,
+    ) -> None:
+        super().__init__(base_url="http://127.0.0.1:40721", internal_token="stub")
+        self._radarr_handler = radarr_handler
+        self._card_handler = card_handler
+        self.radarr_calls: list[dict[str, Any]] = []
+        self.card_calls: list[dict[str, Any]] = []
+        self.eval_reply_calls: list[dict[str, Any]] = []
+        self._next_msg_id = 500
+        self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+
+    async def get_radarr_status(
+        self,
+        *,
+        tmdb_id: Optional[int],
+        imdb_id: Optional[str],
+        release_title: Optional[str] = None,
+    ) -> RadarrStatusResponse:
+        self.radarr_calls.append({"tmdb_id": tmdb_id, "imdb_id": imdb_id, "release_title": release_title})
+        return self._radarr_handler(tmdb_id, imdb_id)
+
+    async def deliver_card(self, card_payload: dict[str, Any]) -> DeliveryCardResponse:
+        self.card_calls.append(card_payload)
+        if self._card_handler is not None:
+            return self._card_handler(card_payload)
+        rel_id = str(card_payload["release_id"])
+        rev = int(card_payload["card_revision"])
+        # Simulate movie-actions-api idempotent delivery table keyed on release_id
+        if rev == 1 and rel_id in self._delivered_by_release:
+            return self._delivered_by_release[rel_id]
+        if rel_id in self._delivered_by_release:
+            prev = self._delivered_by_release[rel_id]
+            return prev
+        self._next_msg_id += 1
+        resp = DeliveryCardResponse(
+            status="delivered",
+            ack_chat_id="-100123456",
+            ack_message_id=self._next_msg_id,
+            ack_thread_id=42,
+        )
+        self._delivered_by_release[rel_id] = resp
+        return resp
+
+    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> bool:
+        self.eval_reply_calls.append(eval_reply_payload)
+        return True
+
+
+def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
+    base = {
+        "host": "127.0.0.1",
+        "port": 40720,
+        "webhook_secret": "test-webhook-secret",
+        "internal_api_secret": "test-internal-secret",
+        "tl_metadata_enabled": True,
+        "tl_cookie_file": tmpdir / "cookies.json",
+        "tmdb_api_token": "stub-tmdb",
+        "tmdb_cache_path": tmpdir / "tmdb-cache.json",
+        "webhook_archive_dir": tmpdir / "webhook-archive",
+        "intake_db_path": tmpdir / "intake.db",
+        "alternative_grab_config_path": None,
+        "triage_api_url": "http://127.0.0.1:40716",
+        "actions_api_url": "http://127.0.0.1:40721",
+        "shadow_replay_enabled": False,
+        "worker_lease_seconds": 90,
+        "worker_poll_interval_seconds": 0.1,
+        "tl_min_interval_seconds": 0.0,
+    }
+    base.update(overrides)
+    return IntakeConfig(**base)
+
+
+class TestMovieIntakeApi(unittest.TestCase):
+    def test_config_enforces_absolute_paths_loopback_and_quality_only_policy(self) -> None:
+        with self.assertRaises(ValueError):
+            IntakeConfig.from_env({"MOVIE_INTEL_HOST": "0.0.0.0"})
+        with self.assertRaises(ValueError):
+            IntakeConfig.from_env({"WEBHOOK_ARCHIVE_DIR": "relative/path"})
+        with self.assertRaises(ValueError):
+            IntakeConfig.from_env({"MOVIE_INTEL_TL_COOKIE_FILE": "~/.config/cookies.json"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "alt-policy.json"
+            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}))
+            os.chmod(p, 0o600)
+            policy = AlternativeGrabPolicy.load_from_file(p)
+            self.assertTrue(policy.enabled)
+            self.assertEqual(policy.allowed_rejection_classes, frozenset({"cutoff_met"}))
+
+            # Non-quality rejection class must be rejected
+            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["identity_conflict"]}))
+            with self.assertRaises(ValueError):
+                AlternativeGrabPolicy.load_from_file(p)
+
+            # World-readable policy file must be rejected
+            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}))
+            os.chmod(p, 0o644)
+            with self.assertRaises(PrivateFileError):
+                AlternativeGrabPolicy.load_from_file(p)
+
+        # Redaction scrubs webhook/action secrets and passkeys
+        redacted = redact_secrets(
+            "POST /webhook/my_secret_123 GET /action/tok_abc https://tl.org/dl?passkey=xyz123"
+        )
+        self.assertIn("/webhook/[REDACTED]", redacted)
+        self.assertIn("/action/[REDACTED]", redacted)
+        self.assertNotIn("my_secret_123", redacted)
+        self.assertNotIn("tok_abc", redacted)
+        self.assertNotIn("xyz123", redacted)
+
+    def test_webhook_auth_limits_strict_json_and_archive_before_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+
+            # 1) Missing webhook secret -> 503
+            app_unconf = create_app(_make_config(tmpdir, webhook_secret=""), start_worker=False)
+            with TestClient(app_unconf) as client:
+                r503 = client.post("/webhook/anything", json={"event": "TEST"})
+                self.assertEqual(r503.status_code, 503)
+
+            # 2) Configured secret: wrong -> 404; >1MB -> 413; NaN/Infinity -> 400; non-movie -> 200 archived
+            cfg = _make_config(tmpdir)
+            app = create_app(cfg, start_worker=False)
+            with TestClient(app) as client:
+                self.assertEqual(client.post("/webhook/wrong", json={"a": 1}).status_code, 404)
+
+                oversized = b'{"x":"' + (b"a" * 1_000_005) + b'"}'
+                r413 = client.post(
+                    "/webhook/test-webhook-secret",
+                    content=oversized,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r413.status_code, 413)
+
+                r_nan = client.post(
+                    "/webhook/test-webhook-secret",
+                    content=b'{"x": NaN}',
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_nan.status_code, 400)
+
+                r_arr = client.post(
+                    "/webhook/test-webhook-secret",
+                    content=b"[1, 2, 3]",
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_arr.status_code, 400)
+
+                # Non-movie / announce / IRC event archived BEFORE filtering -> 200, no release created
+                r_irc = client.post(
+                    "/webhook/test-webhook-secret",
+                    json={"event": "IRC", "data": {"message": "announce ping"}},
+                )
+                self.assertEqual(r_irc.status_code, 200)
+                self.assertEqual(r_irc.json()["status"], "archived_non_movie")
+                self.assertIsNone(r_irc.json()["release_id"])
+
+                # Movie category + conflicting TV release type -> diagnostic only, archived, no release
+                tv_in_movie_cat = _make_autobrr_movie_webhook(
+                    release_name="Some.Show.S01E02.2160p.WEB-DL-GRP",
+                    category="Movies :: 4K",
+                    release_type="tv",
+                )
+                r_diag = client.post("/webhook/test-webhook-secret", json=tv_in_movie_cat)
+                self.assertEqual(r_diag.status_code, 200)
+                self.assertEqual(r_diag.json()["status"], "diagnostic_only")
+                self.assertIsNone(r_diag.json()["release_id"])
+
+                # Verify both archived on disk with 0700 dirs and 0600 files
+                db: IntakeDB = app.state.db
+                occs = db.list_all_occurrences()
+                self.assertEqual(len(occs), 2)
+                self.assertEqual(len(db.list_all_releases()), 0)
+                for occ in occs:
+                    arch_file = cfg.webhook_archive_dir / occ["archive_relpath"]
+                    self.assertTrue(arch_file.exists())
+                    self.assertEqual(stat.S_IMODE(arch_file.stat().st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(arch_file.parent.stat().st_mode), 0o700)
+
+            # 3) Failed required archive write (symlinked archive root) -> 503
+            bad_root = tmpdir / "symlink-archive"
+            os.symlink(tmpdir / "webhook-archive", bad_root)
+            app_bad = create_app(_make_config(tmpdir, webhook_archive_dir=bad_root), start_worker=False)
+            with TestClient(app_bad) as client:
+                r_arch_fail = client.post("/webhook/test-webhook-secret", json={"event": "TEST"})
+                self.assertEqual(r_arch_fail.status_code, 503)
+
+    def test_push_payload_fail_closed_auth_sha256_integrity_and_zero_secrets_in_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            app = create_app(cfg, start_worker=False)
+            with TestClient(app) as client:
+                webhook = _make_autobrr_movie_webhook(
+                    download_url="https://tracker.invalid/dl/9001001/passkey=TOP_SECRET_PASSKEY_999"
+                )
+                r_in = client.post("/webhook/test-webhook-secret", json=webhook)
+                self.assertEqual(r_in.status_code, 200)
+                rel_id = r_in.json()["release_id"]
+                occ_id = r_in.json()["occurrence_id"]
+
+                # Zero secrets in intake.db!
+                raw_db_bytes = cfg.intake_db_path.read_bytes()
+                self.assertNotIn(b"TOP_SECRET_PASSKEY_999", raw_db_bytes)
+                self.assertNotIn(b"tracker.invalid", raw_db_bytes)
+
+                # Missing or wrong X-Internal-Token -> 401
+                self.assertEqual(
+                    client.post(
+                        f"/internal/releases/{rel_id}/push-payload",
+                        json={"source_occurrence_id": occ_id},
+                    ).status_code,
+                    401,
+                )
+                self.assertEqual(
+                    client.post(
+                        f"/internal/releases/{rel_id}/push-payload",
+                        json={"source_occurrence_id": occ_id},
+                        headers={"X-Internal-Token": "wrong"},
+                    ).status_code,
+                    401,
+                )
+
+                # Valid token returns ephemeral push payload with Cache-Control: no-store
+                r_ok = client.post(
+                    f"/internal/releases/{rel_id}/push-payload",
+                    json={"source_occurrence_id": occ_id},
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_ok.status_code, 200)
+                self.assertEqual(r_ok.headers.get("cache-control"), "no-store")
+                pp = r_ok.json()["push_payload"]
+                self.assertEqual(
+                    pp["downloadUrl"],
+                    "https://tracker.invalid/dl/9001001/passkey=TOP_SECRET_PASSKEY_999",
+                )
+                self.assertEqual(pp["guid"], "torrentleech:9001001")
+
+                # Tampering with archived file causes SHA-256 mismatch -> 409
+                occ = app.state.db.list_all_occurrences()[0]
+                arch_file = cfg.webhook_archive_dir / occ["archive_relpath"]
+                arch_file.write_text('{"tampered": true}')
+                os.chmod(arch_file, 0o600)
+                r_tamper = client.post(
+                    f"/internal/releases/{rel_id}/push-payload",
+                    json={"source_occurrence_id": occ_id},
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_tamper.status_code, 409)
+
+                # Shadow replay disabled by default -> 404 even with valid token
+                r_rep = client.post(
+                    "/internal/replay",
+                    json=webhook,
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_rep.status_code, 404)
+
+            # Unconfigured INTERNAL_API_SECRET fails closed with 503
+            app_no_internal = create_app(_make_config(tmpdir, internal_api_secret=""), start_worker=False)
+            with TestClient(app_no_internal) as client:
+                r_503 = client.post(
+                    f"/internal/releases/{rel_id}/push-payload",
+                    json={"source_occurrence_id": occ_id},
+                    headers={"X-Internal-Token": "anything"},
+                )
+                self.assertEqual(r_503.status_code, 503)
+
+    def test_torrentleech_cookies_allowlist_html_mediainfo_and_cooldown_invariants(self) -> None:
+        # Canonical HTTPS allowlist
+        self.assertEqual(
+            build_canonical_tl_url("123456"),
+            "https://www.torrentleech.org/torrent/123456",
+        )
+        self.assertIsNone(build_canonical_tl_url("012345"))
+        self.assertIsNone(build_canonical_tl_url("12345/download"))
+        self.assertIsNone(build_canonical_tl_url("https://evil.test/1"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cookie_file = tmpdir / "cookies.json"
+            cookie_file.write_text(
+                json.dumps(
+                    [
+                        {"name": "tluid", "value": "123", "domain": ".torrentleech.org"},
+                        {"name": "other", "value": "ignore", "domain": "evil.example"},
+                    ]
+                )
+            )
+            # Unsafe 0644 rejected
+            os.chmod(cookie_file, 0o644)
+            with self.assertRaises(PrivateFileError):
+                load_tl_cookies(cookie_file)
+
+            # Owner-only 0600 accepted and filters foreign domain
+            os.chmod(cookie_file, 0o600)
+            loaded = load_tl_cookies(cookie_file)
+            self.assertEqual(loaded, {"tluid": "123"})
+
+            # Symlink cookie rejected
+            sym_cookie = tmpdir / "sym-cookies.json"
+            os.symlink(cookie_file, sym_cookie)
+            with self.assertRaises(PrivateFileError):
+                load_tl_cookies(sym_cookie)
+
+            # Oversized cookie (>16KB) rejected
+            big_cookie = tmpdir / "big-cookies.json"
+            big_cookie.write_bytes(b"{" + b" " * 17000 + b"}")
+            os.chmod(big_cookie, 0o600)
+            with self.assertRaises(PrivateFileError):
+                load_tl_cookies(big_cookie)
+
+            # Login HTML on HTTP 200 -> login_required (never listing_id_missing)
+            login_html = '<html><head><title>Login</title></head><body><form action="/user/account/login"><input type="password" name="pw"></form></body></html>'
+            res_login = parse_tl_listing_html(login_html, exact_release_name="Example.2024")
+            self.assertEqual(res_login.outcome, "login_required")
+
+            # Verified heading stripping ONLY span.new.label.labelfreeleech + section-aware MediaInfo
+            rel_name = "True.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES"
+            valid_html = f"""
+            <html><body>
+              <h1 id="torrentnameid">  {rel_name} <span class="new label labelfreeleech">FREELEECH</span></h1>
+              <div id="torrentName">{rel_name}</div>
+              <a href="https://www.imdb.com/title/tt2024999/">IMDb</a>
+              <div id="description">Catalogue runtime: 999 min. See https://www.torrentleech.org/download?passkey=secret</div>
+              <pre id="nfo">
+General
+Duration : 2 h 4 min
+Language : Spanish
+
+Video
+Duration : 2 h 4 min
+
+Audio #1
+Language : English
+
+Audio #2
+Language : Japanese (Original)
+
+Text #1
+Language : French
+
+Text #2
+Language : German
+              </pre>
+            </body></html>
+            """
+            res_valid = parse_tl_listing_html(valid_html, exact_release_name=rel_name)
+            self.assertEqual(res_valid.outcome, "listing_id_found")
+            self.assertEqual(res_valid.imdb_id, "tt2024999")
+            self.assertTrue(res_valid.freeleech_badge)
+            self.assertEqual(res_valid.file_runtime_minutes, 124)
+            self.assertEqual(res_valid.audio_languages, ("English", "Japanese"))
+            self.assertNotIn("secret", res_valid.sanitized_description or "")
+
+            # Arbitrary non-freeleech span in heading MUST NOT be stripped -> listing_mismatch
+            bad_span_html = f'<h1 id="torrentnameid">{rel_name} <span class="other">EXTRA</span></h1><a href="https://www.imdb.com/title/tt2024999/">IMDb</a>'
+            res_bad_span = parse_tl_listing_html(bad_span_html, exact_release_name=rel_name)
+            self.assertEqual(res_bad_span.outcome, "listing_mismatch")
+            self.assertIsNone(res_bad_span.imdb_id)
+
+            # Second mismatched heading fails ALL-heading rule
+            two_headings_html = f'<h1 id="torrentnameid">{rel_name}</h1><div id="torrentName">Other.Release.2024</div>'
+            self.assertEqual(
+                parse_tl_listing_html(two_headings_html, exact_release_name=rel_name).outcome,
+                "listing_mismatch",
+            )
+
+            # Distinct IMDb outcomes: missing, malformed, conflict
+            self.assertEqual(
+                parse_tl_listing_html(f'<h1 id="torrentnameid">{rel_name}</h1>', exact_release_name=rel_name).outcome,
+                "listing_id_missing",
+            )
+            self.assertEqual(
+                parse_tl_listing_html(
+                    f'<h1 id="torrentnameid">{rel_name}</h1><a href="https://www.imdb.com/title/tt123/">bad</a>',
+                    exact_release_name=rel_name,
+                ).outcome,
+                "listing_id_malformed",
+            )
+            self.assertEqual(
+                parse_tl_listing_html(
+                    f'<h1 id="torrentnameid">{rel_name}</h1>'
+                    '<a href="https://www.imdb.com/title/tt1111111/">1</a>'
+                    '<a href="https://www.imdb.com/title/tt2222222/">2</a>',
+                    exact_release_name=rel_name,
+                ).outcome,
+                "listing_id_conflict",
+            )
+
+            # HTTP transport tests: redirect disabled, 429 Retry-After persistent cooldown, >1MB body cap
+            db = IntakeDB(tmpdir / "intake.db")
+            db.init_db()
+
+            call_counter = {"n": 0}
+
+            def _mock_transport(request: httpx.Request) -> httpx.Response:
+                call_counter["n"] += 1
+                if request.url.path.endswith("/111"):
+                    return httpx.Response(302, headers={"Location": "/user/account/login"})
+                if request.url.path.endswith("/222"):
+                    return httpx.Response(200, content=b"x" * 1_000_050)
+                if request.url.path.endswith("/333"):
+                    return httpx.Response(429, headers={"Retry-After": "120"})
+                return httpx.Response(200, text=valid_html)
+
+            async def _run_http_checks() -> None:
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(_mock_transport), follow_redirects=False
+                ) as http_client:
+                    scraper = TorrentLeechScraper(
+                        db=db,
+                        cookie_file=cookie_file,
+                        enabled=True,
+                        min_interval_seconds=0.0,
+                        http_client=http_client,
+                    )
+                    r_redir = await scraper.fetch_listing(
+                        indexer_norm="torrentleech", external_id="111", exact_release_name=rel_name
+                    )
+                    self.assertEqual(r_redir.outcome, "login_required")
+
+                    r_big = await scraper.fetch_listing(
+                        indexer_norm="torrentleech", external_id="222", exact_release_name=rel_name
+                    )
+                    self.assertEqual(r_big.outcome, "listing_temporary_http")
+
+                    r_429 = await scraper.fetch_listing(
+                        indexer_norm="torrentleech", external_id="333", exact_release_name=rel_name
+                    )
+                    self.assertEqual(r_429.outcome, "listing_temporary_http")
+                    self.assertTrue(db.is_tl_cooldown_active())
+
+                    # New scraper instance (simulating restart) honors persisted cooldown without network call!
+                    before = call_counter["n"]
+                    scraper2 = TorrentLeechScraper(
+                        db=db,
+                        cookie_file=cookie_file,
+                        enabled=True,
+                        min_interval_seconds=0.0,
+                        http_client=http_client,
+                    )
+                    r_cool = await scraper2.fetch_listing(
+                        indexer_norm="torrentleech", external_id="444", exact_release_name=rel_name
+                    )
+                    self.assertEqual(r_cool.outcome, "cooldown_active")
+                    self.assertEqual(call_counter["n"], before)
+
+            asyncio.run(_run_http_checks())
+
+    def test_shadow_case_1_duplicate_burst_restart_late_noncollapse_and_correction(self) -> None:
+        """Mandatory Shadow Case 1 (1a-1e) from docs/ARCHITECTURE.md §8."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024001,
+                title="Example Film",
+                original_title="Example Film",
+                year=2024,
+                imdb_id="tt2024001",
+                runtime_minutes=120,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024001: movie}, {"tt2024001": [2024001]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda ext_id, _name: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024001",
+                    file_runtime_minutes=120,
+                    audio_languages=("English",),
+                    freeleech_badge=False,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _body: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Example Film", year=2024, imdb_id="tt2024001", tmdb_id=2024001
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1a: 3 identical burst deliveries -> 3 archive files, 3 occurrences, 1 release, 1 card
+                payload = _make_autobrr_movie_webhook()
+                r1 = client.post("/webhook/test-webhook-secret", json=payload)
+                r2 = client.post("/webhook/test-webhook-secret", json=payload)
+                r3 = client.post("/webhook/test-webhook-secret", json=payload)
+                self.assertEqual(r1.json()["status"], "accepted")
+                self.assertEqual(r2.json()["status"], "coalesced_duplicate")
+                self.assertEqual(r3.json()["status"], "coalesced_duplicate")
+                rel_id = r1.json()["release_id"]
+                self.assertEqual(r2.json()["release_id"], rel_id)
+                self.assertEqual(r3.json()["release_id"], rel_id)
+                self.assertEqual(len(db.list_occurrences_for_release(rel_id)), 3)
+
+                # Process queue once
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(tl.calls), 1)
+                self.assertEqual(len(triage.calls), 1)
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+
+                # 1c: Late duplicate after completion -> archived as 4th occurrence, zero re-work
+                r4 = client.post("/webhook/test-webhook-secret", json=payload)
+                self.assertEqual(r4.json()["status"], "coalesced_duplicate")
+                self.assertEqual(len(db.list_occurrences_for_release(rel_id)), 4)
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+
+                # 1d: Non-collapse across different encode/ID and different tracker for SAME movie/IMDb
+                encode_1080 = _make_autobrr_movie_webhook(
+                    release_name="Example.Film.2024.1080p.BluRay.REMUX.AVC-FraMeSToR",
+                    external_id="9001002",
+                )
+                other_tracker = _make_autobrr_movie_webhook(
+                    indexer="OtherTracker",
+                    external_id="555",
+                )
+                r_1080 = client.post("/webhook/test-webhook-secret", json=encode_1080)
+                r_other = client.post("/webhook/test-webhook-secret", json=other_tracker)
+                self.assertEqual(len({rel_id, r_1080.json()["release_id"], r_other.json()["release_id"]}), 3)
+
+                # 1b: Mid-flight worker crash & restart lease recovery (no duplicate release/card)
+                rel_1080 = r_1080.json()["release_id"]
+                with sqlite3.connect(str(cfg.intake_db_path)) as conn:
+                    conn.execute(
+                        "UPDATE releases SET state='enriching', lease_owner='dead-worker', lease_expires_at='2020-01-01T00:00:00+00:00' WHERE release_id=?",
+                        (rel_1080,),
+                    )
+                fresh_worker = IntakeWorker(
+                    config=cfg,
+                    db=db,
+                    tl_scraper=tl,
+                    tmdb_client=tmdb,
+                    triage_client=triage,
+                    actions_client=actions,
+                    worker_id="recovered-worker",
+                )
+                recovered = db.recover_orphaned_leases(
+                    active_worker_id="recovered-worker", recover_dead_owners=True
+                )
+                self.assertEqual(recovered, 1)
+                while asyncio.run(fresh_worker.process_next_queued()):
+                    pass
+                self.assertEqual(db.get_release(rel_1080)["state"], "completed")  # type: ignore[index]
+
+                # 1e: Verified correction after initial evidence_review updates bound card (card_revision 1 -> 2)
+                corr_name = "Correction.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES"
+                corr_movie = TmdbMovieRecord(
+                    tmdb_id=2024555,
+                    title="Correction Film",
+                    original_title="Correction Film",
+                    year=2024,
+                    imdb_id="tt2024555",
+                    runtime_minutes=110,
+                )
+                tmdb._movies[2024555] = corr_movie
+                tmdb._imdb_map["tt2024555"] = [2024555]
+                tl_mode = {"fail": True}
+
+                def _corr_tl(_ext: str, _name: str) -> TorrentLeechResult:
+                    if tl_mode["fail"]:
+                        return TorrentLeechResult(outcome="listing_temporary_http")
+                    return TorrentLeechResult(
+                        outcome="listing_id_found",
+                        imdb_id="tt2024555",
+                        file_runtime_minutes=110,
+                        audio_languages=("English",),
+                    )
+
+                tl._handler = _corr_tl
+                triage._handler = lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Correction Film",
+                        year=2024,
+                        imdb_id="tt2024555",
+                        tmdb_id=2024555,
+                        confidence="medium",
+                    ),
+                )
+                w_initial = _make_autobrr_movie_webhook(
+                    release_name=corr_name,
+                    external_id="9005555",
+                    title="Correction Film",
+                    year=2024,
+                    meta_imdb=None,
+                )
+                rc1 = client.post("/webhook/test-webhook-secret", json=w_initial)
+                corr_rel_id = rc1.json()["release_id"]
+                asyncio.run(app.state.worker.process_next_queued())
+                rev1_card = [c for c in actions.card_calls if c["release_id"] == corr_rel_id][-1]
+                self.assertEqual(rev1_card["card_revision"], 1)
+                self.assertEqual(rev1_card["delivery_kind"], "evidence_review")
+
+                # Newer delivery arrives with corrected meta_imdb and working TL
+                tl_mode["fail"] = False
+                w_corrected = _make_autobrr_movie_webhook(
+                    release_name=corr_name,
+                    external_id="9005555",
+                    title="Correction Film",
+                    year=2024,
+                    meta_imdb="tt2024555",
+                )
+                rc2 = client.post("/webhook/test-webhook-secret", json=w_corrected)
+                self.assertEqual(rc2.json()["status"], "updated_correction")
+                asyncio.run(app.state.worker.process_next_queued())
+                rev2_card = [c for c in actions.card_calls if c["release_id"] == corr_rel_id][-1]
+                self.assertEqual(rev2_card["card_revision"], 2)
+                self.assertEqual(rev2_card["delivery_kind"], "actionable_grab")
+                self.assertEqual(rev2_card["verified_tmdb_id"], 2024555)
+                self.assertTrue(triage.calls[-1]["force_refresh"])
+
+    def test_shadow_case_2_wrong_tracker_imdb_forces_evidence_review(self) -> None:
+        """Mandatory Shadow Case 2: poisoned tracker IMDb rejected, never converted to Grab Anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            wrong_2018 = TmdbMovieRecord(
+                tmdb_id=99999,
+                title="Unrelated Old Film",
+                original_title="Unrelated Old Film",
+                year=2018,
+                imdb_id="tt0099999",
+                runtime_minutes=89,
+            )
+            true_2024 = TmdbMovieRecord(
+                tmdb_id=2024999,
+                title="True Film",
+                original_title="True Film",
+                year=2024,
+                imdb_id="tt2024999",
+                runtime_minutes=124,
+            )
+            tmdb = StubTmdbClient(
+                cfg.tmdb_cache_path,
+                {99999: wrong_2018, 2024999: true_2024},
+                {"tt0099999": [99999], "tt2024999": [2024999]},
+            )
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _ext, _name: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt0099999",
+                    file_runtime_minutes=124,
+                    audio_languages=("English",),
+                    freeleech_badge=False,
+                    sanitized_nfo="General Duration: 2h 4min",
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _body: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="True Film", year=2024, imdb_id="tt2024999", tmdb_id=2024999
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            alt_policy = AlternativeGrabPolicy(
+                enabled=True, allowed_rejection_classes=frozenset({"cutoff_met"})
+            )
+
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                alt_grab_policy=alt_policy,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                webhook = _make_autobrr_movie_webhook(
+                    release_name="True.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="9002001",
+                    title="True Film",
+                    year=2024,
+                    meta_imdb="tt0099999",
+                    action_rejected=True,
+                    rejections=["Quality cutoff already met"],
+                )
+                r = client.post("/webhook/test-webhook-secret", json=webhook)
+                self.assertEqual(r.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+
+            # Evaluator received force_refresh=True, MediaInfo 124m, audio ["English"], and conflict note
+            self.assertEqual(len(triage.calls), 1)
+            self.assertTrue(triage.calls[0]["force_refresh"])
+            self.assertEqual(triage.calls[0]["torrent_info"]["runtime_minutes"], 124)
+            self.assertEqual(triage.calls[0]["torrent_info"]["audio_languages"], ["English"])
+            self.assertEqual(triage.calls[0]["torrent_info"]["freeleech"], False)
+            self.assertIn("extra_context", triage.calls[0])
+
+            # Identity conflict MUST render evidence_review ONLY (never actionable_grab or alternative_grab!)
+            self.assertEqual(len(actions.card_calls), 1)
+            card = actions.card_calls[0]
+            self.assertEqual(card["delivery_kind"], "evidence_review")
+            self.assertEqual(card["identity_gate_status"], "evidence_review")
+            self.assertNotIn("verified_tmdb_id", card)
+            self.assertEqual(len(actions.eval_reply_calls), 1)
+            self.assertEqual(actions.eval_reply_calls[0]["ack_message_id"], 501)
+
+    def test_shadow_case_3_unidentified_movie_gate_pass_and_negative_controls(self) -> None:
+        """Mandatory Shadow Case 3 (3a pass, 3b failed TL control, 3c runtime/confidence failure)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            gem = TmdbMovieRecord(
+                tmdb_id=3025001,
+                title="Festival Gem",
+                original_title="Festival Gem",
+                year=2025,
+                imdb_id="tt3025001",
+                runtime_minutes=114,
+            )
+            long_wrong = TmdbMovieRecord(
+                tmdb_id=3025002,
+                title="Festival Gem",
+                original_title="Festival Gem",
+                year=2025,
+                imdb_id="tt3025002",
+                runtime_minutes=168,
+            )
+            tmdb = StubTmdbClient(
+                cfg.tmdb_cache_path,
+                {3025001: gem, 3025002: long_wrong},
+                {"tt3025001": [3025001], "tt3025002": [3025002]},
+            )
+            tl_outcomes: dict[str, TorrentLeechResult] = {
+                "3001": TorrentLeechResult(
+                    outcome="listing_id_missing",
+                    file_runtime_minutes=112,
+                    audio_languages=("French",),
+                ),
+                "3002": TorrentLeechResult(outcome="login_required"),
+                "3003": TorrentLeechResult(
+                    outcome="listing_id_missing",
+                    file_runtime_minutes=112,
+                    audio_languages=("French",),
+                ),
+            }
+            tl = StubTlScraper(db, cfg.tl_cookie_file, lambda ext, _n: tl_outcomes[ext])
+
+            eval_map = {
+                "3001": _make_eval_payload(
+                    title="Festival Gem", year=2025, imdb_id="tt3025001", tmdb_id=3025001, confidence="high"
+                ),
+                "3002": _make_eval_payload(
+                    title="Festival Gem", year=2025, imdb_id="tt3025001", tmdb_id=3025001, confidence="high"
+                ),
+                "3003": _make_eval_payload(
+                    title="Festival Gem", year=2025, imdb_id="tt3025002", tmdb_id=3025002, confidence="high"
+                ),
+            }
+            eval_idx = {"key": "3001"}
+            triage = StubTriageClient(lambda _b: TriageEvalResult(ok=True, payload=eval_map[eval_idx["key"]]))
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 3a: Unidentified (listing_id_missing) + high-conf evaluator + all checks pass -> actionable_grab
+                eval_idx["key"] = "3001"
+                w_3a = _make_autobrr_movie_webhook(
+                    release_name="Festival.Gem.2025.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                    external_id="3001",
+                    title="Festival Gem",
+                    year=2025,
+                    meta_imdb=None,
+                )
+                client.post("/webhook/test-webhook-secret", json=w_3a)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[-1]["verified_tmdb_id"], 3025001)
+
+                # 3b: Failed TL lookup (login_required) CANNOT authorize title-only guess -> evidence_review
+                eval_idx["key"] = "3002"
+                w_3b = _make_autobrr_movie_webhook(
+                    release_name="Festival.Gem.2025.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                    external_id="3002",
+                    title="Festival Gem",
+                    year=2025,
+                    meta_imdb=None,
+                )
+                client.post("/webhook/test-webhook-secret", json=w_3b)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertNotIn("verified_tmdb_id", actions.card_calls[-1])
+
+                # 3c: MediaInfo runtime mismatch (112m vs 168m) fails independent gate -> evidence_review
+                eval_idx["key"] = "3003"
+                w_3c = _make_autobrr_movie_webhook(
+                    release_name="Festival.Gem.2025.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                    external_id="3003",
+                    title="Festival Gem",
+                    year=2025,
+                    meta_imdb=None,
+                )
+                client.post("/webhook/test-webhook-secret", json=w_3c)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertIn("runtime", (actions.card_calls[-1]["conflict_reason"] or "").lower())
+
+    def test_shadow_case_4_radarr_suppression_alternative_grab_and_ambiguous_delivery(self) -> None:
+        """Mandatory Shadow Case 4 (4a-4d) + Alternative Grab + quality suppression + ambiguous_delivery."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=4024001,
+                title="Library Film",
+                original_title="Library Film",
+                year=2024,
+                imdb_id="tt4024001",
+                runtime_minutes=110,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {4024001: movie}, {"tt4024001": [4024001]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _ext, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt4024001",
+                    file_runtime_minutes=110,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Library Film", year=2024, imdb_id="tt4024001", tmdb_id=4024001
+                    ),
+                )
+            )
+
+            radarr_next = {"resp": RadarrStatusResponse(status="watched_unmonitored", movie_id=77)}
+            card_override: dict[str, Optional[DeliveryCardResponse]] = {"resp": None}
+
+            def _card_handler(payload: dict[str, Any]) -> DeliveryCardResponse:
+                if card_override["resp"] is not None:
+                    return card_override["resp"]
+                return DeliveryCardResponse(
+                    status="delivered",
+                    ack_chat_id="-100123",
+                    ack_message_id=900 + len(actions.card_calls),
+                    ack_thread_id=10,
+                )
+
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: radarr_next["resp"],
+                card_handler=_card_handler,
+            )
+            alt_policy = AlternativeGrabPolicy(
+                enabled=True, allowed_rejection_classes=frozenset({"cutoff_met"})
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                alt_grab_policy=alt_policy,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 4a: Watched + unmonitored -> suppressed BEFORE delivery, 0 Telegram sends, 0 evaluator calls
+                r_4a = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4001",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                rel_4a = db.get_release(r_4a.json()["release_id"])
+                assert rel_4a is not None
+                self.assertEqual(rel_4a["state"], "suppressed")
+                self.assertEqual(rel_4a["suppression_reason"], "watched_unmonitored")
+                self.assertEqual(len(actions.card_calls), 0)
+                self.assertEqual(len(triage.calls), 0)
+
+                # 4b: Monitored, hasFile=false -> NOT suppressed, labeled explicitly
+                radarr_next["resp"] = RadarrStatusResponse(status="monitored_no_file", movie_id=77)
+                client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4002",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "actionable_grab")
+                self.assertIn("Monitored in Radarr", actions.card_calls[-1]["radarr_note"])
+
+                # 4c: Already owned (no Alternative Grab trigger) -> suppressed before delivery
+                radarr_next["resp"] = RadarrStatusResponse(status="owned_file", movie_id=77, file_id=888)
+                cards_before = len(actions.card_calls)
+                r_4c = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4003",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(db.get_release(r_4c.json()["release_id"])["suppression_reason"], "already_owned")  # type: ignore[index]
+                self.assertEqual(len(actions.card_calls), cards_before)
+
+                # 4c-alt: Already owned + allowed quality-only cutoff_met -> alternative_grab bound to exact movie/file
+                client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                        external_id="4004",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                        action_rejected=True,
+                        rejections=["Quality cutoff already met"],
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                alt_card = actions.card_calls[-1]
+                self.assertEqual(alt_card["delivery_kind"], "alternative_grab")
+                self.assertEqual(alt_card["bound_existing_movie_id"], 77)
+                self.assertEqual(alt_card["bound_existing_file_id"], 888)
+                self.assertEqual(alt_card["bound_rejection_class"], "cutoff_met")
+
+                # Routine disallowed quality rejection -> suppressed early (0 TL calls, 0 cards)
+                tl_before = len(tl.calls)
+                r_qrej = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.1080p.WEB-DL-GRP",
+                        external_id="4005",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                        action_rejected=True,
+                        rejections=["Quality is not wanted in profile"],
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(db.get_release(r_qrej.json()["release_id"])["suppression_reason"], "quality_rejected")  # type: ignore[index]
+                self.assertEqual(len(tl.calls), tl_before)
+
+                # 4d: Failed Radarr lookup -> does NOT establish absence -> evidence_review
+                radarr_next["resp"] = RadarrStatusResponse(status="lookup_failed", detail="http_503")
+                client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4006",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertIn("unverified", actions.card_calls[-1]["radarr_note"].lower())
+
+                # Ambiguous delivery lock -> no evaluation reply sent, never reopened on later webhook
+                radarr_next["resp"] = RadarrStatusResponse(status="absent")
+                card_override["resp"] = DeliveryCardResponse(status="ambiguous_delivery", detail="timeout")
+                replies_before = len(actions.eval_reply_calls)
+                r_amb = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4007",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                amb_id = r_amb.json()["release_id"]
+                self.assertEqual(db.get_release(amb_id)["state"], "ambiguous_delivery")  # type: ignore[index]
+                self.assertEqual(len(actions.eval_reply_calls), replies_before)
+
+                # Even a modified webhook for the same release does NOT reopen ambiguous_delivery
+                r_amb2 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="4007",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                        freeleech=True,
+                    ),
+                )
+                self.assertEqual(r_amb2.json()["status"], "coalesced_duplicate")
+                self.assertEqual(db.get_release(amb_id)["state"], "ambiguous_delivery")  # type: ignore[index]
+
+    def test_concurrent_burst_coalescing_imdb_field_variants_fast_path_conflict_and_shadow_replay(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # 1) #imdb with rating link text resolves cleanly; N/A -> missing
+        rel = "Edge.Case.2024.2160p.UHD.BluRay.REMUX-GRP"
+        html_with_rating = f'<h1 id="torrentnameid">{rel}</h1><div id="imdb"><a href="https://www.imdb.com/title/tt2024888/">7.8 / 10 (IMDb)</a></div>'
+        r_rating = parse_tl_listing_html(html_with_rating, exact_release_name=rel)
+        self.assertEqual(r_rating.outcome, "listing_id_found")
+        self.assertEqual(r_rating.imdb_id, "tt2024888")
+
+        html_na = f'<h1 id="torrentnameid">{rel}</h1><div id="imdb">N/A</div>'
+        self.assertEqual(parse_tl_listing_html(html_na, exact_release_name=rel).outcome, "listing_id_missing")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir, shadow_replay_enabled=True)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            # 2) True concurrent multi-threaded SQLite BEGIN IMMEDIATE burst (6 simultaneous arrivals)
+            payload = _make_autobrr_movie_webhook(release_name=rel, external_id="777001", meta_imdb="tt2024888")
+            raw_bytes = json.dumps(payload).encode("utf-8")
+            classified = classify_webhook_payload(payload)
+
+            def _submit(i: int) -> Any:
+                occ_id = f"occ-burst-{i}"
+                receipt = archive_raw_webhook(cfg.webhook_archive_dir, occ_id, raw_bytes)
+                return db.record_movie_occurrence(
+                    occurrence_id=occ_id,
+                    received_at_iso=utc_now_iso(),
+                    receipt=receipt,
+                    classified=classified,
+                )
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                claims = list(pool.map(_submit, range(6)))
+
+            statuses = [c.status for c in claims]
+            self.assertEqual(statuses.count("accepted"), 1)
+            self.assertEqual(statuses.count("coalesced_duplicate"), 5)
+            self.assertEqual(len({c.release_id for c in claims}), 1)
+            self.assertEqual(len(db.list_all_occurrences()), 6)
+            self.assertEqual(len(db.list_all_releases()), 1)
+
+            # 3) Fast-path evaluator contradiction supersedes card to evidence_review (rev 1 -> 2)
+            # and /internal/replay executes cleanly in shadow mode
+            movie = TmdbMovieRecord(
+                tmdb_id=2024888,
+                title="Edge Case",
+                original_title="Edge Case",
+                year=2024,
+                imdb_id="tt2024888",
+                runtime_minutes=105,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024888: movie}, {"tt2024888": [2024888]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _e, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024888",
+                    file_runtime_minutes=105,
+                    audio_languages=("English",),
+                ),
+            )
+            # Evaluator returns contradicting IMDb ID tt9999888
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Different Film", year=2024, imdb_id="tt9999888", tmdb_id=9999888
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                # Drain the burst release
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[0]["card_revision"], 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[1]["card_revision"], 2)
+                self.assertEqual(actions.card_calls[1]["delivery_kind"], "evidence_review")
+
+                # Shadow /internal/replay works with X-Internal-Token when SHADOW_REPLAY_ENABLED=True
+                r_rep = client.post(
+                    "/internal/replay",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Edge.Case.2024.1080p.BluRay.REMUX-GRP",
+                        external_id="777002",
+                        meta_imdb="tt2024888",
+                    ),
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_rep.status_code, 200)
+                self.assertEqual(r_rep.json()["ingest"]["status"], "accepted")
+                self.assertEqual(r_rep.json()["release"]["state"], "completed")
+
+
+if __name__ == "__main__":
+    unittest.main()
