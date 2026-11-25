@@ -1812,6 +1812,323 @@ Language : German
 
             asyncio.run(_check_client())
 
+    def test_genuine_tracker_conflict_supersedes_verified_card_while_transient_tl_preserves_it(self) -> None:
+        """Codex Round 2 P1 #1: listing_id_conflict / listing_mismatch must supersede verified card; transient failures preserve it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024901,
+                title="Verified Guard Film",
+                original_title="Verified Guard Film",
+                year=2024,
+                imdb_id="tt2024901",
+                runtime_minutes=112,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024901: movie}, {"tt2024901": [2024901]})
+
+            tl_state = {
+                "outcome": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024901",
+                    file_runtime_minutes=112,
+                    audio_languages=("English",),
+                )
+            }
+            tl = StubTlScraper(db, cfg.tl_cookie_file, lambda _e, _n: tl_state["outcome"])
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Verified Guard Film",
+                        year=2024,
+                        imdb_id="tt2024901",
+                        tmdb_id=2024901,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Initial verified release completes with actionable rev 1 card
+                w1 = _make_autobrr_movie_webhook(
+                    release_name="Verified.Guard.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="901001",
+                    title="Verified Guard Film",
+                    year=2024,
+                    meta_imdb="tt2024901",
+                    freeleech=False,
+                )
+                r1 = client.post("/webhook/test-webhook-secret", json=w1)
+                rel_id = r1.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[0]["card_revision"], 1)
+
+                # 2) Correction arrives while TL has a transient HTTP outage -> preserves verified rev 1 card
+                tl_state["outcome"] = TorrentLeechResult(outcome="listing_temporary_http")
+                w2_transient = _make_autobrr_movie_webhook(
+                    release_name="Verified.Guard.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="901001",
+                    title="Verified Guard Film",
+                    year=2024,
+                    meta_imdb="tt2024901",
+                    freeleech=True,
+                )
+                self.assertEqual(
+                    client.post("/webhook/test-webhook-secret", json=w2_transient).json()["status"],
+                    "updated_correction",
+                )
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_after_transient = db.get_release(rel_id)
+                assert rel_after_transient is not None
+                self.assertEqual(rel_after_transient["state"], "completed")
+                self.assertEqual(rel_after_transient["identity_gate_status"], "verified")
+                self.assertEqual(rel_after_transient["verified_tmdb_id"], 2024901)
+                self.assertEqual(rel_after_transient["card_revision"], 1)
+                self.assertEqual(len(actions.card_calls), 1)
+
+                # 3) Next correction hits a genuine TL conflict (listing_id_conflict) -> MUST supersede to evidence_review rev 2!
+                tl_state["outcome"] = TorrentLeechResult(
+                    outcome="listing_id_conflict",
+                    diagnostic="conflicting_imdb_ids",
+                )
+                w3_conflict = _make_autobrr_movie_webhook(
+                    release_name="Verified.Guard.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="901001",
+                    title="Verified Guard Film",
+                    year=2024,
+                    meta_imdb="tt2024901",
+                    freeleech=False,
+                    size=69_000_000_000,
+                )
+                self.assertEqual(
+                    client.post("/webhook/test-webhook-secret", json=w3_conflict).json()["status"],
+                    "updated_correction",
+                )
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_after_conflict = db.get_release(rel_id)
+                assert rel_after_conflict is not None
+                self.assertEqual(rel_after_conflict["state"], "completed")
+                self.assertEqual(rel_after_conflict["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_after_conflict["verified_tmdb_id"])
+                self.assertEqual(rel_after_conflict["card_revision"], 2)
+                self.assertEqual(len(actions.card_calls), 2)
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertNotIn("verified_tmdb_id", actions.card_calls[-1])
+                self.assertTrue(triage.calls[-1]["force_refresh"])
+
+                # 4) Verify listing_mismatch also supersedes a previously verified release
+                tl_state["outcome"] = TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024901",
+                    file_runtime_minutes=112,
+                    audio_languages=("English",),
+                )
+                w_m1 = _make_autobrr_movie_webhook(
+                    release_name="Verified.Guard.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="901002",
+                    title="Verified Guard Film",
+                    year=2024,
+                    meta_imdb="tt2024901",
+                )
+                rel_m_id = client.post("/webhook/test-webhook-secret", json=w_m1).json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel_m_id)["identity_gate_status"], "verified")  # type: ignore[index]
+
+                tl_state["outcome"] = TorrentLeechResult(outcome="listing_mismatch", diagnostic="heading_mismatch")
+                w_m2 = _make_autobrr_movie_webhook(
+                    release_name="Verified.Guard.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="901002",
+                    title="Verified Guard Film",
+                    year=2024,
+                    meta_imdb="tt2024901",
+                    freeleech=True,
+                )
+                client.post("/webhook/test-webhook-secret", json=w_m2)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                rel_m_after = db.get_release(rel_m_id)
+                assert rel_m_after is not None
+                self.assertEqual(rel_m_after["identity_gate_status"], "evidence_review")
+                self.assertIsNone(rel_m_after["verified_tmdb_id"])
+                self.assertEqual(rel_m_after["card_revision"], 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+
+    def test_coalesced_duplicate_preserves_usable_download_url_source_before_and_after_delivery(self) -> None:
+        """Codex Round 2 P1 #2: Duplicate coalescing must preserve a usable download_url acquisition source."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024902,
+                title="Download Source Film",
+                original_title="Download Source Film",
+                year=2024,
+                imdb_id="tt2024902",
+                runtime_minutes=104,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024902: movie}, {"tt2024902": [2024902]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _e, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024902",
+                    file_runtime_minutes=104,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Download Source Film",
+                        year=2024,
+                        imdb_id="tt2024902",
+                        tmdb_id=2024902,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # Subcase A: Delivery 1 lacks download_url; Delivery 2 supplies it BEFORE worker claims
+                w_no_url = _make_autobrr_movie_webhook(
+                    release_name="Download.Source.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="902001",
+                    title="Download Source Film",
+                    year=2024,
+                    meta_imdb="tt2024902",
+                    download_url="",
+                )
+                w_with_url = _make_autobrr_movie_webhook(
+                    release_name="Download.Source.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="902001",
+                    title="Download Source Film",
+                    year=2024,
+                    meta_imdb="tt2024902",
+                    download_url="https://tracker.invalid/dl/902001/passkey=USABLE_KEY_A",
+                )
+                w_non_http = _make_autobrr_movie_webhook(
+                    release_name="Download.Source.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="902001",
+                    title="Download Source Film",
+                    year=2024,
+                    meta_imdb="tt2024902",
+                    download_url="magnet:?xt=urn:btih:deadbeef",
+                )
+                r1 = client.post("/webhook/test-webhook-secret", json=w_no_url)
+                r2 = client.post("/webhook/test-webhook-secret", json=w_with_url)
+                r3 = client.post("/webhook/test-webhook-secret", json=w_non_http)
+                rel_a = r1.json()["release_id"]
+                occ_a2 = r2.json()["occurrence_id"]
+                self.assertEqual(r1.json()["status"], "accepted")
+                self.assertEqual(r2.json()["status"], "coalesced_duplicate")
+                self.assertEqual(r3.json()["status"], "coalesced_duplicate")
+                self.assertEqual(r2.json()["release_id"], rel_a)
+                # Usable HTTP(S) source preserved and NOT overwritten by later non-HTTP/empty delivery
+                self.assertEqual(db.get_release(rel_a)["source_occurrence_id"], occ_a2)  # type: ignore[index]
+
+                # Worker runs ONCE and binds card directly to occ_a2
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["source_occurrence_id"], occ_a2)
+                r_push_a = client.post(
+                    f"/internal/releases/{rel_a}/push-payload",
+                    json={"source_occurrence_id": occ_a2},
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_push_a.status_code, 200)
+                self.assertEqual(
+                    r_push_a.json()["push_payload"]["downloadUrl"],
+                    "https://tracker.invalid/dl/902001/passkey=USABLE_KEY_A",
+                )
+
+                # Subcase B: Delivery 1 lacks URL and card is delivered BEFORE Delivery 2 arrives with URL
+                w_b1 = _make_autobrr_movie_webhook(
+                    release_name="Download.Source.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="902002",
+                    title="Download Source Film",
+                    year=2024,
+                    meta_imdb="tt2024902",
+                    download_url="",
+                )
+                w_b2 = _make_autobrr_movie_webhook(
+                    release_name="Download.Source.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="902002",
+                    title="Download Source Film",
+                    year=2024,
+                    meta_imdb="tt2024902",
+                    download_url="https://tracker.invalid/dl/902002/passkey=LATE_USABLE_KEY_B",
+                )
+                rb1 = client.post("/webhook/test-webhook-secret", json=w_b1)
+                rel_b = rb1.json()["release_id"]
+                occ_b1 = rb1.json()["occurrence_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(actions.card_calls[-1]["source_occurrence_id"], occ_b1)
+
+                # Late duplicate supplies usable download_url without triggering extra evaluation/card
+                rb2 = client.post("/webhook/test-webhook-secret", json=w_b2)
+                occ_b2 = rb2.json()["occurrence_id"]
+                self.assertEqual(rb2.json()["status"], "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(db.get_release(rel_b)["source_occurrence_id"], occ_b2)  # type: ignore[index]
+
+                # Confirming grab with the card's original bound occ_b1 resolves verified sibling occ_b2
+                r_push_b = client.post(
+                    f"/internal/releases/{rel_b}/push-payload",
+                    json={"source_occurrence_id": occ_b1},
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_push_b.status_code, 200)
+                self.assertEqual(r_push_b.json()["source_occurrence_id"], occ_b2)
+                self.assertEqual(
+                    r_push_b.json()["push_payload"]["downloadUrl"],
+                    "https://tracker.invalid/dl/902002/passkey=LATE_USABLE_KEY_B",
+                )
+
+                # Tampering with occ_b1's archive file MUST still fail closed with 409 (no bypass!)
+                occ_b1_ref = db.get_occurrence_archive_ref(rel_b, occ_b1)
+                assert occ_b1_ref is not None
+                arch_b1 = cfg.webhook_archive_dir / occ_b1_ref.archive_relpath
+                arch_b1.write_text('{"tampered": true}')
+                os.chmod(arch_b1, 0o600)
+                r_tamper = client.post(
+                    f"/internal/releases/{rel_b}/push-payload",
+                    json={"source_occurrence_id": occ_b1},
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r_tamper.status_code, 409)
+
 
 if __name__ == "__main__":
     unittest.main()

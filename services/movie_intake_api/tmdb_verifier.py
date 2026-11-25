@@ -18,7 +18,7 @@ from .security import (
     read_owner_private_regular_file,
     redact_secrets,
 )
-from .torrentleech import TL_FAILED_OUTCOMES
+from .torrentleech import TL_FAILED_OUTCOMES, TL_INTEGRITY_CONFLICT_OUTCOMES
 
 logger = logging.getLogger(__name__)
 
@@ -344,7 +344,7 @@ async def run_independent_identity_gate(
     # Check 1: Source / TorrentLeech integrity
     if tl_applicable and tl_outcome in TL_FAILED_OUTCOMES:
         failed.append(f"tl_integrity_failed:{tl_outcome}")
-        is_conflict = tl_outcome in ("listing_id_conflict", "listing_mismatch")
+        is_conflict = tl_outcome in TL_INTEGRITY_CONFLICT_OUTCOMES
         return IdentityGateResult(
             status="evidence_review",
             conflict_reason=f"TorrentLeech lookup outcome '{tl_outcome}' cannot authorize ordinary actions",

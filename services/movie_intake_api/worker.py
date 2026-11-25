@@ -20,7 +20,11 @@ from .config import AlternativeGrabPolicy, IntakeConfig
 from .db import IntakeDB, utc_now, utc_now_iso
 from .security import redact_secrets
 from .tmdb_verifier import IdentityGateResult, TmdbIndependentClient, TmdbMovieRecord, run_independent_identity_gate
-from .torrentleech import TL_FAILED_OUTCOMES, TorrentLeechResult, TorrentLeechScraper
+from .torrentleech import (
+    TL_TRANSIENT_FAILURE_OUTCOMES,
+    TorrentLeechResult,
+    TorrentLeechScraper,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -555,9 +559,16 @@ class IntakeWorker:
 
         next_card_rev = prev_card_revision + 1
 
-        # Guard: if already verified previously and this correction pass had a temporary lookup failure,
-        # never downgrade an already-verified release.
-        if prev_verified and pre_gate.status != "verified" and tl_result.outcome in TL_FAILED_OUTCOMES:
+        # Guard: if already verified previously and this correction pass had only a
+        # transient TL lookup failure (never a genuine tracker conflict like
+        # listing_mismatch / listing_id_conflict / listing_id_malformed),
+        # preserve the already-verified release without downgrading.
+        if (
+            prev_verified
+            and pre_gate.status != "verified"
+            and not pre_gate.is_genuine_conflict
+            and tl_result.outcome in TL_TRANSIENT_FAILURE_OUTCOMES
+        ):
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,

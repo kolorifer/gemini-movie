@@ -40,16 +40,23 @@ _MI_DURATION_M_RE = re.compile(r"^\s*Duration\s*:\s*(\d{1,4})\s*min\b", re.IGNOR
 _MI_DURATION_HMS_RE = re.compile(r"^\s*Duration\s*:\s*(\d{1,2}):(\d{2}):(\d{2})\b", re.IGNORECASE)
 _MI_LANGUAGE_RE = re.compile(r"^\s*Language\s*:\s*([A-Za-z][A-Za-z\s\-/()]{0,48})$", re.IGNORECASE)
 
-TL_FAILED_OUTCOMES = frozenset(
+TL_TRANSIENT_FAILURE_OUTCOMES = frozenset(
     {
         "login_required",
-        "listing_mismatch",
         "listing_temporary_http",
         "cooldown_active",
+    }
+)
+
+TL_INTEGRITY_CONFLICT_OUTCOMES = frozenset(
+    {
+        "listing_mismatch",
         "listing_id_conflict",
         "listing_id_malformed",
     }
 )
+
+TL_FAILED_OUTCOMES = TL_TRANSIENT_FAILURE_OUTCOMES | TL_INTEGRITY_CONFLICT_OUTCOMES
 
 
 @dataclass(frozen=True)

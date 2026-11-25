@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .archive import (
     ArchiveIntegrityError,
+    ArchiveMissingDownloadUrlError,
     ArchivePersistenceError,
     archive_raw_webhook,
     extract_radarr_push_payload,
@@ -312,6 +313,7 @@ def create_app(
         if ref is None:
             raise HTTPException(status_code=404, detail="Release occurrence not found")
 
+        resolved_occurrence_id = body.source_occurrence_id
         try:
             raw_payload = await asyncio.to_thread(
                 read_verified_archive_json,
@@ -319,13 +321,43 @@ def create_app(
                 ref.archive_relpath,
                 ref.archive_sha256,
             )
-            push_payload = extract_radarr_push_payload(
-                raw_payload,
-                indexer_norm=ref.indexer_norm,
-                external_id_norm=ref.external_id_norm,
-                exact_release_name=ref.exact_release_name,
-                fallback_publish_date=ref.received_at,
-            )
+            try:
+                push_payload = extract_radarr_push_payload(
+                    raw_payload,
+                    indexer_norm=ref.indexer_norm,
+                    external_id_norm=ref.external_id_norm,
+                    exact_release_name=ref.exact_release_name,
+                    fallback_publish_date=ref.received_at,
+                )
+            except ArchiveMissingDownloadUrlError:
+                # Requested occurrence passed SHA-256 integrity verification but had no URL;
+                # if a later coalesced duplicate of the SAME release supplied a usable URL,
+                # verify and extract from releases.source_occurrence_id.
+                rel_row = await asyncio.to_thread(intake_db.get_release, release_id)
+                fallback_occ_id = str(rel_row["source_occurrence_id"]) if rel_row else ""
+                if not fallback_occ_id or fallback_occ_id == body.source_occurrence_id:
+                    raise
+                fallback_ref = await asyncio.to_thread(
+                    intake_db.get_occurrence_archive_ref,
+                    release_id,
+                    fallback_occ_id,
+                )
+                if fallback_ref is None:
+                    raise
+                fallback_raw = await asyncio.to_thread(
+                    read_verified_archive_json,
+                    cfg.webhook_archive_dir,
+                    fallback_ref.archive_relpath,
+                    fallback_ref.archive_sha256,
+                )
+                push_payload = extract_radarr_push_payload(
+                    fallback_raw,
+                    indexer_norm=fallback_ref.indexer_norm,
+                    external_id_norm=fallback_ref.external_id_norm,
+                    exact_release_name=fallback_ref.exact_release_name,
+                    fallback_publish_date=fallback_ref.received_at,
+                )
+                resolved_occurrence_id = fallback_occ_id
         except ArchiveIntegrityError as exc:
             logger.error(
                 "Private archive verification failed for release=%s: %s",
@@ -337,7 +369,7 @@ def create_app(
         return JSONResponse(
             content={
                 "release_id": release_id,
-                "source_occurrence_id": body.source_occurrence_id,
+                "source_occurrence_id": resolved_occurrence_id,
                 "push_payload": push_payload,
             },
             headers={

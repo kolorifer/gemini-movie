@@ -26,6 +26,10 @@ class ArchiveIntegrityError(RuntimeError):
     """Raised when archived payload verification or extraction fails."""
 
 
+class ArchiveMissingDownloadUrlError(ArchiveIntegrityError):
+    """Raised when a SHA-256-verified archived payload legitimately lacks a downloadUrl."""
+
+
 def _reject_nonstandard_json_constant(token: str) -> Any:
     raise ValueError(f"Non-standard JSON constant rejected: {token}")
 
@@ -180,7 +184,7 @@ def extract_radarr_push_payload(
             break
 
     if not download_url:
-        raise ArchiveIntegrityError("Archived webhook does not contain a downloadUrl")
+        raise ArchiveMissingDownloadUrlError("Archived webhook does not contain a downloadUrl")
     if not (download_url.startswith("https://") or download_url.startswith("http://")):
         raise ArchiveIntegrityError("Archived downloadUrl must use http or https scheme")
 

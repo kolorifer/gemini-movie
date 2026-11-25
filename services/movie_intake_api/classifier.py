@@ -440,7 +440,11 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
         freeleech = _clean_bool(release.get("is_freeleech"))
 
     has_download_url = any(
-        isinstance(container.get(k), str) and bool(str(container.get(k)).strip())
+        isinstance(container.get(k), str)
+        and (
+            str(container.get(k)).strip().startswith("https://")
+            or str(container.get(k)).strip().startswith("http://")
+        )
         for container in (release, data, raw_payload)
         for k in ("download_url", "downloadUrl", "torrent_url", "torrentUrl")
     )

@@ -300,25 +300,32 @@ class IntakeDB:
                 )
 
                 if cur_digest == classified.incoming_evidence_digest:
-                    # Exact duplicate (concurrent burst or late duplicate): attach occurrence only!
+                    # Exact duplicate (concurrent burst or late duplicate): attach occurrence
+                    # without re-queuing, while preserving/upgrading source_occurrence_id if
+                    # this delivery supplies a usable download URL.
                     conn.execute(
                         """
                         UPDATE releases
-                        SET latest_occurrence_id = ?, updated_at = ?
+                        SET latest_occurrence_id = ?,
+                            source_occurrence_id = ?,
+                            updated_at = ?
                         WHERE release_id = ?
                         """,
-                        (occurrence_id, received_at_iso, release_id),
+                        (occurrence_id, source_occ, received_at_iso, release_id),
                     )
                     result_status = "coalesced_duplicate"
                 elif cur_state == "ambiguous_delivery":
-                    # Never reopen/resend a possibly delivered grab card while delivery is ambiguous
+                    # Never reopen/resend a possibly delivered grab card while delivery is ambiguous,
+                    # but still preserve a newly supplied usable acquisition source occurrence.
                     conn.execute(
                         """
                         UPDATE releases
-                        SET latest_occurrence_id = ?, updated_at = ?
+                        SET latest_occurrence_id = ?,
+                            source_occurrence_id = ?,
+                            updated_at = ?
                         WHERE release_id = ?
                         """,
-                        (occurrence_id, received_at_iso, release_id),
+                        (occurrence_id, source_occ, received_at_iso, release_id),
                     )
                     result_status = "coalesced_duplicate"
                 elif cur_state == "queued":
