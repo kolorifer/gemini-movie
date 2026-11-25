@@ -455,7 +455,7 @@ Existing operator variable names from `~/.config/movie-intel/environment` are pr
   - `MOVIE_INTEL_PUBLIC_BASE_URL` (public HTTPS origin for Telegram action buttons)
   - `RADARR_URL` (preserving any provider prefix), `RADARR_API_KEY`
   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_TOPIC_ID`, `TELEGRAM_ADD_GRAB_TOPIC_ID`, `TELEGRAM_GRAB_ANYWAY_TOPIC_ID`
-  - `MOVIE_INTEL_ACTION_TTL_SECONDS`, `MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG` (optional), `MOVIE_INTEL_STANDALONE_SKIP_ENABLED` (default `false` until user opts in)
+  - `MOVIE_INTEL_ACTION_TTL_SECONDS`, `MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG` (retained active at cutover), `MOVIE_INTEL_STANDALONE_SKIP_ENABLED=true` (enabled alongside `Watched – Good / Bad`)
   - `ACTIONS_DB_PATH` (default `/home/<user>/.local/state/movie-intel/actions.db`)
   - `INTAKE_API_URL=http://127.0.0.1:<PORT_INTAKE>`, `TRIAGE_API_URL=http://127.0.0.1:40716`
   - `INTERNAL_API_SECRET`
@@ -555,7 +555,7 @@ Explicitly **excluded** from the new services (preserved in place in existing pr
 
 ---
 
-## 10. Open Product Choices for User Sign-Off (Non-Blocking for Core Architecture)
+## 10. Confirmed Product Decisions
 
-1. **`Standalone Skip` button (`MOVIE_INTEL_STANDALONE_SKIP_ENABLED`):** Default `false` initially or enable alongside `Watched – Good / Bad`? (Explicit `POST` only, zero Radarr changes, strictly distinct from `Watched – Bad`.)
-2. **`Alternative Grab` retention (`MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG`):** Keep active at cutover (strictly quality-only exception routed to `TELEGRAM_GRAB_ANYWAY_TOPIC_ID` and revalidated at confirmation) or defer until after core cutover?
+1. **`Standalone Skip` button (`MOVIE_INTEL_STANDALONE_SKIP_ENABLED=true`):** **Enabled** alongside `Watched – Good / Bad` (explicit `POST` only, zero Radarr changes, logs `decision=skip` to `movie-triage-api`, strictly distinct from `Watched – Bad`).
+2. **`Alternative Grab` ("Grab Anyway", `MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG`):** **Retained active at cutover** (strictly quality-only exception bound to exact existing movie/file, original release, and allowed rejection class, routed to `TELEGRAM_GRAB_ANYWAY_TOPIC_ID`, revalidated at confirmation, and never triggered on an identity conflict).
