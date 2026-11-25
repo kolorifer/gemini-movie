@@ -355,15 +355,37 @@ class RadarrClient:
 
     async def get_movies_by_tmdb(self, tmdb_id: int) -> RadarrReadResult:
         res = await self._get_json("/api/v3/movie", params={"tmdbId": tmdb_id})
-        if res.ok and not isinstance(res.data, list):
+        if not res.ok:
+            return res
+        if not isinstance(res.data, list):
             return RadarrReadResult(ok=False, status_code=res.status_code, error_redacted="radarr_movies_not_list")
-        return res
+        filtered = [
+            m
+            for m in res.data
+            if isinstance(m, dict)
+            and isinstance(m.get("tmdbId"), int)
+            and not isinstance(m.get("tmdbId"), bool)
+            and m["tmdbId"] == tmdb_id
+        ]
+        return RadarrReadResult(ok=True, data=filtered, status_code=res.status_code)
 
     async def get_movies_by_imdb(self, imdb_id: str) -> RadarrReadResult:
-        res = await self._get_json("/api/v3/movie", params={"imdbId": imdb_id})
-        if res.ok and not isinstance(res.data, list):
+        # Radarr v3 GET /api/v3/movie only filters on `tmdbId` (ignoring `imdbId` and returning
+        # the entire library). Fetch /api/v3/movie and filter strictly by exact normalized imdbId.
+        target = imdb_id.strip().lower()
+        if not target:
+            return RadarrReadResult(ok=True, data=[], status_code=200)
+        res = await self._get_json("/api/v3/movie")
+        if not res.ok:
+            return res
+        if not isinstance(res.data, list):
             return RadarrReadResult(ok=False, status_code=res.status_code, error_redacted="radarr_movies_not_list")
-        return res
+        filtered = [
+            m
+            for m in res.data
+            if isinstance(m, dict) and str(m.get("imdbId") or "").strip().lower() == target
+        ]
+        return RadarrReadResult(ok=True, data=filtered, status_code=res.status_code)
 
     async def get_movie_by_id(self, movie_id: int) -> RadarrReadResult:
         res = await self._get_json(f"/api/v3/movie/{movie_id}")
@@ -373,9 +395,17 @@ class RadarrClient:
 
     async def get_queue_details(self, movie_id: int) -> RadarrReadResult:
         res = await self._get_json("/api/v3/queue/details", params={"movieId": movie_id})
-        if res.ok and not isinstance(res.data, list):
+        if not res.ok:
+            return res
+        if not isinstance(res.data, list):
             return RadarrReadResult(ok=False, status_code=res.status_code, error_redacted="radarr_queue_not_list")
-        return res
+        filtered = [
+            q
+            for q in res.data
+            if isinstance(q, dict)
+            and (q.get("movieId") is None or q.get("movieId") == movie_id)
+        ]
+        return RadarrReadResult(ok=True, data=filtered, status_code=res.status_code)
 
     async def get_movie_history(self, movie_id: int) -> RadarrReadResult:
         res = await self._get_json("/api/v3/history/movie", params={"movieId": movie_id})

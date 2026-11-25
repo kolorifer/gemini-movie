@@ -1963,6 +1963,74 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(fb.calls), 1)
                     self.assertEqual(len(radarr.push_calls), 1)
 
+    async def test_radarr_client_filters_imdb_locally_against_populated_unrelated_library(self) -> None:
+        """Codex Round 4 P1: Radarr /api/v3/movie ignores imdbId and returns the full library; filter locally."""
+        populated_library = [
+            {"id": 10, "tmdbId": 11111, "imdbId": "tt0011111", "monitored": True, "hasFile": True, "tags": []},
+            {"id": 11, "tmdbId": 22222, "imdbId": "tt0022222", "monitored": False, "hasFile": False, "tags": [9]},
+            {"id": 12, "tmdbId": 33333, "imdbId": "tt0033333", "monitored": True, "hasFile": False, "tags": []},
+        ]
+
+        def _radarr_v3_controller(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/v3/tag"):
+                return httpx.Response(200, json=[{"id": 9, "label": "watched"}])
+            if request.url.path.endswith("/api/v3/movie"):
+                # Real Radarr MovieController ONLY filters on tmdbId; otherwise returns ALL movies!
+                tmdb_param = request.url.params.get("tmdbId")
+                if tmdb_param is not None:
+                    tid = int(tmdb_param)
+                    return httpx.Response(200, json=[m for m in populated_library if m["tmdbId"] == tid])
+                return httpx.Response(200, json=list(populated_library))
+            return httpx.Response(404)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_radarr_v3_controller)) as radarr_http:
+                real_radarr_client = RadarrClient(
+                    base_url="https://seedbox.invalid/user/radarr",
+                    api_key="test-key",
+                    http_client=radarr_http,
+                )
+                app = create_actions_app(
+                    cfg,
+                    radarr_client=real_radarr_client,
+                    telegram_client=ControllableTelegramStub(),
+                    intake_push_client=ShadowStubIntakePushClient(),
+                    triage_feedback_client=ControllableFeedbackStub(),
+                )
+                headers = {"X-Internal-Token": cfg.internal_api_secret}
+                async with app.router.lifespan_context(app):
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app), base_url="http://test"
+                    ) as client:
+                        # Brand new movie with BOTH tmdb_id and imdb_id MUST report 'absent' (NOT ambiguous!)
+                        r_absent = await client.get(
+                            "/internal/radarr/status",
+                            params={"tmdb_id": 999999, "imdb_id": "tt9999999"},
+                            headers=headers,
+                        )
+                        self.assertEqual(r_absent.status_code, 200)
+                        self.assertEqual(r_absent.json()["status"], "absent")
+
+                        # IMDb-only lookup against populated library matches ONLY exact movie (watched_unmonitored)
+                        r_imdb = await client.get(
+                            "/internal/radarr/status",
+                            params={"imdb_id": "TT0022222"},
+                            headers=headers,
+                        )
+                        self.assertEqual(r_imdb.status_code, 200)
+                        self.assertEqual(r_imdb.json()["status"], "watched_unmonitored")
+                        self.assertEqual(r_imdb.json()["movie_id"], 11)
+
+                        # Cross-check conflict: absent tmdb_id=888888, but imdb_id=tt0011111 belongs to tmdbId=11111 -> ambiguous!
+                        r_conflict = await client.get(
+                            "/internal/radarr/status",
+                            params={"tmdb_id": 888888, "imdb_id": "tt0011111"},
+                            headers=headers,
+                        )
+                        self.assertEqual(r_conflict.status_code, 200)
+                        self.assertEqual(r_conflict.json()["status"], "ambiguous")
+
 
 if __name__ == "__main__":
     unittest.main()
