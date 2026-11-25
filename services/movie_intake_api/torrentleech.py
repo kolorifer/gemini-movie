@@ -24,6 +24,7 @@ _TL_EXTERNAL_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 _TL_CANONICAL_URL_RE = re.compile(r"^https://www\.torrentleech\.org/torrent/[1-9][0-9]{0,19}$")
 _IMDB_VALID_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
 _IMDB_URL_TOKEN_RE = re.compile(r"imdb\.com/title/([^/?#\"'\s<>]+)", re.IGNORECASE)
+_IMDB_TEXT_TOKEN_RE = re.compile(r"\btt\d+[a-z0-9]*\b", re.IGNORECASE)
 _LOGIN_TEXT_RE = re.compile(
     r"\b(?:please\s+log\s*in|you\s+need\s+to\s+be\s+logged\s+in|member\s+login|sign\s+in\s+to\s+torrentleech)\b",
     re.IGNORECASE,
@@ -298,6 +299,17 @@ class _TorrentLeechHtmlParser(HTMLParser):
             elif top["badge_depth"] > 0:
                 top["badge_depth"] += 1
 
+        # Open IMDb field container BEFORE inspecting href so <a id="imdb" href="...">
+        # accurately sets _imdb_field_saw_href while still checking field text for explicit IDs.
+        if not is_void:
+            if elem_id_low in ("imdb", "imdbid", "imdb_id", "torrentimdb"):
+                self._imdb_field_depth = 1
+                self._imdb_field_saw_href = False
+                self._imdb_field_parts = []
+            elif self._imdb_field_depth > 0:
+                self._imdb_field_depth += 1
+                self._imdb_field_parts.append(" ")
+
         # IMDb links and explicit IMDb attributes/elements
         href = attr_map.get("href", "")
         if href:
@@ -308,18 +320,12 @@ class _TorrentLeechHtmlParser(HTMLParser):
                 for match in href_matches:
                     self.imdb_tokens.append(match.group(1).strip())
 
-        data_imdb = attr_map.get("data-imdb", "").strip() or attr_map.get("data-imdb-id", "").strip()
-        if data_imdb:
-            self.imdb_tokens.append(data_imdb)
+        for attr_name in ("data-imdb", "data-imdb-id"):
+            data_imdb = attr_map.get(attr_name, "").strip()
+            if data_imdb:
+                self.imdb_tokens.append(data_imdb)
 
         if not is_void:
-            if elem_id_low in ("imdb", "imdbid", "imdb_id", "torrentimdb"):
-                self._imdb_field_depth = 1
-                self._imdb_field_saw_href = False
-                self._imdb_field_parts = []
-            elif self._imdb_field_depth > 0:
-                self._imdb_field_depth += 1
-
             # NFO / MediaInfo capture
             if self._nfo_depth > 0:
                 self._nfo_depth += 1
@@ -364,18 +370,26 @@ class _TorrentLeechHtmlParser(HTMLParser):
 
         if self._imdb_field_depth > 0:
             self._imdb_field_depth -= 1
-            if self._imdb_field_depth == 0:
-                if not self._imdb_field_saw_href:
-                    raw_field = re.sub(r"\s+", " ", "".join(self._imdb_field_parts)).strip()
-                    if raw_field and raw_field.lower() not in ("n/a", "-", "none", "unknown", "imdb", "imdb:"):
-                        url_matches = _IMDB_URL_TOKEN_RE.findall(raw_field)
-                        if url_matches:
-                            self.imdb_tokens.extend(url_matches)
-                        else:
-                            for tok in re.split(r"[\s,;]+", raw_field):
-                                cleaned = tok.strip()
-                                if cleaned and cleaned.lower() not in ("imdb", "imdb:", "id", "id:", "n/a", "-"):
-                                    self.imdb_tokens.append(cleaned)
+            if self._imdb_field_depth > 0:
+                self._imdb_field_parts.append(" ")
+            elif self._imdb_field_depth == 0:
+                raw_field = re.sub(r"\s+", " ", "".join(self._imdb_field_parts)).strip()
+                if raw_field and raw_field.lower() not in ("n/a", "-", "none", "unknown", "imdb", "imdb:"):
+                    # Always extract explicit IMDb URLs and tt-prefixed IDs from field text,
+                    # even when an <a href="...imdb.com/title/..."> link is also present, so
+                    # contradictory text+link evidence produces listing_id_conflict / malformed
+                    # while ordinary rating labels like "7.8 / 10 (IMDb)" are ignored.
+                    url_matches = _IMDB_URL_TOKEN_RE.findall(raw_field)
+                    explicit_tt_matches = _IMDB_TEXT_TOKEN_RE.findall(raw_field)
+                    if url_matches:
+                        self.imdb_tokens.extend(url_matches)
+                    if explicit_tt_matches:
+                        self.imdb_tokens.extend(explicit_tt_matches)
+                    elif not url_matches and not self._imdb_field_saw_href:
+                        for tok in re.split(r"[\s,;]+", raw_field):
+                            cleaned = tok.strip()
+                            if cleaned and cleaned.lower() not in ("imdb", "imdb:", "id", "id:", "n/a", "-"):
+                                self.imdb_tokens.append(cleaned)
                 self._imdb_field_saw_href = False
 
         if self._nfo_depth > 0:
@@ -472,11 +486,11 @@ def parse_tl_listing_html(html_text: str, *, exact_release_name: str) -> Torrent
         else:
             malformed_found = True
 
-    if malformed_found:
-        outcome = "listing_id_malformed"
-        chosen_imdb: Optional[str] = None
-    elif len(valid_ids) > 1:
+    if len(valid_ids) > 1:
         outcome = "listing_id_conflict"
+        chosen_imdb: Optional[str] = None
+    elif malformed_found:
+        outcome = "listing_id_malformed"
         chosen_imdb = None
     elif len(valid_ids) == 1:
         outcome = "listing_id_found"

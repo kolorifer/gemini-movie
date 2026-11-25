@@ -2500,6 +2500,92 @@ Language : German
                 self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
                 self.assertIn("195m", str(actions.card_calls[-1]["conflict_reason"] or ""))
 
+    def test_tl_imdb_field_text_vs_href_conflict_and_rating_labels(self) -> None:
+        """Codex Round 6 P1: Explicit textual IMDb IDs in #imdb must be checked even when a link is present."""
+        from services.movie_intake_api.tmdb_verifier import run_independent_identity_gate
+
+        rel = "Link.Conflict.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES"
+
+        # 1) Exact Codex repro: conflicting textual ID alongside valid IMDb link -> listing_id_conflict
+        html_conflict = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<div id="imdb">tt9999999 <a href="https://www.imdb.com/title/tt2024001/">IMDb</a></div>'
+        )
+        res_conflict = parse_tl_listing_html(html_conflict, exact_release_name=rel)
+        self.assertEqual(res_conflict.outcome, "listing_id_conflict")
+        self.assertIsNone(res_conflict.imdb_id)
+
+        # 2) No-space boundary variant: tt9999999<a href="...">IMDb</a> -> listing_id_conflict
+        html_nospace = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<div id="imdb">tt9999999<a href="https://www.imdb.com/title/tt2024001/">IMDb</a></div>'
+        )
+        self.assertEqual(parse_tl_listing_html(html_nospace, exact_release_name=rel).outcome, "listing_id_conflict")
+
+        # 3) Malformed textual ID alongside valid IMDb link -> listing_id_malformed
+        html_malformed = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<div id="imdb">tt123 <a href="https://www.imdb.com/title/tt2024001/">IMDb</a></div>'
+        )
+        self.assertEqual(parse_tl_listing_html(html_malformed, exact_release_name=rel).outcome, "listing_id_malformed")
+
+        # 4) Matching textual ID + link + ordinary rating label -> listing_id_found
+        html_agree = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<div id="imdb">tt2024001 <a href="https://www.imdb.com/title/tt2024001/">7.8 / 10 (IMDb)</a></div>'
+        )
+        res_agree = parse_tl_listing_html(html_agree, exact_release_name=rel)
+        self.assertEqual(res_agree.outcome, "listing_id_found")
+        self.assertEqual(res_agree.imdb_id, "tt2024001")
+
+        # 5) <a id="imdb" href="..."> with rating label vs conflicting text
+        html_anchor_rating = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<a id="imdb" href="https://www.imdb.com/title/tt2024001/">7.8 / 10 (IMDb)</a>'
+        )
+        res_anchor = parse_tl_listing_html(html_anchor_rating, exact_release_name=rel)
+        self.assertEqual(res_anchor.outcome, "listing_id_found")
+        self.assertEqual(res_anchor.imdb_id, "tt2024001")
+
+        html_anchor_conflict = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<a id="imdb" href="https://www.imdb.com/title/tt2024001/">tt9999999</a>'
+        )
+        self.assertEqual(
+            parse_tl_listing_html(html_anchor_conflict, exact_release_name=rel).outcome,
+            "listing_id_conflict",
+        )
+
+        # 6) Verify conflicting parse result fails the independent identity gate (evidence_review only)
+        with tempfile.TemporaryDirectory() as tmp:
+            movie = TmdbMovieRecord(
+                tmdb_id=2024001,
+                title="Link Conflict",
+                original_title="Link Conflict",
+                year=2024,
+                imdb_id="tt2024001",
+                runtime_minutes=110,
+            )
+            tmdb = StubTmdbClient(Path(tmp) / "tmdb.json", {2024001: movie}, {"tt2024001": [2024001]})
+            gate = asyncio.run(
+                run_independent_identity_gate(
+                    tmdb_client=tmdb,
+                    exact_release_name=rel,
+                    proposed_imdb_id="tt2024001",
+                    proposed_tmdb_id=2024001,
+                    proposal_confidence="high",
+                    from_evaluator=False,
+                    tl_applicable=True,
+                    tl_outcome=res_conflict.outcome,
+                    observed_meta_imdb="tt2024001",
+                    observed_meta_tmdb=2024001,
+                    observed_tl_imdb=res_conflict.imdb_id,
+                    file_runtime_minutes=110,
+                )
+            )
+            self.assertEqual(gate.status, "evidence_review")
+            self.assertTrue(gate.is_genuine_conflict)
+
 
 if __name__ == "__main__":
     unittest.main()
