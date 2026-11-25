@@ -96,6 +96,7 @@ class IntakeConfig:
     worker_lease_seconds: int = 90
     worker_poll_interval_seconds: float = 2.0
     tl_min_interval_seconds: float = 1.5
+    retry_backoff_seconds: float = 30.0
     max_webhook_body_bytes: int = MAX_WEBHOOK_BODY_BYTES
 
     @classmethod
@@ -171,5 +172,8 @@ class IntakeConfig:
             ),
             tl_min_interval_seconds=max(
                 0.0, float((source.get("TL_MIN_INTERVAL_SECONDS") or "1.5").strip())
+            ),
+            retry_backoff_seconds=max(
+                0.0, float((source.get("RETRY_BACKOFF_SECONDS") or "30.0").strip())
             ),
         )

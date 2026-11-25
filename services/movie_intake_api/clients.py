@@ -37,6 +37,12 @@ class DeliveryCardResponse:
 
 
 @dataclass(frozen=True)
+class DeliveryEvalResponse:
+    status: str  # sent | ambiguous_reply | failed
+    detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TriageEvalResult:
     ok: bool
     payload: Optional[dict[str, Any]] = None
@@ -45,6 +51,8 @@ class TriageEvalResult:
 
 class TriageApiClient:
     """Async client calling local movie-triage-api POST /evaluate with X-Internal-Token."""
+
+    is_shadow_stub: bool = False
 
     def __init__(
         self,
@@ -98,6 +106,8 @@ class TriageApiClient:
 
 class ActionsApiClient:
     """Async client calling local movie-actions-api /internal/* endpoints with X-Internal-Token."""
+
+    is_shadow_stub: bool = False
 
     def __init__(
         self,
@@ -236,7 +246,7 @@ class ActionsApiClient:
             if owns_client:
                 await client.aclose()
 
-    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> bool:
+    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> DeliveryEvalResponse:
         owns_client = self._external_client is None
         client = (
             self._external_client
@@ -249,9 +259,87 @@ class ActionsApiClient:
                 json=eval_reply_payload,
                 headers=self._headers(),
             )
-            return resp.status_code == 200
-        except Exception:
-            return False
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                st = str(data.get("status") or "sent") if isinstance(data, dict) else "sent"
+                if st == "ambiguous_reply":
+                    return DeliveryEvalResponse(status="ambiguous_reply", detail="actions_ambiguous_reply")
+                if st == "failed":
+                    return DeliveryEvalResponse(status="failed", detail="actions_reply_failed")
+                return DeliveryEvalResponse(status="sent")
+            if 400 <= resp.status_code < 500:
+                return DeliveryEvalResponse(status="failed", detail=f"actions_http_{resp.status_code}")
+            return DeliveryEvalResponse(status="ambiguous_reply", detail=f"actions_http_{resp.status_code}")
+        except httpx.ConnectError:
+            return DeliveryEvalResponse(status="failed", detail="actions_connect_error")
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            return DeliveryEvalResponse(
+                status="ambiguous_reply",
+                detail=redact_secrets(exc.__class__.__name__, max_chars=120),
+            )
         finally:
             if owns_client:
                 await client.aclose()
+
+
+class ShadowStubTriageClient(TriageApiClient):
+    """Zero-mutation in-memory triage stub used automatically when SHADOW_REPLAY_ENABLED=true."""
+
+    is_shadow_stub: bool = True
+
+    def __init__(self) -> None:
+        super().__init__(base_url="http://shadow.invalid", internal_token="")
+        self.calls: list[dict[str, Any]] = []
+
+    async def evaluate(self, request_body: dict[str, Any]) -> TriageEvalResult:
+        self.calls.append(dict(request_body))
+        return TriageEvalResult(
+            ok=False,
+            error_redacted="shadow_replay_stub_evaluator_no_external_mutation",
+        )
+
+
+class ShadowStubActionsClient(ActionsApiClient):
+    """Zero-mutation in-memory actions stub used automatically when SHADOW_REPLAY_ENABLED=true."""
+
+    is_shadow_stub: bool = True
+
+    def __init__(self) -> None:
+        super().__init__(base_url="http://shadow.invalid", internal_token="")
+        self.radarr_calls: list[dict[str, Any]] = []
+        self.card_calls: list[dict[str, Any]] = []
+        self.eval_reply_calls: list[dict[str, Any]] = []
+        self._next_msg_id = 1000
+        self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+
+    async def get_radarr_status(
+        self,
+        *,
+        tmdb_id: Optional[int],
+        imdb_id: Optional[str],
+        release_title: Optional[str] = None,
+    ) -> RadarrStatusResponse:
+        self.radarr_calls.append({"tmdb_id": tmdb_id, "imdb_id": imdb_id, "release_title": release_title})
+        return RadarrStatusResponse(status="absent", detail="shadow_stub")
+
+    async def deliver_card(self, card_payload: dict[str, Any]) -> DeliveryCardResponse:
+        self.card_calls.append(dict(card_payload))
+        rel_id = str(card_payload["release_id"])
+        if rel_id in self._delivered_by_release:
+            return self._delivered_by_release[rel_id]
+        self._next_msg_id += 1
+        resp = DeliveryCardResponse(
+            status="delivered",
+            ack_chat_id="shadow-chat",
+            ack_message_id=self._next_msg_id,
+            ack_thread_id=0,
+        )
+        self._delivered_by_release[rel_id] = resp
+        return resp
+
+    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> DeliveryEvalResponse:
+        self.eval_reply_calls.append(dict(eval_reply_payload))
+        return DeliveryEvalResponse(status="sent", detail="shadow_stub")

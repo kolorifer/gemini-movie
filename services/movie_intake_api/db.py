@@ -145,6 +145,13 @@ class IntakeDB:
                     verified_imdb_id           TEXT,
                     verified_title             TEXT,
                     verified_year              INTEGER,
+                    ack_chat_id                TEXT,
+                    ack_message_id             INTEGER,
+                    ack_thread_id              INTEGER,
+                    ack_incoming_digest        TEXT,
+                    eval_reply_status          TEXT NOT NULL DEFAULT 'pending',
+                    pending_card_supersede_json TEXT,
+                    pending_eval_reply_json    TEXT,
                     radarr_status_snapshot     TEXT,
                     evaluation_json            TEXT,
                     created_at                 TEXT NOT NULL,
@@ -323,6 +330,11 @@ class IntakeDB:
                             source_occurrence_id = ?,
                             incoming_evidence_digest = ?,
                             incoming_snapshot_json = ?,
+                            retry_count = 0,
+                            pending_card_supersede_json = NULL,
+                            pending_eval_reply_json = NULL,
+                            eval_reply_status = 'pending',
+                            next_attempt_at = ?,
                             updated_at = ?
                         WHERE release_id = ?
                         """,
@@ -331,6 +343,7 @@ class IntakeDB:
                             source_occ,
                             classified.incoming_evidence_digest,
                             snap_json,
+                            received_at_iso,
                             received_at_iso,
                             release_id,
                         ),
@@ -370,6 +383,10 @@ class IntakeDB:
                             incoming_snapshot_json = ?,
                             state = 'queued',
                             pending_reprocess = 0,
+                            retry_count = 0,
+                            pending_card_supersede_json = NULL,
+                            pending_eval_reply_json = NULL,
+                            eval_reply_status = 'pending',
                             suppression_reason = NULL,
                             lease_owner = NULL,
                             lease_expires_at = NULL,
@@ -545,6 +562,144 @@ class IntakeDB:
         finally:
             conn.close()
 
+    def record_card_ack(
+        self,
+        release_id: str,
+        *,
+        worker_id: str,
+        card_revision: int,
+        ack_chat_id: Optional[str],
+        ack_message_id: int,
+        ack_thread_id: Optional[int],
+        ack_incoming_digest: str,
+        pending_eval_reply: Any = ...,
+        full_evidence_digest: Optional[str] = None,
+        last_evaluated_digest: Optional[str] = None,
+        tl_outcome: Optional[str] = None,
+        identity_gate_status: Optional[str] = None,
+        identity_conflict_reason: Any = ...,
+        verified_tmdb_id: Any = ...,
+        verified_imdb_id: Any = ...,
+        verified_title: Any = ...,
+        verified_year: Any = ...,
+        radarr_status_snapshot: Optional[dict[str, Any]] = None,
+        evaluation_json: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Persist acknowledged Telegram card receipt (and optional pre-reply metadata) immediately after delivery."""
+        now_iso = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if pending_eval_reply is ...:
+                cur = conn.execute(
+                    """
+                    UPDATE releases
+                    SET card_revision = ?,
+                        ack_chat_id = ?,
+                        ack_message_id = ?,
+                        ack_thread_id = ?,
+                        ack_incoming_digest = ?,
+                        updated_at = ?
+                    WHERE release_id = ? AND lease_owner = ?
+                    """,
+                    (
+                        card_revision,
+                        ack_chat_id,
+                        ack_message_id,
+                        ack_thread_id,
+                        ack_incoming_digest,
+                        now_iso,
+                        release_id,
+                        worker_id,
+                    ),
+                )
+            else:
+                cur_row = conn.execute(
+                    """
+                    SELECT identity_gate_status, identity_conflict_reason,
+                           verified_tmdb_id, verified_imdb_id, verified_title, verified_year
+                    FROM releases
+                    WHERE release_id = ? AND lease_owner = ?
+                    """,
+                    (release_id, worker_id),
+                ).fetchone()
+                if cur_row is None:
+                    conn.execute("COMMIT")
+                    return False
+                pending_reply_json = (
+                    json.dumps(pending_eval_reply, ensure_ascii=False)
+                    if pending_eval_reply is not None
+                    else None
+                )
+                final_gate = identity_gate_status or str(cur_row["identity_gate_status"])
+                final_conflict = (
+                    cur_row["identity_conflict_reason"]
+                    if identity_conflict_reason is ...
+                    else identity_conflict_reason
+                )
+                final_tmdb = cur_row["verified_tmdb_id"] if verified_tmdb_id is ... else verified_tmdb_id
+                final_imdb = cur_row["verified_imdb_id"] if verified_imdb_id is ... else verified_imdb_id
+                final_title = cur_row["verified_title"] if verified_title is ... else verified_title
+                final_year = cur_row["verified_year"] if verified_year is ... else verified_year
+                cur = conn.execute(
+                    """
+                    UPDATE releases
+                    SET card_revision = ?,
+                        ack_chat_id = ?,
+                        ack_message_id = ?,
+                        ack_thread_id = ?,
+                        ack_incoming_digest = ?,
+                        eval_reply_status = 'pending',
+                        pending_eval_reply_json = ?,
+                        full_evidence_digest = COALESCE(?, full_evidence_digest),
+                        last_evaluated_digest = COALESCE(?, last_evaluated_digest),
+                        tl_outcome = COALESCE(?, tl_outcome),
+                        identity_gate_status = ?,
+                        identity_conflict_reason = ?,
+                        verified_tmdb_id = ?,
+                        verified_imdb_id = ?,
+                        verified_title = ?,
+                        verified_year = ?,
+                        radarr_status_snapshot = COALESCE(?, radarr_status_snapshot),
+                        evaluation_json = COALESCE(?, evaluation_json),
+                        updated_at = ?
+                    WHERE release_id = ? AND lease_owner = ?
+                    """,
+                    (
+                        card_revision,
+                        ack_chat_id,
+                        ack_message_id,
+                        ack_thread_id,
+                        ack_incoming_digest,
+                        pending_reply_json,
+                        full_evidence_digest,
+                        last_evaluated_digest,
+                        tl_outcome,
+                        final_gate,
+                        final_conflict,
+                        final_tmdb,
+                        final_imdb,
+                        final_title,
+                        final_year,
+                        json.dumps(radarr_status_snapshot, ensure_ascii=False)
+                        if radarr_status_snapshot is not None
+                        else None,
+                        json.dumps(evaluation_json, ensure_ascii=False)
+                        if evaluation_json is not None
+                        else None,
+                        now_iso,
+                        release_id,
+                        worker_id,
+                    ),
+                )
+            conn.execute("COMMIT")
+            return cur.rowcount == 1
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def finalize_release(
         self,
         release_id: str,
@@ -552,21 +707,28 @@ class IntakeDB:
         worker_id: str,
         state: str,
         expected_incoming_digest: str,
-        suppression_reason: Optional[str] = None,
+        suppression_reason: Any = ...,
         card_revision: Optional[int] = None,
         full_evidence_digest: Optional[str] = None,
         last_evaluated_digest: Optional[str] = None,
         tl_outcome: Optional[str] = None,
         identity_gate_status: Optional[str] = None,
-        identity_conflict_reason: Optional[str] = None,
-        verified_tmdb_id: Optional[int] = None,
-        verified_imdb_id: Optional[str] = None,
-        verified_title: Optional[str] = None,
-        verified_year: Optional[int] = None,
+        identity_conflict_reason: Any = ...,
+        verified_tmdb_id: Any = ...,
+        verified_imdb_id: Any = ...,
+        verified_title: Any = ...,
+        verified_year: Any = ...,
+        ack_chat_id: Optional[str] = None,
+        ack_message_id: Optional[int] = None,
+        ack_thread_id: Optional[int] = None,
+        eval_reply_status: Optional[str] = None,
+        pending_card_supersede: Any = ...,
+        pending_eval_reply: Any = ...,
         radarr_status_snapshot: Optional[dict[str, Any]] = None,
         evaluation_json: Optional[dict[str, Any]] = None,
         next_attempt_at: Optional[str] = None,
         increment_retry: bool = False,
+        reset_retry: bool = False,
         allow_downgrade_on_conflict: bool = False,
     ) -> str:
         """
@@ -582,8 +744,11 @@ class IntakeDB:
             cur_row = conn.execute(
                 """
                 SELECT pending_reprocess, incoming_evidence_digest, card_revision,
-                       identity_gate_status, verified_tmdb_id, verified_imdb_id,
-                       verified_title, verified_year, retry_count
+                       suppression_reason, identity_gate_status, identity_conflict_reason,
+                       verified_tmdb_id, verified_imdb_id,
+                       verified_title, verified_year, retry_count,
+                       ack_chat_id, ack_message_id, ack_thread_id, eval_reply_status,
+                       pending_card_supersede_json, pending_eval_reply_json
                 FROM releases
                 WHERE release_id = ? AND lease_owner = ?
                 """,
@@ -602,10 +767,18 @@ class IntakeDB:
             # only allow superseding to evidence_review on a genuine verified conflict.
             prev_verified = str(cur_row["identity_gate_status"]) == "verified"
             final_gate = identity_gate_status or str(cur_row["identity_gate_status"])
-            final_tmdb = verified_tmdb_id
-            final_imdb = verified_imdb_id
-            final_title = verified_title
-            final_year = verified_year
+            final_suppression = (
+                cur_row["suppression_reason"] if suppression_reason is ... else suppression_reason
+            )
+            final_conflict_reason = (
+                cur_row["identity_conflict_reason"]
+                if identity_conflict_reason is ...
+                else identity_conflict_reason
+            )
+            final_tmdb = cur_row["verified_tmdb_id"] if verified_tmdb_id is ... else verified_tmdb_id
+            final_imdb = cur_row["verified_imdb_id"] if verified_imdb_id is ... else verified_imdb_id
+            final_title = cur_row["verified_title"] if verified_title is ... else verified_title
+            final_year = cur_row["verified_year"] if verified_year is ... else verified_year
             if prev_verified and final_gate != "verified" and not allow_downgrade_on_conflict:
                 final_gate = "verified"
                 final_tmdb = cur_row["verified_tmdb_id"]
@@ -613,17 +786,45 @@ class IntakeDB:
                 final_title = cur_row["verified_title"]
                 final_year = cur_row["verified_year"]
 
+            final_pending_supersede = (
+                cur_row["pending_card_supersede_json"]
+                if pending_card_supersede is ...
+                else (
+                    json.dumps(pending_card_supersede, ensure_ascii=False)
+                    if pending_card_supersede is not None
+                    else None
+                )
+            )
+            final_pending_reply = (
+                cur_row["pending_eval_reply_json"]
+                if pending_eval_reply is ...
+                else (
+                    json.dumps(pending_eval_reply, ensure_ascii=False)
+                    if pending_eval_reply is not None
+                    else None
+                )
+            )
+            final_eval_reply_status = eval_reply_status or str(cur_row["eval_reply_status"])
+
             final_state = state
             final_pending = 0
             final_next_attempt = next_attempt_at
+            base_retries = 0 if (reset_retry or state == "completed") else int(cur_row["retry_count"])
+            final_retries = base_retries + (1 if increment_retry else 0)
             if has_newer and state != "ambiguous_delivery":
                 final_state = "queued"
                 final_next_attempt = now_iso
+                final_retries = 0
+                final_pending_supersede = None
+                final_pending_reply = None
+                final_eval_reply_status = "pending"
 
             final_card_rev = (
                 card_revision if card_revision is not None else int(cur_row["card_revision"])
             )
-            final_retries = int(cur_row["retry_count"]) + (1 if increment_retry else 0)
+            final_ack_chat = ack_chat_id if ack_chat_id is not None else cur_row["ack_chat_id"]
+            final_ack_msg = ack_message_id if ack_message_id is not None else cur_row["ack_message_id"]
+            final_ack_thread = ack_thread_id if ack_thread_id is not None else cur_row["ack_thread_id"]
 
             conn.execute(
                 """
@@ -645,6 +846,12 @@ class IntakeDB:
                     verified_imdb_id = ?,
                     verified_title = ?,
                     verified_year = ?,
+                    ack_chat_id = ?,
+                    ack_message_id = ?,
+                    ack_thread_id = ?,
+                    eval_reply_status = ?,
+                    pending_card_supersede_json = ?,
+                    pending_eval_reply_json = ?,
                     radarr_status_snapshot = COALESCE(?, radarr_status_snapshot),
                     evaluation_json = COALESCE(?, evaluation_json),
                     updated_at = ?
@@ -653,7 +860,7 @@ class IntakeDB:
                 (
                     final_state,
                     final_pending,
-                    suppression_reason,
+                    final_suppression,
                     final_card_rev,
                     final_retries,
                     final_next_attempt,
@@ -661,11 +868,17 @@ class IntakeDB:
                     last_evaluated_digest,
                     tl_outcome,
                     final_gate,
-                    identity_conflict_reason,
+                    final_conflict_reason,
                     final_tmdb,
                     final_imdb,
                     final_title,
                     final_year,
+                    final_ack_chat,
+                    final_ack_msg,
+                    final_ack_thread,
+                    final_eval_reply_status,
+                    final_pending_supersede,
+                    final_pending_reply,
                     json.dumps(radarr_status_snapshot, ensure_ascii=False)
                     if radarr_status_snapshot is not None
                     else None,

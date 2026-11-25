@@ -9,7 +9,13 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from .classifier import ClassifiedWebhook, classify_rejection_reasons
-from .clients import ActionsApiClient, DeliveryCardResponse, RadarrStatusResponse, TriageApiClient
+from .clients import (
+    ActionsApiClient,
+    DeliveryCardResponse,
+    DeliveryEvalResponse,
+    RadarrStatusResponse,
+    TriageApiClient,
+)
 from .config import AlternativeGrabPolicy, IntakeConfig
 from .db import IntakeDB, utc_now, utc_now_iso
 from .security import redact_secrets
@@ -281,10 +287,12 @@ class IntakeWorker:
         *,
         release_id: str,
         card_revision: int,
+        incoming_digest: str,
         card_payload: dict[str, Any],
         eval_payload: Optional[dict[str, Any]],
         eval_error: Optional[str],
-    ) -> tuple[DeliveryCardResponse, bool]:
+        ack_metadata: Optional[dict[str, Any]] = None,
+    ) -> tuple[DeliveryCardResponse, Optional[DeliveryEvalResponse], Optional[dict[str, Any]]]:
         await asyncio.to_thread(
             self.db.renew_lease,
             release_id,
@@ -295,7 +303,7 @@ class IntakeWorker:
         card_resp = await self.actions_client.deliver_card(card_payload)
         if card_resp.status != "delivered" or card_resp.ack_message_id is None:
             # Never post an unanchored reply when ack_message_id is missing / ambiguous_delivery
-            return card_resp, False
+            return card_resp, None, None
 
         reply_body: dict[str, Any] = {
             "release_id": release_id,
@@ -306,16 +314,189 @@ class IntakeWorker:
             "evaluation": eval_payload,
             "error_redacted": eval_error,
         }
-        reply_ok = await self.actions_client.deliver_evaluation(reply_body)
-        return card_resp, reply_ok
+        # Persist acknowledged card receipt + pending reply + snapshot metadata BEFORE posting reply
+        # so even a hard process kill mid-reply recovers directly into Path B with intact state.
+        await asyncio.to_thread(
+            self.db.record_card_ack,
+            release_id,
+            worker_id=self.worker_id,
+            card_revision=card_revision,
+            ack_chat_id=card_resp.ack_chat_id,
+            ack_message_id=card_resp.ack_message_id,
+            ack_thread_id=card_resp.ack_thread_id,
+            ack_incoming_digest=incoming_digest,
+            pending_eval_reply=reply_body,
+            **(ack_metadata or {}),
+        )
+        reply_resp = await self.actions_client.deliver_evaluation(reply_body)
+        return card_resp, reply_resp, reply_body
+
+    def _retry_next_attempt_iso(self) -> str:
+        return utc_now_iso(utc_now() + timedelta(seconds=self.config.retry_backoff_seconds))
+
+    async def _process_pending_followups(self, row: dict[str, Any]) -> bool:
+        """
+        Handle durably persisted post-card follow-ups independently WITHOUT resending
+        the original card, re-scraping TorrentLeech, or repeating /evaluate:
+          - Path A: retry failed conflict-card supersession (evidence_review edit)
+          - Path B: retry failed evaluation / redacted-error reply bound to ack_message_id
+        Returns True if this row was handled by a pending follow-up path.
+        """
+        raw_sup = row.get("pending_card_supersede_json")
+        raw_reply = row.get("pending_eval_reply_json")
+        if not raw_sup and not raw_reply:
+            return False
+
+        release_id = str(row["release_id"])
+        expected_digest = str(row["incoming_evidence_digest"])
+        retry_count = int(row.get("retry_count") or 0)
+        pending_reply: Optional[dict[str, Any]] = json.loads(str(raw_reply)) if raw_reply else None
+
+        await asyncio.to_thread(
+            self.db.renew_lease,
+            release_id,
+            worker_id=self.worker_id,
+            lease_seconds=self.config.worker_lease_seconds,
+            new_state="delivering",
+        )
+
+        # Path A: Retry conflict-card supersession before allowing completion
+        if raw_sup:
+            supersede_card = json.loads(str(raw_sup))
+            effective_rev = int(supersede_card.get("card_revision") or (int(row.get("card_revision") or 0) + 1))
+            conflict_reason = supersede_card.get("conflict_reason")
+            sup_resp = await self.actions_client.deliver_card(supersede_card)
+            if sup_resp.status == "ambiguous_delivery":
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="ambiguous_delivery",
+                    expected_incoming_digest=expected_digest,
+                    identity_gate_status="evidence_review",
+                    identity_conflict_reason=conflict_reason,
+                    verified_tmdb_id=None,
+                    verified_imdb_id=None,
+                    verified_title=None,
+                    verified_year=None,
+                    pending_card_supersede=None,
+                    pending_eval_reply=None,
+                    allow_downgrade_on_conflict=True,
+                )
+                return True
+            if sup_resp.status != "delivered":
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="queued" if retry_count < 4 else "failed_terminal",
+                    expected_incoming_digest=expected_digest,
+                    identity_gate_status="evidence_review",
+                    identity_conflict_reason=conflict_reason,
+                    verified_tmdb_id=None,
+                    verified_imdb_id=None,
+                    verified_title=None,
+                    verified_year=None,
+                    pending_card_supersede=supersede_card,
+                    pending_eval_reply=pending_reply,
+                    next_attempt_at=self._retry_next_attempt_iso(),
+                    increment_retry=True,
+                    allow_downgrade_on_conflict=True,
+                )
+                return True
+
+            # Conflict supersession succeeded! Now deliver pending bound evaluation reply if any.
+            if pending_reply is not None:
+                pending_reply["card_revision"] = effective_rev
+                reply_resp = await self.actions_client.deliver_evaluation(pending_reply)
+                if reply_resp.status == "failed":
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="queued",
+                        expected_incoming_digest=expected_digest,
+                        card_revision=effective_rev,
+                        identity_gate_status="evidence_review",
+                        identity_conflict_reason=conflict_reason,
+                        verified_tmdb_id=None,
+                        verified_imdb_id=None,
+                        verified_title=None,
+                        verified_year=None,
+                        eval_reply_status="pending",
+                        pending_card_supersede=None,
+                        pending_eval_reply=pending_reply,
+                        next_attempt_at=self._retry_next_attempt_iso(),
+                        reset_retry=True,
+                        increment_retry=True,
+                        allow_downgrade_on_conflict=True,
+                    )
+                    return True
+                reply_status = "sent" if reply_resp.status == "sent" else "ambiguous_reply"
+            else:
+                reply_status = str(row.get("eval_reply_status") or "sent")
+
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="completed",
+                expected_incoming_digest=expected_digest,
+                card_revision=effective_rev,
+                identity_gate_status="evidence_review",
+                identity_conflict_reason=conflict_reason,
+                verified_tmdb_id=None,
+                verified_imdb_id=None,
+                verified_title=None,
+                verified_year=None,
+                eval_reply_status=reply_status,
+                pending_card_supersede=None,
+                pending_eval_reply=None,
+                allow_downgrade_on_conflict=True,
+            )
+            return True
+
+        # Path B: Retry pending bound evaluation reply ONLY (never resend card or re-evaluate)
+        assert pending_reply is not None
+        reply_resp = await self.actions_client.deliver_evaluation(pending_reply)
+        if reply_resp.status == "failed":
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="queued" if retry_count < 4 else "failed_terminal",
+                expected_incoming_digest=expected_digest,
+                eval_reply_status="pending",
+                pending_eval_reply=pending_reply,
+                next_attempt_at=self._retry_next_attempt_iso(),
+                increment_retry=True,
+            )
+            return True
+
+        reply_status = "sent" if reply_resp.status == "sent" else "ambiguous_reply"
+        await asyncio.to_thread(
+            self.db.finalize_release,
+            release_id,
+            worker_id=self.worker_id,
+            state="completed",
+            expected_incoming_digest=expected_digest,
+            eval_reply_status=reply_status,
+            pending_eval_reply=None,
+        )
+        return True
 
     async def _process_claimed_release(self, row: dict[str, Any]) -> None:
+        # First drain any persisted post-card follow-ups (conflict supersession or eval reply)
+        if await self._process_pending_followups(row):
+            return
+
         release_id = str(row["release_id"])
         source_occurrence_id = str(row["source_occurrence_id"])
         expected_digest = str(row["incoming_evidence_digest"])
         prev_card_revision = int(row["card_revision"] or 0)
         prev_last_eval_digest = row.get("last_evaluated_digest")
         prev_verified = str(row.get("identity_gate_status") or "") == "verified"
+        retry_count = int(row.get("retry_count") or 0)
 
         snap = json.loads(str(row["incoming_snapshot_json"]))
         classified = ClassifiedWebhook.from_sanitized_snapshot(snap, expected_digest)
@@ -334,16 +515,19 @@ class IntakeWorker:
                 state="suppressed",
                 expected_incoming_digest=expected_digest,
                 suppression_reason="quality_rejected",
+                eval_reply_status="skipped",
             )
             return
 
         alt_grab_eligible = rej_mode == "alternative_grab_candidate"
 
         # Step 2: TorrentLeech listing enrichment (serialized single worker)
+        # Keep TL verification mandatory whenever TL metadata is enabled for a TorrentLeech
+        # webhook — a missing or malformed external_id MUST fail verification rather than
+        # disabling the source-integrity check.
         tl_applicable = (
             self.config.tl_metadata_enabled
             and classified.indexer_norm == "torrentleech"
-            and bool(classified.external_id_norm)
         )
         tl_result = await self.tl_scraper.fetch_listing(
             indexer_norm=classified.indexer_norm,
@@ -413,66 +597,96 @@ class IntakeWorker:
                     verified_imdb_id=movie.imdb_id,
                     verified_title=movie.title,
                     verified_year=movie.year,
+                    eval_reply_status="skipped",
                     radarr_status_snapshot=radarr.to_dict(),
                 )
                 return
 
-            # Deliver prompt card immediately BEFORE waiting on Gemini evaluation
-            card_payload = self._build_card_payload(
-                release_id=release_id,
-                card_revision=next_card_rev,
-                source_occurrence_id=source_occurrence_id,
-                delivery_kind=delivery_mode,
-                classified=classified,
-                tl_result=tl_result,
-                gate=pre_gate,
-                radarr=radarr,
-                radarr_note=radarr_note,
-                alt_rejection_class=rej_class,
+            # If the worker crashed after persisting card ack for this exact incoming digest
+            # and before completing /evaluate, reuse the persisted receipt instead of
+            # re-sending or bumping card_revision unnecessarily.
+            resuming_mid_eval = (
+                prev_card_revision >= 1
+                and row.get("ack_message_id") is not None
+                and str(row.get("ack_incoming_digest") or "") == expected_digest
+                and str(row.get("eval_reply_status") or "") == "pending"
             )
-            await asyncio.to_thread(
-                self.db.renew_lease,
-                release_id,
-                worker_id=self.worker_id,
-                lease_seconds=self.config.worker_lease_seconds,
-                new_state="delivering",
-            )
-            card_resp = await self.actions_client.deliver_card(card_payload)
-            if card_resp.status == "ambiguous_delivery":
+            if resuming_mid_eval:
+                next_card_rev = prev_card_revision
+                card_resp = DeliveryCardResponse(
+                    status="delivered",
+                    ack_chat_id=row.get("ack_chat_id"),
+                    ack_message_id=int(row["ack_message_id"]),
+                    ack_thread_id=row.get("ack_thread_id"),
+                )
+            else:
+                # Deliver prompt card immediately BEFORE waiting on Gemini evaluation
+                card_payload = self._build_card_payload(
+                    release_id=release_id,
+                    card_revision=next_card_rev,
+                    source_occurrence_id=source_occurrence_id,
+                    delivery_kind=delivery_mode,
+                    classified=classified,
+                    tl_result=tl_result,
+                    gate=pre_gate,
+                    radarr=radarr,
+                    radarr_note=radarr_note,
+                    alt_rejection_class=rej_class,
+                )
                 await asyncio.to_thread(
-                    self.db.finalize_release,
+                    self.db.renew_lease,
                     release_id,
                     worker_id=self.worker_id,
-                    state="ambiguous_delivery",
-                    expected_incoming_digest=expected_digest,
-                    tl_outcome=tl_result.outcome,
-                    identity_gate_status="verified",
-                    verified_tmdb_id=movie.tmdb_id,
-                    verified_imdb_id=movie.imdb_id,
-                    verified_title=movie.title,
-                    verified_year=movie.year,
-                    radarr_status_snapshot=radarr.to_dict(),
+                    lease_seconds=self.config.worker_lease_seconds,
+                    new_state="delivering",
                 )
-                return
-            if card_resp.status != "delivered" or card_resp.ack_message_id is None:
-                retry_at = utc_now_iso(utc_now() + timedelta(seconds=30))
+                card_resp = await self.actions_client.deliver_card(card_payload)
+                if card_resp.status == "ambiguous_delivery":
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="ambiguous_delivery",
+                        expected_incoming_digest=expected_digest,
+                        tl_outcome=tl_result.outcome,
+                        identity_gate_status="verified",
+                        verified_tmdb_id=movie.tmdb_id,
+                        verified_imdb_id=movie.imdb_id,
+                        verified_title=movie.title,
+                        verified_year=movie.year,
+                        radarr_status_snapshot=radarr.to_dict(),
+                    )
+                    return
+                if card_resp.status != "delivered" or card_resp.ack_message_id is None:
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="queued" if retry_count < 4 else "failed_terminal",
+                        expected_incoming_digest=expected_digest,
+                        tl_outcome=tl_result.outcome,
+                        identity_gate_status="verified",
+                        verified_tmdb_id=movie.tmdb_id,
+                        verified_imdb_id=movie.imdb_id,
+                        verified_title=movie.title,
+                        verified_year=movie.year,
+                        radarr_status_snapshot=radarr.to_dict(),
+                        next_attempt_at=self._retry_next_attempt_iso(),
+                        increment_retry=True,
+                    )
+                    return
+
+                # Persist card ack receipt immediately so crash during /evaluate never loses receipt
                 await asyncio.to_thread(
-                    self.db.finalize_release,
+                    self.db.record_card_ack,
                     release_id,
                     worker_id=self.worker_id,
-                    state="queued" if int(row.get("retry_count") or 0) < 3 else "failed_terminal",
-                    expected_incoming_digest=expected_digest,
-                    tl_outcome=tl_result.outcome,
-                    identity_gate_status="verified",
-                    verified_tmdb_id=movie.tmdb_id,
-                    verified_imdb_id=movie.imdb_id,
-                    verified_title=movie.title,
-                    verified_year=movie.year,
-                    radarr_status_snapshot=radarr.to_dict(),
-                    next_attempt_at=retry_at,
-                    increment_retry=True,
+                    card_revision=next_card_rev,
+                    ack_chat_id=card_resp.ack_chat_id,
+                    ack_message_id=card_resp.ack_message_id,
+                    ack_thread_id=card_resp.ack_thread_id,
+                    ack_incoming_digest=expected_digest,
                 )
-                return
 
             # Now call movie-triage-api /evaluate and post bound reply
             await asyncio.to_thread(
@@ -489,7 +703,7 @@ class IntakeWorker:
             )
             must_force = (
                 prev_last_eval_digest is not None and full_digest != prev_last_eval_digest
-            ) or prev_card_revision > 0
+            ) or (prev_card_revision > 0 and not resuming_mid_eval)
             if must_force:
                 eval_body_probe["force_refresh"] = True
 
@@ -520,9 +734,7 @@ class IntakeWorker:
             effective_gate_status = "verified"
             effective_conflict: Optional[str] = None
             if eval_conflict_reason is not None:
-                effective_rev = next_card_rev + 1
-                effective_gate_status = "evidence_review"
-                effective_conflict = eval_conflict_reason
+                supersede_rev = next_card_rev + 1
                 conflict_gate = IdentityGateResult(
                     status="evidence_review",
                     verified_movie=None,
@@ -531,7 +743,7 @@ class IntakeWorker:
                 )
                 supersede_card = self._build_card_payload(
                     release_id=release_id,
-                    card_revision=effective_rev,
+                    card_revision=supersede_rev,
                     source_occurrence_id=source_occurrence_id,
                     delivery_kind="evidence_review",
                     classified=classified,
@@ -541,6 +753,15 @@ class IntakeWorker:
                     radarr_note="Superseded to evidence review due to evaluator identity conflict",
                     alt_rejection_class=None,
                 )
+                pending_reply_for_sup: dict[str, Any] = {
+                    "release_id": release_id,
+                    "card_revision": supersede_rev,
+                    "ack_chat_id": card_resp.ack_chat_id,
+                    "ack_message_id": card_resp.ack_message_id,
+                    "ack_thread_id": card_resp.ack_thread_id,
+                    "evaluation": eval_res.payload if eval_res.ok else None,
+                    "error_redacted": None if eval_res.ok else eval_res.error_redacted,
+                }
                 sup_resp = await self.actions_client.deliver_card(supersede_card)
                 if sup_resp.status == "ambiguous_delivery":
                     await asyncio.to_thread(
@@ -549,28 +770,107 @@ class IntakeWorker:
                         worker_id=self.worker_id,
                         state="ambiguous_delivery",
                         expected_incoming_digest=expected_digest,
+                        card_revision=next_card_rev,
                         full_evidence_digest=full_digest,
                         last_evaluated_digest=full_digest if eval_res.ok else prev_last_eval_digest,
                         tl_outcome=tl_result.outcome,
                         identity_gate_status="evidence_review",
-                        identity_conflict_reason=effective_conflict,
+                        identity_conflict_reason=eval_conflict_reason,
+                        verified_tmdb_id=None,
+                        verified_imdb_id=None,
+                        verified_title=None,
+                        verified_year=None,
+                        ack_chat_id=card_resp.ack_chat_id,
+                        ack_message_id=card_resp.ack_message_id,
+                        ack_thread_id=card_resp.ack_thread_id,
+                        pending_card_supersede=None,
+                        pending_eval_reply=None,
                         radarr_status_snapshot=radarr.to_dict(),
                         evaluation_json=eval_res.payload if eval_res.ok else None,
                         allow_downgrade_on_conflict=True,
                     )
                     return
+                if sup_resp.status != "delivered":
+                    # Supersession failed definitively: DO NOT mark completed or advance revision;
+                    # record genuine conflict and persist pending supersession + reply for independent retry.
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="queued",
+                        expected_incoming_digest=expected_digest,
+                        card_revision=next_card_rev,
+                        full_evidence_digest=full_digest,
+                        last_evaluated_digest=full_digest if eval_res.ok else prev_last_eval_digest,
+                        tl_outcome=tl_result.outcome,
+                        identity_gate_status="evidence_review",
+                        identity_conflict_reason=eval_conflict_reason,
+                        verified_tmdb_id=None,
+                        verified_imdb_id=None,
+                        verified_title=None,
+                        verified_year=None,
+                        ack_chat_id=card_resp.ack_chat_id,
+                        ack_message_id=card_resp.ack_message_id,
+                        ack_thread_id=card_resp.ack_thread_id,
+                        eval_reply_status="pending",
+                        pending_card_supersede=supersede_card,
+                        pending_eval_reply=pending_reply_for_sup,
+                        radarr_status_snapshot=radarr.to_dict(),
+                        evaluation_json=eval_res.payload if eval_res.ok else None,
+                        next_attempt_at=self._retry_next_attempt_iso(),
+                        reset_retry=True,
+                        increment_retry=True,
+                        allow_downgrade_on_conflict=True,
+                    )
+                    return
 
-            await self.actions_client.deliver_evaluation(
-                {
-                    "release_id": release_id,
-                    "card_revision": effective_rev,
-                    "ack_chat_id": card_resp.ack_chat_id,
-                    "ack_message_id": card_resp.ack_message_id,
-                    "ack_thread_id": card_resp.ack_thread_id,
-                    "evaluation": eval_res.payload if eval_res.ok else None,
-                    "error_redacted": None if eval_res.ok else eval_res.error_redacted,
-                }
-            )
+                effective_rev = supersede_rev
+                effective_gate_status = "evidence_review"
+                effective_conflict = eval_conflict_reason
+
+            reply_body: dict[str, Any] = {
+                "release_id": release_id,
+                "card_revision": effective_rev,
+                "ack_chat_id": card_resp.ack_chat_id,
+                "ack_message_id": card_resp.ack_message_id,
+                "ack_thread_id": card_resp.ack_thread_id,
+                "evaluation": eval_res.payload if eval_res.ok else None,
+                "error_redacted": None if eval_res.ok else eval_res.error_redacted,
+            }
+            reply_resp = await self.actions_client.deliver_evaluation(reply_body)
+            if reply_resp.status == "failed":
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="queued",
+                    expected_incoming_digest=expected_digest,
+                    card_revision=effective_rev,
+                    full_evidence_digest=full_digest,
+                    last_evaluated_digest=full_digest if eval_res.ok else prev_last_eval_digest,
+                    tl_outcome=tl_result.outcome,
+                    identity_gate_status=effective_gate_status,
+                    identity_conflict_reason=effective_conflict,
+                    verified_tmdb_id=movie.tmdb_id if effective_gate_status == "verified" else None,
+                    verified_imdb_id=movie.imdb_id if effective_gate_status == "verified" else None,
+                    verified_title=movie.title if effective_gate_status == "verified" else None,
+                    verified_year=movie.year if effective_gate_status == "verified" else None,
+                    ack_chat_id=card_resp.ack_chat_id,
+                    ack_message_id=card_resp.ack_message_id,
+                    ack_thread_id=card_resp.ack_thread_id,
+                    eval_reply_status="pending",
+                    pending_card_supersede=None,
+                    pending_eval_reply=reply_body,
+                    radarr_status_snapshot=radarr.to_dict(),
+                    evaluation_json=eval_res.payload if eval_res.ok else None,
+                    next_attempt_at=self._retry_next_attempt_iso(),
+                    reset_retry=True,
+                    increment_retry=True,
+                    allow_downgrade_on_conflict=effective_conflict is not None,
+                )
+                return
+
+            reply_status = "sent" if reply_resp.status == "sent" else "ambiguous_reply"
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,
@@ -587,6 +887,12 @@ class IntakeWorker:
                 verified_imdb_id=movie.imdb_id if effective_gate_status == "verified" else None,
                 verified_title=movie.title if effective_gate_status == "verified" else None,
                 verified_year=movie.year if effective_gate_status == "verified" else None,
+                ack_chat_id=card_resp.ack_chat_id,
+                ack_message_id=card_resp.ack_message_id,
+                ack_thread_id=card_resp.ack_thread_id,
+                eval_reply_status=reply_status,
+                pending_card_supersede=None,
+                pending_eval_reply=None,
                 radarr_status_snapshot=radarr.to_dict(),
                 evaluation_json=eval_res.payload if eval_res.ok else None,
                 allow_downgrade_on_conflict=effective_conflict is not None,
@@ -685,6 +991,7 @@ class IntakeWorker:
                     verified_imdb_id=movie.imdb_id,
                     verified_title=movie.title,
                     verified_year=movie.year,
+                    eval_reply_status="skipped",
                     radarr_status_snapshot=radarr.to_dict(),
                     evaluation_json=eval_res.payload if eval_res.ok else None,
                 )
@@ -706,16 +1013,29 @@ class IntakeWorker:
             radarr_note=radarr_note,
             alt_rejection_class=rej_class if delivery_kind == "alternative_grab" else None,
         )
-        card_resp, _ = await self._deliver_card_and_eval_reply(
+        verified_movie: Optional[TmdbMovieRecord] = (
+            final_gate.verified_movie if final_gate.status == "verified" else None
+        )
+        card_resp, reply_resp, reply_body = await self._deliver_card_and_eval_reply(
             release_id=release_id,
             card_revision=next_card_rev,
+            incoming_digest=expected_digest,
             card_payload=card_payload,
             eval_payload=eval_res.payload if eval_res.ok else None,
             eval_error=None if eval_res.ok else eval_res.error_redacted,
-        )
-
-        verified_movie: Optional[TmdbMovieRecord] = (
-            final_gate.verified_movie if final_gate.status == "verified" else None
+            ack_metadata={
+                "full_evidence_digest": full_digest,
+                "last_evaluated_digest": full_digest if eval_res.ok else prev_last_eval_digest,
+                "tl_outcome": tl_result.outcome,
+                "identity_gate_status": final_gate.status,
+                "identity_conflict_reason": final_gate.conflict_reason,
+                "verified_tmdb_id": verified_movie.tmdb_id if verified_movie else None,
+                "verified_imdb_id": verified_movie.imdb_id if verified_movie else None,
+                "verified_title": verified_movie.title if verified_movie else None,
+                "verified_year": verified_movie.year if verified_movie else None,
+                "radarr_status_snapshot": radarr.to_dict() if radarr else None,
+                "evaluation_json": eval_res.payload if eval_res.ok else None,
+            },
         )
         if card_resp.status == "ambiguous_delivery":
             await asyncio.to_thread(
@@ -740,12 +1060,11 @@ class IntakeWorker:
             return
 
         if card_resp.status != "delivered" or card_resp.ack_message_id is None:
-            retry_at = utc_now_iso(utc_now() + timedelta(seconds=30))
             await asyncio.to_thread(
                 self.db.finalize_release,
                 release_id,
                 worker_id=self.worker_id,
-                state="queued" if int(row.get("retry_count") or 0) < 3 else "failed_terminal",
+                state="queued" if retry_count < 4 else "failed_terminal",
                 expected_incoming_digest=expected_digest,
                 full_evidence_digest=full_digest,
                 last_evaluated_digest=full_digest if eval_res.ok else prev_last_eval_digest,
@@ -758,12 +1077,45 @@ class IntakeWorker:
                 verified_year=verified_movie.year if verified_movie else None,
                 radarr_status_snapshot=radarr.to_dict() if radarr else None,
                 evaluation_json=eval_res.payload if eval_res.ok else None,
-                next_attempt_at=retry_at,
+                next_attempt_at=self._retry_next_attempt_iso(),
                 increment_retry=True,
                 allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
             )
             return
 
+        # Card was delivered & ack persisted! Check evaluation reply status before completing.
+        if reply_resp is not None and reply_resp.status == "failed" and reply_body is not None:
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="queued",
+                expected_incoming_digest=expected_digest,
+                card_revision=next_card_rev,
+                full_evidence_digest=full_digest,
+                last_evaluated_digest=full_digest if eval_res.ok else prev_last_eval_digest,
+                tl_outcome=tl_result.outcome,
+                identity_gate_status=final_gate.status,
+                identity_conflict_reason=final_gate.conflict_reason,
+                verified_tmdb_id=verified_movie.tmdb_id if verified_movie else None,
+                verified_imdb_id=verified_movie.imdb_id if verified_movie else None,
+                verified_title=verified_movie.title if verified_movie else None,
+                verified_year=verified_movie.year if verified_movie else None,
+                ack_chat_id=card_resp.ack_chat_id,
+                ack_message_id=card_resp.ack_message_id,
+                ack_thread_id=card_resp.ack_thread_id,
+                eval_reply_status="pending",
+                pending_eval_reply=reply_body,
+                radarr_status_snapshot=radarr.to_dict() if radarr else None,
+                evaluation_json=eval_res.payload if eval_res.ok else None,
+                next_attempt_at=self._retry_next_attempt_iso(),
+                reset_retry=True,
+                increment_retry=True,
+                allow_downgrade_on_conflict=final_gate.is_genuine_conflict,
+            )
+            return
+
+        reply_status = "sent" if (reply_resp and reply_resp.status == "sent") else "ambiguous_reply"
         await asyncio.to_thread(
             self.db.finalize_release,
             release_id,
@@ -780,6 +1132,12 @@ class IntakeWorker:
             verified_imdb_id=verified_movie.imdb_id if verified_movie else None,
             verified_title=verified_movie.title if verified_movie else None,
             verified_year=verified_movie.year if verified_movie else None,
+            ack_chat_id=card_resp.ack_chat_id,
+            ack_message_id=card_resp.ack_message_id,
+            ack_thread_id=card_resp.ack_thread_id,
+            eval_reply_status=reply_status,
+            pending_card_supersede=None,
+            pending_eval_reply=None,
             radarr_status_snapshot=radarr.to_dict() if radarr else None,
             evaluation_json=eval_res.payload if eval_res.ok else None,
             allow_downgrade_on_conflict=final_gate.is_genuine_conflict,

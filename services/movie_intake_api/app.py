@@ -21,7 +21,12 @@ from .archive import (
     verify_archive_root,
 )
 from .classifier import classify_webhook_payload
-from .clients import ActionsApiClient, TriageApiClient
+from .clients import (
+    ActionsApiClient,
+    ShadowStubActionsClient,
+    ShadowStubTriageClient,
+    TriageApiClient,
+)
 from .config import AlternativeGrabPolicy, IntakeConfig
 from .db import IntakeDB, generate_uuid7, utc_now, utc_now_iso
 from .security import constant_time_equals, install_log_redaction, redact_secrets
@@ -36,6 +41,55 @@ class PushPayloadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_occurrence_id: str = Field(..., min_length=1, max_length=128)
+
+
+def _is_within_dir(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _enforce_shadow_isolation(
+    cfg: IntakeConfig,
+    triage: TriageApiClient,
+    actions: ActionsApiClient,
+    *,
+    tl_scraper_injected: bool = False,
+) -> None:
+    """
+    Hard handover invariant: Shadow replay MUST use isolated state directories and
+    stubbed external writers producing zero external mutations.
+    """
+    default_prod_state = Path.home() / ".local" / "state" / "movie-intel"
+    default_prod_config = Path.home() / ".config" / "movie-intel"
+    if (
+        _is_within_dir(cfg.intake_db_path, default_prod_state)
+        or _is_within_dir(cfg.webhook_archive_dir, default_prod_state)
+        or _is_within_dir(cfg.tmdb_cache_path, default_prod_state)
+    ):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires isolated INTAKE_DB_PATH, WEBHOOK_ARCHIVE_DIR, "
+            "and TMDB_CACHE_PATH outside the production ~/.local/state/movie-intel directory"
+        )
+    if (
+        cfg.tl_metadata_enabled
+        and not tl_scraper_injected
+        and _is_within_dir(cfg.tl_cookie_file, default_prod_config)
+    ):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true with MOVIE_INTEL_TL_METADATA_ENABLED=true refuses "
+            "the production ~/.config/movie-intel cookie file; disable TL scraping or inject a shadow stub"
+        )
+    if not getattr(triage, "is_shadow_stub", False):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires a shadow-stubbed triage client (zero external writes)"
+        )
+    if not getattr(actions, "is_shadow_stub", False):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires a shadow-stubbed actions client (zero external writes)"
+        )
 
 
 async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
@@ -89,14 +143,25 @@ def create_app(
         api_token=cfg.tmdb_api_token,
         cache_path=cfg.tmdb_cache_path,
     )
-    triage = triage_client or TriageApiClient(
-        base_url=cfg.triage_api_url,
-        internal_token=cfg.internal_api_secret,
-    )
-    actions = actions_client or ActionsApiClient(
-        base_url=cfg.actions_api_url,
-        internal_token=cfg.internal_api_secret,
-    )
+    if cfg.shadow_replay_enabled:
+        triage = triage_client if triage_client is not None else ShadowStubTriageClient()
+        actions = actions_client if actions_client is not None else ShadowStubActionsClient()
+        _enforce_shadow_isolation(
+            cfg,
+            triage,
+            actions,
+            tl_scraper_injected=tl_scraper is not None,
+        )
+    else:
+        triage = triage_client or TriageApiClient(
+            base_url=cfg.triage_api_url,
+            internal_token=cfg.internal_api_secret,
+        )
+        actions = actions_client or ActionsApiClient(
+            base_url=cfg.actions_api_url,
+            internal_token=cfg.internal_api_secret,
+        )
+
     worker = IntakeWorker(
         config=cfg,
         db=intake_db,
@@ -136,6 +201,8 @@ def create_app(
     app.state.config = cfg
     app.state.db = intake_db
     app.state.worker = worker
+    app.state.triage_client = triage
+    app.state.actions_client = actions
 
     async def _ingest_raw_bytes(raw_bytes: bytes) -> dict[str, Any]:
         try:
@@ -284,9 +351,14 @@ def create_app(
         dependencies=[Depends(require_internal_token)],
     )
     async def shadow_replay(request: Request) -> dict[str, Any]:
-        """Shadow-mode deterministic replay endpoint (disabled in production)."""
+        """Shadow-mode deterministic replay endpoint (disabled in production; stubbed writers only)."""
         if not cfg.shadow_replay_enabled:
             raise HTTPException(status_code=404, detail="Not found")
+        if not getattr(triage, "is_shadow_stub", False) or not getattr(actions, "is_shadow_stub", False):
+            raise HTTPException(
+                status_code=503,
+                detail="Shadow replay refused: external writers are not stubbed",
+            )
         raw_bytes = await _read_bounded_body(request, cfg.max_webhook_body_bytes)
         ingest_result = await _ingest_raw_bytes(raw_bytes)
         if ingest_result.get("release_id") and not start_worker:

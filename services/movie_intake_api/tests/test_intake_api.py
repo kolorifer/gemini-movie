@@ -19,7 +19,10 @@ from services.movie_intake_api.classifier import classify_webhook_payload
 from services.movie_intake_api.clients import (
     ActionsApiClient,
     DeliveryCardResponse,
+    DeliveryEvalResponse,
     RadarrStatusResponse,
+    ShadowStubActionsClient,
+    ShadowStubTriageClient,
     TriageApiClient,
     TriageEvalResult,
 )
@@ -180,6 +183,8 @@ class StubTlScraper(TorrentLeechScraper):
 
 
 class StubTriageClient(TriageApiClient):
+    is_shadow_stub: bool = True
+
     def __init__(self, handler: Any) -> None:
         super().__init__(base_url="http://127.0.0.1:40716", internal_token="stub")
         self._handler = handler
@@ -191,15 +196,19 @@ class StubTriageClient(TriageApiClient):
 
 
 class StubActionsClient(ActionsApiClient):
+    is_shadow_stub: bool = True
+
     def __init__(
         self,
         *,
         radarr_handler: Any,
         card_handler: Optional[Any] = None,
+        eval_reply_handler: Optional[Any] = None,
     ) -> None:
         super().__init__(base_url="http://127.0.0.1:40721", internal_token="stub")
         self._radarr_handler = radarr_handler
         self._card_handler = card_handler
+        self._eval_reply_handler = eval_reply_handler
         self.radarr_calls: list[dict[str, Any]] = []
         self.card_calls: list[dict[str, Any]] = []
         self.eval_reply_calls: list[dict[str, Any]] = []
@@ -238,9 +247,11 @@ class StubActionsClient(ActionsApiClient):
         self._delivered_by_release[rel_id] = resp
         return resp
 
-    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> bool:
+    async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> DeliveryEvalResponse:
         self.eval_reply_calls.append(eval_reply_payload)
-        return True
+        if self._eval_reply_handler is not None:
+            return self._eval_reply_handler(eval_reply_payload)
+        return DeliveryEvalResponse(status="sent")
 
 
 def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
@@ -262,6 +273,7 @@ def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
         "worker_lease_seconds": 90,
         "worker_poll_interval_seconds": 0.1,
         "tl_min_interval_seconds": 0.0,
+        "retry_backoff_seconds": 0.0,
     }
     base.update(overrides)
     return IntakeConfig(**base)
@@ -1347,6 +1359,458 @@ Language : German
                 self.assertEqual(r_rep.status_code, 200)
                 self.assertEqual(r_rep.json()["ingest"]["status"], "accepted")
                 self.assertEqual(r_rep.json()["release"]["state"], "completed")
+
+    def test_shadow_replay_isolation_default_stubs_and_prod_state_guards(self) -> None:
+        """Codex P1 #1: SHADOW_REPLAY_ENABLED=true enforces isolated state and stubbed writers by default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            prod_state = Path.home() / ".local" / "state" / "movie-intel"
+            prod_cfg = Path.home() / ".config" / "movie-intel"
+
+            # 1) Default create_app with isolated paths auto-wires zero-mutation shadow stubs
+            cfg_isolated = _make_config(
+                tmpdir,
+                shadow_replay_enabled=True,
+                tl_metadata_enabled=False,
+                tmdb_api_token="",
+            )
+            app = create_app(cfg_isolated, start_worker=False)
+            self.assertIsInstance(app.state.triage_client, ShadowStubTriageClient)
+            self.assertIsInstance(app.state.actions_client, ShadowStubActionsClient)
+            with TestClient(app) as client:
+                r = client.post(
+                    "/internal/replay",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Shadow.Safe.2025.2160p.UHD.BluRay.REMUX-GRP",
+                        external_id="808001",
+                    ),
+                    headers={"X-Internal-Token": "test-internal-secret"},
+                )
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["ingest"]["status"], "accepted")
+                self.assertEqual(r.json()["release"]["state"], "completed")
+                self.assertEqual(len(app.state.triage_client.calls), 1)
+                self.assertEqual(len(app.state.actions_client.card_calls), 1)
+                self.assertEqual(len(app.state.actions_client.eval_reply_calls), 1)
+
+            # 2) Any state path inside default production ~/.local/state/movie-intel fails fast
+            for field_name, bad_path in (
+                ("intake_db_path", prod_state / "intake.db"),
+                ("webhook_archive_dir", prod_state / "webhook-archive"),
+                ("tmdb_cache_path", prod_state / "tmdb-cache.json"),
+            ):
+                with self.assertRaises(ValueError):
+                    create_app(
+                        _make_config(
+                            tmpdir,
+                            shadow_replay_enabled=True,
+                            tl_metadata_enabled=False,
+                            **{field_name: bad_path},
+                        ),
+                        start_worker=False,
+                    )
+
+            # 3) Production TL cookie path rejected when TL scraping is enabled without a stub
+            with self.assertRaises(ValueError):
+                create_app(
+                    _make_config(
+                        tmpdir,
+                        shadow_replay_enabled=True,
+                        tl_metadata_enabled=True,
+                        tl_cookie_file=prod_cfg / "torrentleech-cookies-pr42.json",
+                    ),
+                    start_worker=False,
+                )
+
+            # 4) Explicit real non-stub writers are refused in shadow mode
+            with self.assertRaises(ValueError):
+                create_app(
+                    cfg_isolated,
+                    triage_client=TriageApiClient(base_url="http://127.0.0.1:40716", internal_token="tok"),
+                    start_worker=False,
+                )
+            with self.assertRaises(ValueError):
+                create_app(
+                    cfg_isolated,
+                    actions_client=ActionsApiClient(base_url="http://127.0.0.1:40721", internal_token="tok"),
+                    start_worker=False,
+                )
+
+    def test_torrentleech_missing_external_id_fails_verification_mandatory(self) -> None:
+        """Codex P1 #2: TorrentLeech webhook missing external_id must fail Check 1 and yield evidence_review."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir, tl_metadata_enabled=True)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2025111,
+                title="Missing Id Film",
+                original_title="Missing Id Film",
+                year=2025,
+                imdb_id="tt2025111",
+                runtime_minutes=115,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2025111: movie}, {"tt2025111": [2025111]})
+            # Use the REAL TorrentLeechScraper (no network call expected when external_id is empty)
+            real_tl_scraper = TorrentLeechScraper(
+                db=db,
+                cookie_file=cfg.tl_cookie_file,
+                enabled=True,
+                min_interval_seconds=0.0,
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Missing Id Film",
+                        year=2025,
+                        imdb_id="tt2025111",
+                        tmdb_id=2025111,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
+
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=real_tl_scraper,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                webhook = _make_autobrr_movie_webhook(
+                    release_name="Missing.Id.Film.2025.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    indexer="TorrentLeech",
+                    external_id="",
+                    title="Missing Id Film",
+                    year=2025,
+                    meta_imdb="tt2025111",
+                )
+                r = client.post("/webhook/test-webhook-secret", json=webhook)
+                self.assertEqual(r.status_code, 200)
+                rel_id = r.json()["release_id"]
+                asyncio.run(app.state.worker.process_next_queued())
+
+            rel = db.get_release(rel_id)
+            assert rel is not None
+            self.assertEqual(rel["state"], "completed")
+            self.assertEqual(rel["tl_outcome"], "listing_mismatch")
+            self.assertEqual(rel["identity_gate_status"], "evidence_review")
+            self.assertIsNone(rel["verified_tmdb_id"])
+            self.assertEqual(len(actions.card_calls), 1)
+            card = actions.card_calls[0]
+            self.assertEqual(card["delivery_kind"], "evidence_review")
+            self.assertNotIn("verified_tmdb_id", card)
+
+    def test_failed_conflict_supersession_persists_pending_and_retries_independently(self) -> None:
+        """Codex P1 #3: Failed fast-path conflict supersession must stay queued and retry before completing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024777,
+                title="Conflict Retry Film",
+                original_title="Conflict Retry Film",
+                year=2024,
+                imdb_id="tt2024777",
+                runtime_minutes=108,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024777: movie}, {"tt2024777": [2024777]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _e, _n: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt2024777",
+                    file_runtime_minutes=108,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Different Film",
+                        year=2024,
+                        imdb_id="tt9999777",
+                        tmdb_id=9999777,
+                    ),
+                )
+            )
+
+            fail_supersede_once = {"fail": True}
+
+            def _card_handler(payload: dict[str, Any]) -> DeliveryCardResponse:
+                rev = int(payload["card_revision"])
+                if rev == 1:
+                    return DeliveryCardResponse(
+                        status="delivered",
+                        ack_chat_id="-100777",
+                        ack_message_id=701,
+                        ack_thread_id=12,
+                    )
+                if fail_supersede_once["fail"]:
+                    fail_supersede_once["fail"] = False
+                    return DeliveryCardResponse(status="failed", detail="actions_connect_error")
+                return DeliveryCardResponse(
+                    status="delivered",
+                    ack_chat_id="-100777",
+                    ack_message_id=701,
+                    ack_thread_id=12,
+                )
+
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"),
+                card_handler=_card_handler,
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                webhook = _make_autobrr_movie_webhook(
+                    release_name="Conflict.Retry.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="700777",
+                    title="Conflict Retry Film",
+                    year=2024,
+                    meta_imdb="tt2024777",
+                )
+                r1 = client.post("/webhook/test-webhook-secret", json=webhook)
+                rel_id = r1.json()["release_id"]
+
+                # First worker pass: rev 1 succeeds, evaluator contradicts, rev 2 supersession fails
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                mid_rel = db.get_release(rel_id)
+                assert mid_rel is not None
+                self.assertEqual(mid_rel["state"], "queued")
+                self.assertEqual(mid_rel["card_revision"], 1)
+                self.assertEqual(mid_rel["identity_gate_status"], "evidence_review")
+                self.assertIsNone(mid_rel["verified_tmdb_id"])
+                self.assertIsNotNone(mid_rel["pending_card_supersede_json"])
+                self.assertIsNotNone(mid_rel["pending_eval_reply_json"])
+                self.assertEqual(len(actions.eval_reply_calls), 0)
+
+                # Duplicate webhook coalesces without dropping pending supersession
+                r_dup = client.post("/webhook/test-webhook-secret", json=webhook)
+                self.assertEqual(r_dup.json()["status"], "coalesced_duplicate")
+                self.assertIsNotNone(db.get_release(rel_id)["pending_card_supersede_json"])  # type: ignore[index]
+
+                # Second worker pass: retries ONLY supersession (rev 2) + bound reply; 0 extra TL/triage calls
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(tl.calls), 1)
+                self.assertEqual(len(triage.calls), 1)
+                self.assertEqual(len(actions.card_calls), 3)  # rev1, failed rev2, succeeded rev2
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+                self.assertEqual(actions.eval_reply_calls[0]["ack_message_id"], 701)
+                self.assertEqual(actions.eval_reply_calls[0]["card_revision"], 2)
+
+                done_rel = db.get_release(rel_id)
+                assert done_rel is not None
+                self.assertEqual(done_rel["state"], "completed")
+                self.assertEqual(done_rel["card_revision"], 2)
+                self.assertEqual(done_rel["identity_gate_status"], "evidence_review")
+                self.assertEqual(done_rel["eval_reply_status"], "sent")
+                self.assertIsNone(done_rel["pending_card_supersede_json"])
+                self.assertIsNone(done_rel["pending_eval_reply_json"])
+
+    def test_failed_eval_reply_persists_pending_and_retries_without_resending_card(self) -> None:
+        """Codex P1 #4: Failed evaluation reply retries independently on both fast and unresolved paths."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=2024666,
+                title="Reply Retry Film",
+                original_title="Reply Retry Film",
+                year=2024,
+                imdb_id="tt2024666",
+                runtime_minutes=116,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {2024666: movie}, {"tt2024666": [2024666]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda ext, _n: (
+                    TorrentLeechResult(
+                        outcome="listing_id_found",
+                        imdb_id="tt2024666",
+                        file_runtime_minutes=116,
+                        audio_languages=("English",),
+                    )
+                    if ext == "6661"
+                    else TorrentLeechResult(outcome="listing_temporary_http")
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _b: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Reply Retry Film",
+                        year=2024,
+                        imdb_id="tt2024666",
+                        tmdb_id=2024666,
+                        confidence="medium",
+                    ),
+                )
+            )
+
+            reply_sequence: list[DeliveryEvalResponse] = [
+                DeliveryEvalResponse(status="failed", detail="actions_connect_error"),
+                DeliveryEvalResponse(status="sent"),
+                DeliveryEvalResponse(status="failed", detail="actions_connect_error"),
+                DeliveryEvalResponse(status="sent"),
+                DeliveryEvalResponse(status="ambiguous_reply", detail="timeout"),
+            ]
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"),
+                eval_reply_handler=lambda _p: reply_sequence.pop(0),
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 1) Fast path: card succeeds, first eval reply fails -> stays queued, retries reply ONLY
+                w_fast = _make_autobrr_movie_webhook(
+                    release_name="Reply.Retry.Film.2024.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    external_id="6661",
+                    title="Reply Retry Film",
+                    year=2024,
+                    meta_imdb="tt2024666",
+                )
+                r_fast = client.post("/webhook/test-webhook-secret", json=w_fast)
+                fast_id = r_fast.json()["release_id"]
+
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                mid_fast = db.get_release(fast_id)
+                assert mid_fast is not None
+                self.assertEqual(mid_fast["state"], "queued")
+                self.assertEqual(mid_fast["card_revision"], 1)
+                self.assertEqual(mid_fast["ack_message_id"], 501)
+                self.assertEqual(mid_fast["eval_reply_status"], "pending")
+                self.assertEqual(mid_fast["verified_tmdb_id"], 2024666)
+                self.assertIsNotNone(mid_fast["pending_eval_reply_json"])
+
+                # Duplicate webhook while reply is pending coalesces cleanly without losing pending reply
+                self.assertEqual(
+                    client.post("/webhook/test-webhook-secret", json=w_fast).json()["status"],
+                    "coalesced_duplicate",
+                )
+
+                # Retry pass: 0 extra cards, 0 extra TL scrapes, 0 extra /evaluate calls
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(len(tl.calls), 1)
+                self.assertEqual(len(triage.calls), 1)
+                self.assertEqual(len(actions.eval_reply_calls), 2)
+                self.assertEqual(actions.eval_reply_calls[-1]["ack_message_id"], 501)
+
+                done_fast = db.get_release(fast_id)
+                assert done_fast is not None
+                self.assertEqual(done_fast["state"], "completed")
+                self.assertEqual(done_fast["eval_reply_status"], "sent")
+                self.assertIsNone(done_fast["pending_eval_reply_json"])
+                self.assertEqual(done_fast["verified_tmdb_id"], 2024666)
+
+                # 2) Unresolved path: card succeeds, first eval reply fails -> retries reply ONLY
+                w_unres = _make_autobrr_movie_webhook(
+                    release_name="Reply.Retry.Film.2024.1080p.BluRay.REMUX-FraMeSToR",
+                    external_id="6662",
+                    title="Reply Retry Film",
+                    year=2024,
+                    meta_imdb=None,
+                )
+                r_unres = client.post("/webhook/test-webhook-secret", json=w_unres)
+                unres_id = r_unres.json()["release_id"]
+
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                mid_unres = db.get_release(unres_id)
+                assert mid_unres is not None
+                self.assertEqual(mid_unres["state"], "queued")
+                self.assertEqual(mid_unres["eval_reply_status"], "pending")
+                self.assertIsNotNone(mid_unres["pending_eval_reply_json"])
+                cards_before = len(actions.card_calls)
+                tl_before = len(tl.calls)
+                triage_before = len(triage.calls)
+
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), cards_before)
+                self.assertEqual(len(tl.calls), tl_before)
+                self.assertEqual(len(triage.calls), triage_before)
+                done_unres = db.get_release(unres_id)
+                assert done_unres is not None
+                self.assertEqual(done_unres["state"], "completed")
+                self.assertEqual(done_unres["eval_reply_status"], "sent")
+                self.assertIsNone(done_unres["pending_eval_reply_json"])
+
+                # 3) Ambiguous reply: marks completed with eval_reply_status='ambiguous_reply' (no blind resend)
+                w_amb = _make_autobrr_movie_webhook(
+                    release_name="Reply.Retry.Film.2024.1080p.BluRay.REMUX-GRP2",
+                    external_id="6663",
+                    title="Reply Retry Film",
+                    year=2024,
+                    meta_imdb=None,
+                )
+                r_amb = client.post("/webhook/test-webhook-secret", json=w_amb)
+                amb_id = r_amb.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                done_amb = db.get_release(amb_id)
+                assert done_amb is not None
+                self.assertEqual(done_amb["state"], "completed")
+                self.assertEqual(done_amb["eval_reply_status"], "ambiguous_reply")
+                self.assertIsNone(done_amb["pending_eval_reply_json"])
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+
+            # 4) Verify ActionsApiClient.deliver_evaluation HTTP/transport classification
+            def _reply_transport(request: httpx.Request) -> httpx.Response:
+                mode = json.loads(request.content.decode("utf-8")).get("mode")
+                if mode == "ok":
+                    return httpx.Response(200, json={"status": "sent"})
+                if mode == "400":
+                    return httpx.Response(400, json={"detail": "bad request"})
+                if mode == "502":
+                    return httpx.Response(502, text="bad gateway")
+                if mode == "connect":
+                    raise httpx.ConnectError("refused")
+                raise httpx.ReadTimeout("timed out")
+
+            async def _check_client() -> None:
+                async with httpx.AsyncClient(transport=httpx.MockTransport(_reply_transport)) as hc:
+                    ac = ActionsApiClient(
+                        base_url="http://127.0.0.1:40721", internal_token="tok", http_client=hc
+                    )
+                    self.assertEqual((await ac.deliver_evaluation({"mode": "ok"})).status, "sent")
+                    self.assertEqual((await ac.deliver_evaluation({"mode": "400"})).status, "failed")
+                    self.assertEqual((await ac.deliver_evaluation({"mode": "connect"})).status, "failed")
+                    self.assertEqual((await ac.deliver_evaluation({"mode": "502"})).status, "ambiguous_reply")
+                    self.assertEqual((await ac.deliver_evaluation({"mode": "timeout"})).status, "ambiguous_reply")
+
+            asyncio.run(_check_client())
 
 
 if __name__ == "__main__":
