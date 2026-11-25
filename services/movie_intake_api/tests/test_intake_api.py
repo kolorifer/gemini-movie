@@ -2556,6 +2556,29 @@ Language : German
             "listing_id_conflict",
         )
 
+        # 5b) Void HTML elements (<br>, <wbr>, <br/>) inside #imdb preserve word boundaries
+        for void_tag, expected_outcome in (
+            ("<br>", "listing_id_conflict"),
+            ("<wbr>", "listing_id_conflict"),
+            ("<br/>", "listing_id_conflict"),
+        ):
+            html_void = (
+                f'<h1 id="torrentnameid">{rel}</h1>'
+                f'<div id="imdb"><a href="https://www.imdb.com/title/tt2024001/">IMDb{void_tag}tt9999999</a></div>'
+            )
+            res_void = parse_tl_listing_html(html_void, exact_release_name=rel)
+            self.assertEqual(res_void.outcome, expected_outcome)
+            self.assertIsNone(res_void.imdb_id)
+
+        html_void_malformed = (
+            f'<h1 id="torrentnameid">{rel}</h1>'
+            '<div id="imdb"><a href="https://www.imdb.com/title/tt2024001/">IMDb<br/>tt123</a></div>'
+        )
+        self.assertEqual(
+            parse_tl_listing_html(html_void_malformed, exact_release_name=rel).outcome,
+            "listing_id_malformed",
+        )
+
         # 6) Verify conflicting parse result fails the independent identity gate (evidence_review only)
         with tempfile.TemporaryDirectory() as tmp:
             movie = TmdbMovieRecord(
@@ -2585,6 +2608,86 @@ Language : German
             )
             self.assertEqual(gate.status, "evidence_review")
             self.assertTrue(gate.is_genuine_conflict)
+
+    def test_year_like_movie_titles_parse_and_verify_cleanly(self) -> None:
+        """Codex Round 7 P1: Year-like numeric title tokens must not be misidentified as the release year."""
+        from services.movie_intake_api.tmdb_verifier import (
+            parse_release_title_year,
+            run_independent_identity_gate,
+        )
+
+        cases = [
+            ("Blade.Runner.2049.2017.2160p.UHD.BluRay.REMUX-CiNEPHiLES", ("Blade Runner 2049", 2017)),
+            ("Wonder.Woman.1984.2020.2160p.UHD.BluRay.REMUX-GRP", ("Wonder Woman 1984", 2020)),
+            ("2001.A.Space.Odyssey.1968.2160p.UHD.BluRay.REMUX-GRP", ("2001 A Space Odyssey", 1968)),
+            ("1917.2019.2160p.UHD.BluRay.REMUX-GRP", ("1917", 2019)),
+            ("1984.1984.1080p.BluRay.REMUX-GRP", ("1984", 1984)),
+            ("Blade.Runner.2049.2160p.UHD.BluRay.REMUX-GRP", ("Blade Runner 2049", None)),
+            ("Example.Film.REMASTERED.2024.2160p.UHD.BluRay.REMUX-GRP", ("Example Film", 2024)),
+        ]
+        for rel_name, expected in cases:
+            self.assertEqual(parse_release_title_year(rel_name), expected, msg=rel_name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            br2049 = TmdbMovieRecord(
+                tmdb_id=335984,
+                title="Blade Runner 2049",
+                original_title="Blade Runner 2049",
+                year=2017,
+                imdb_id="tt1856101",
+                runtime_minutes=164,
+            )
+            ww84 = TmdbMovieRecord(
+                tmdb_id=464052,
+                title="Wonder Woman 1984",
+                original_title="Wonder Woman 1984",
+                year=2020,
+                imdb_id="tt7126948",
+                runtime_minutes=151,
+            )
+            tmdb = StubTmdbClient(
+                Path(tmp) / "tmdb.json",
+                {335984: br2049, 464052: ww84},
+                {"tt1856101": [335984], "tt7126948": [464052]},
+            )
+
+            gate_br = asyncio.run(
+                run_independent_identity_gate(
+                    tmdb_client=tmdb,
+                    exact_release_name="Blade.Runner.2049.2017.2160p.UHD.BluRay.REMUX-CiNEPHiLES",
+                    proposed_imdb_id="tt1856101",
+                    proposed_tmdb_id=335984,
+                    proposal_confidence="high",
+                    from_evaluator=False,
+                    tl_applicable=True,
+                    tl_outcome="listing_id_found",
+                    observed_meta_imdb="tt1856101",
+                    observed_meta_tmdb=335984,
+                    observed_tl_imdb="tt1856101",
+                    file_runtime_minutes=164,
+                )
+            )
+            self.assertEqual(gate_br.status, "verified")
+            self.assertEqual(gate_br.verified_movie.tmdb_id, 335984)  # type: ignore[union-attr]
+
+            gate_ww = asyncio.run(
+                run_independent_identity_gate(
+                    tmdb_client=tmdb,
+                    exact_release_name="Wonder.Woman.1984.2020.2160p.UHD.BluRay.REMUX-GRP",
+                    proposed_imdb_id="tt7126948",
+                    proposed_tmdb_id=464052,
+                    proposal_confidence="high",
+                    from_evaluator=False,
+                    tl_applicable=True,
+                    tl_outcome="listing_id_found",
+                    observed_meta_imdb="tt7126948",
+                    observed_meta_tmdb=464052,
+                    observed_tl_imdb="tt7126948",
+                    file_runtime_minutes=151,
+                )
+            )
+            self.assertEqual(gate_ww.status, "verified")
+            self.assertEqual(gate_ww.verified_movie.tmdb_id, 464052)  # type: ignore[union-attr]
 
 
 if __name__ == "__main__":

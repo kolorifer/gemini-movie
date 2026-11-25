@@ -302,13 +302,17 @@ class _TorrentLeechHtmlParser(HTMLParser):
         # Open IMDb field container BEFORE inspecting href so <a id="imdb" href="...">
         # accurately sets _imdb_field_saw_href while still checking field text for explicit IDs.
         if not is_void:
-            if elem_id_low in ("imdb", "imdbid", "imdb_id", "torrentimdb"):
+            if self._imdb_field_depth > 0:
+                self._imdb_field_depth += 1
+                self._imdb_field_parts.append(" ")
+            elif elem_id_low in ("imdb", "imdbid", "imdb_id", "torrentimdb"):
                 self._imdb_field_depth = 1
                 self._imdb_field_saw_href = False
                 self._imdb_field_parts = []
-            elif self._imdb_field_depth > 0:
-                self._imdb_field_depth += 1
-                self._imdb_field_parts.append(" ")
+        elif self._imdb_field_depth > 0:
+            # Preserve word boundaries across void HTML elements (<br>, <wbr>, <img>, etc.)
+            # without incrementing container depth.
+            self._imdb_field_parts.append(" ")
 
         # IMDb links and explicit IMDb attributes/elements
         href = attr_map.get("href", "")
@@ -345,6 +349,12 @@ class _TorrentLeechHtmlParser(HTMLParser):
             ):
                 self._desc_depth = 1
                 self._desc_blocks.append([])
+        else:
+            if low_tag == "br":
+                if self._nfo_depth > 0 and self._nfo_blocks:
+                    self._nfo_blocks[-1].append("\n")
+                if self._desc_depth > 0 and self._desc_blocks:
+                    self._desc_blocks[-1].append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         low_tag = tag.lower()

@@ -7,6 +7,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,17 +29,28 @@ MAX_TMDB_CACHE_BYTES = 4_000_000
 
 _IMDB_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
 _YEAR_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
-_STOP_TOKENS = frozenset(
+_TECH_STOP_TOKENS = frozenset(
     {
         "2160p", "1080p", "1080i", "720p", "576p", "480p", "4k", "uhd",
         "bluray", "blu", "bdrip", "brrip", "remux", "web", "webdl", "webrip",
         "hdtv", "dvdrip", "x264", "x265", "h264", "h265", "hevc", "avc", "av1",
         "10bit", "8bit", "hdr", "hdr10", "hdr10plus", "dv", "dovi", "dolby",
         "atmos", "dts", "dtshd", "truehd", "aac", "ac3", "eac3", "flac", "lpcm",
+    }
+)
+_EDITION_STOP_TOKENS = frozenset(
+    {
         "proper", "repack", "internal", "extended", "unrated", "remastered",
         "restored", "imax", "hybrid", "multi", "dual", "criterion",
     }
 )
+
+
+def _is_plausible_release_year(token: str, *, max_year: int) -> bool:
+    if not _YEAR_RE.match(token):
+        return False
+    val = int(token)
+    return 1888 <= val <= max_year
 
 
 def normalize_title(text: str) -> str:
@@ -49,25 +61,52 @@ def normalize_title(text: str) -> str:
 
 
 def parse_release_title_year(exact_release_name: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Extract (title, release_year) from an exact scene/P2P release name while preserving
+    year-like numeric tokens in the movie title (e.g. 'Blade.Runner.2049.2017.2160p...',
+    'Wonder.Woman.1984.2020.2160p...', '2001.A.Space.Odyssey.1968.2160p...', '1917.2019...').
+    """
     cleaned = (exact_release_name or "").strip()
     if not cleaned:
         return None, None
     cleaned = re.sub(r"\.(?:mkv|mp4|m2ts|iso|torrent)$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"-[A-Za-z0-9]{2,24}$", "", cleaned)
     tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", cleaned) if t]
+    if not tokens:
+        return None, None
 
-    title_tokens: list[str] = []
-    year: Optional[int] = None
-    for idx, tok in enumerate(tokens):
-        low = tok.lower()
-        if _YEAR_RE.match(low) and idx > 0:
-            year = int(low)
+    # Slice before the first technical metadata token (keeping idx 0 as part of title)
+    tech_stop_idx = len(tokens)
+    for idx in range(1, len(tokens)):
+        if tokens[idx].lower() in _TECH_STOP_TOKENS:
+            tech_stop_idx = idx
             break
-        if low in _STOP_TOKENS and title_tokens:
+    pre_tech = [tok for tok in tokens[:tech_stop_idx] if not _IMDB_RE.fullmatch(tok.lower())]
+    if not pre_tech:
+        return None, None
+
+    max_year = datetime.now(timezone.utc).year + 2
+    # Select the LAST plausible release-year token (idx > 0) before technical metadata,
+    # so year-like title numbers ('Blade Runner 2049 2017', 'Wonder Woman 1984 2020') stay
+    # in the title while the trailing release year is identified cleanly.
+    year_idx: Optional[int] = None
+    for idx in range(len(pre_tech) - 1, 0, -1):
+        if _is_plausible_release_year(pre_tech[idx], max_year=max_year):
+            year_idx = idx
             break
-        if _IMDB_RE.fullmatch(low):
-            continue
-        title_tokens.append(tok)
+
+    if year_idx is not None:
+        year: Optional[int] = int(pre_tech[year_idx])
+        title_tokens = list(pre_tech[:year_idx])
+        while len(title_tokens) > 1 and title_tokens[-1].lower() in _EDITION_STOP_TOKENS:
+            title_tokens.pop()
+    else:
+        year = None
+        title_tokens = []
+        for idx, tok in enumerate(pre_tech):
+            if idx > 0 and tok.lower() in _EDITION_STOP_TOKENS:
+                break
+            title_tokens.append(tok)
 
     title = " ".join(title_tokens).strip() or None
     return title, year
