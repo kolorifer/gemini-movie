@@ -254,8 +254,16 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             test_db = TriageDB(Path(tmpdir) / "triage.db")
             test_db.init_db()
+            from tmdb_client import TmdbLookupResult
+
             mock_tmdb = TmdbClient(api_key="dummy-key")
-            mock_tmdb.lookup_from_request = AsyncMock(return_value=tmdb_hit)  # type: ignore[method-assign]
+            mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                return_value=TmdbLookupResult(
+                    movie=tmdb_hit,
+                    tracker_conflict=None,
+                    trusted_for_cache=True,
+                )
+            )
             mock_tmdb.verify_identification = AsyncMock(return_value=None)  # type: ignore[method-assign]
             mock_gemini_eval = AsyncMock(return_value=gemini_raw)
 
@@ -288,6 +296,124 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertTrue(resp2.cached)
                 self.assertEqual(resp2.identification.tmdb_id, 837335)
                 self.assertEqual(mock_gemini_eval.await_count, 1)
+
+    def test_tracker_info_conflict_rejected_and_falls_back_cleanly(self) -> None:
+        from schemas import TorrentInfo
+        from tmdb_client import (
+            check_tracker_movie_consistency,
+            format_torrent_info_for_prompt,
+            sanitize_tracker_text,
+        )
+
+        # Wrong-year remake linked by tracker must be flagged as conflict
+        wrong_remake = TmdbMovie(
+            tmdb_id=999,
+            canonical_title="Silent Night, Deadly Night",
+            original_title="Silent Night, Deadly Night",
+            year=1984,
+            imdb_id="tt0088117",
+            runtime_minutes=79,
+            original_language="en",
+        )
+        conflict = check_tracker_movie_consistency(
+            wrong_remake,
+            query_title="Silent Night Deadly Night",
+            query_year=2025,
+            nfo_runtime=97,
+        )
+        self.assertIsNotNone(conflict)
+        assert conflict is not None
+        self.assertIn("year mismatch", conflict)
+        self.assertIn("runtime mismatch", conflict)
+
+        # Non-Latin romanized title corroborated by matching runtime & language is accepted
+        jp_movie = TmdbMovie(
+            tmdb_id=372058,
+            canonical_title="Your Name.",
+            original_title="君の名は。",
+            year=2016,
+            imdb_id="tt5311514",
+            runtime_minutes=106,
+            original_language="ja",
+        )
+        self.assertIsNone(
+            check_tracker_movie_consistency(
+                jp_movie,
+                query_title="Kimi no Na wa",
+                query_year=2016,
+                nfo_runtime=106,
+                audio_languages=["Japanese"],
+            )
+        )
+
+        # Secret redaction scrubs URLs, passkeys, cookies, and long tokens
+        dirty = (
+            "Great film! See https://www.torrentleech.org/torrent/12345 "
+            "passkey=supersecret123 cookie=abc magnet:?xt=urn:btih:deadbeef "
+            + "X" * 60
+        )
+        clean = sanitize_tracker_text(dirty)
+        self.assertNotIn("torrentleech.org", clean)
+        self.assertNotIn("supersecret123", clean)
+        self.assertNotIn("magnet:", clean)
+        self.assertNotIn("X" * 48, clean)
+
+        # Conflict warning banner appears in prompt block
+        prompt_block = format_torrent_info_for_prompt(
+            TorrentInfo(
+                indexer="TorrentLeech",
+                imdb_id="tt0088117",
+                nfo_text="General\nDuration : 1 h 37 min\nLanguage : English",
+                description="Uploaded from tracker",
+            ),
+            conflict_warning=conflict,
+        )
+        self.assertIsNotNone(prompt_block)
+        assert prompt_block is not None
+        self.assertIn("CONFLICT WARNING:", prompt_block)
+        self.assertIn("UNTRUSTED", prompt_block)
+        self.assertIn("MediaInfo file duration: 97 minutes", prompt_block)
+
+    def test_tmdb_runtime_tiebreaker_and_conflict_fallback_in_client(self) -> None:
+        from schemas import TorrentInfo
+
+        client = TmdbClient(api_key="0123456789abcdef0123456789abcdef")
+
+        # Simulate tracker linking wrong 1984 movie (id=10) when release is 2025 movie (id=20),
+        # while two 2025 candidates exist (id=20 at 113m Cantonese, id=21 at 88m English).
+        fake_search = [
+            {"id": 21, "title": "The Furious", "original_title": "The Furious", "release_date": "2025-04-01", "popularity": 25.0},
+            {"id": 20, "title": "The Furious", "original_title": "火遮眼", "release_date": "2025-09-06", "popularity": 18.0},
+        ]
+        fake_details = {
+            10: TmdbMovie(tmdb_id=10, canonical_title="The Furious", original_title="The Furious", year=1984, imdb_id="tt0000010", runtime_minutes=80, original_language="en"),
+            20: TmdbMovie(tmdb_id=20, canonical_title="The Furious", original_title="火遮眼", year=2025, imdb_id="tt33311069", runtime_minutes=113, original_language="zh"),
+            21: TmdbMovie(tmdb_id=21, canonical_title="The Furious", original_title="The Furious", year=2025, imdb_id="tt0000021", runtime_minutes=88, original_language="en"),
+        }
+
+        req = EvaluateRequest(
+            raw_text="The.Furious.2025.2160p.UHD.BluRay.REMUX-GRP",
+            torrent_info=TorrentInfo(
+                indexer="TorrentLeech",
+                imdb_id="tt0000010",
+                runtime_minutes=113,
+                audio_languages=["Cantonese"],
+            ),
+        )
+
+        with (
+            patch.object(client, "_find_tmdb_id_by_imdb", return_value=10),
+            patch.object(client, "_search_results", return_value=fake_search),
+            patch.object(client, "_fetch_movie_details", side_effect=lambda tid: fake_details[tid]),
+        ):
+            res = asyncio.run(client.lookup_with_diagnostics(req))
+            self.assertIsNotNone(res.tracker_conflict)
+            self.assertFalse(res.trusted_for_cache)
+            self.assertIsNotNone(res.movie)
+            assert res.movie is not None
+            # MediaInfo 113m + Cantonese broke the tie in favor of id=20 over more popular id=21!
+            self.assertEqual(res.movie.tmdb_id, 20)
+            self.assertEqual(res.movie.imdb_id, "tt33311069")
 
     def test_feedback_watch_skip_normalization_and_dedup(self) -> None:
         from pydantic import ValidationError

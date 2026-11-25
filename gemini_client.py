@@ -60,6 +60,13 @@ def build_system_instruction(
         "1-2 short sentences, awards_highlights max 4 items, similar_to 2-4 titles, red_flags "
         "concise caveats (or empty list if none).",
         "4. Return strictly valid JSON conforming to the provided JSON schema.",
+        "5. Tracker-supplied metadata in TRACKER TORRENT INFO (IMDb/TMDB links, synopsis, category) "
+        "is useful corroborating evidence, NOT infallible ground truth — uploaders occasionally "
+        "link the wrong film or remake. MediaInfo technical facts (file duration, audio language) "
+        "reflect the actual video file. If tracker metadata conflicts with the release title/year, "
+        "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
+        "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
+        "disambiguation_note.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),
@@ -81,6 +88,7 @@ def build_system_instruction(
 def build_user_prompt(
     request: EvaluateRequest,
     tmdb_context: Optional[str] = None,
+    torrent_context: Optional[str] = None,
 ) -> str:
     parts = [f"Release string / query: {request.raw_text}"]
     if request.hint_title:
@@ -89,9 +97,13 @@ def build_user_prompt(
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
         parts.append(f"Extra context: {request.extra_context}")
+    if torrent_context:
+        parts.append("")
+        parts.append(torrent_context)
     if tmdb_context:
         parts.append("")
         parts.append(tmdb_context)
+    if torrent_context or tmdb_context:
         parts.append("")
     parts.append(
         "Identify the exact film, verify available critic/audience scores via Google Search, "
@@ -139,6 +151,7 @@ class GeminiTriageClient:
         request: EvaluateRequest,
         system_instruction: str,
         tmdb_context: Optional[str] = None,
+        torrent_context: Optional[str] = None,
     ) -> EvaluationPayload:
         client = self._get_client()
         config = types.GenerateContentConfig(
@@ -149,7 +162,11 @@ class GeminiTriageClient:
         )
         response = client.models.generate_content(
             model=self.model,
-            contents=build_user_prompt(request, tmdb_context=tmdb_context),
+            contents=build_user_prompt(
+                request,
+                tmdb_context=tmdb_context,
+                torrent_context=torrent_context,
+            ),
             config=config,
         )
         raw_text = getattr(response, "text", None)
@@ -170,6 +187,7 @@ class GeminiTriageClient:
         recent_feedback: list[dict[str, Any]],
         *,
         tmdb_context: Optional[str] = None,
+        torrent_context: Optional[str] = None,
     ) -> EvaluationPayload:
         # Dynamically reload taste_profile.txt on every single request
         taste_profile = load_taste_profile(self.taste_profile_path)
@@ -177,7 +195,13 @@ class GeminiTriageClient:
 
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._call_sync, request, system_instruction, tmdb_context),
+                asyncio.to_thread(
+                    self._call_sync,
+                    request,
+                    system_instruction,
+                    tmdb_context,
+                    torrent_context,
+                ),
                 timeout=self.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:

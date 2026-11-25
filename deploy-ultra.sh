@@ -58,6 +58,7 @@ EOF_TASTE_PROFILE
 cat <<'EOF_SCHEMAS' > "$APP_DIR/schemas.py"
 from __future__ import annotations
 
+import re
 from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -65,6 +66,56 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MatchConfidence = Literal["high", "medium", "low"]
 Verdict = Literal["WATCH", "MAYBE", "SKIP"]
 FeedbackDecision = Literal["WATCH", "SKIP"]
+
+_IMDB_ID_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
+
+
+class TorrentInfo(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    indexer: Optional[str] = Field(default=None, description="Tracker/indexer name (e.g. TorrentLeech)")
+    category: Optional[str] = Field(default=None, description="Tracker category (e.g. Movies :: 4K)")
+    imdb_id: Optional[str] = Field(default=None, description="Tracker-supplied IMDb ID (treated as unverified hint)")
+    tmdb_id: Optional[int] = Field(default=None, ge=1, description="Tracker-supplied TMDB ID (treated as unverified hint)")
+    runtime_minutes: Optional[int] = Field(
+        default=None, ge=1, le=1440, description="Actual file duration in minutes (e.g. from MediaInfo/NFO)"
+    )
+    audio_languages: list[str] = Field(
+        default_factory=list, description="Audio track language(s) from MediaInfo/NFO"
+    )
+    resolution: Optional[str] = Field(default=None, description="Release resolution (e.g. 2160p, 1080p)")
+    source: Optional[str] = Field(default=None, description="Release source (e.g. UHD BluRay REMUX, WEB-DL)")
+    size_gb: Optional[float] = Field(default=None, ge=0, description="Release size in GB")
+    freeleech: Optional[bool] = Field(default=None, description="Whether release is freeleech")
+    description: Optional[str] = Field(
+        default=None, description="Sanitized tracker listing description/summary"
+    )
+    nfo_text: Optional[str] = Field(
+        default=None, description="Sanitized MediaInfo / NFO text from tracker listing"
+    )
+
+    @field_validator("imdb_id", mode="before")
+    @classmethod
+    def _clean_imdb_id(cls, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if _IMDB_ID_RE.fullmatch(text):
+                return text
+        return None
+
+    @field_validator("audio_languages", mode="before")
+    @classmethod
+    def _clean_audio_languages(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [p.strip() for p in re.split(r"[,;/]+", value) if p.strip()]
+            return parts[:6]
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()][:6]
+        return []
 
 
 class EvaluateRequest(BaseModel):
@@ -74,6 +125,10 @@ class EvaluateRequest(BaseModel):
     hint_title: Optional[str] = Field(default=None, description="Optional title hint")
     hint_year: Optional[int] = Field(default=None, ge=1888, le=2100, description="Optional release year hint")
     extra_context: Optional[str] = Field(default=None, description="Optional tracker, IMDb ID, or release context")
+    torrent_info: Optional[TorrentInfo] = Field(
+        default=None,
+        description="Optional tracker listing metadata, description, and MediaInfo/NFO (cross-checked for mismatches)",
+    )
     force_refresh: bool = Field(default=False, description="Bypass SQLite cache and query Gemini fresh")
 
 
@@ -658,12 +713,121 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from db import RELEASE_STOP_TOKENS, YEAR_RE, extract_imdb_id
-from schemas import EvaluateRequest, EvaluationPayload, Identification
+from schemas import EvaluateRequest, EvaluationPayload, Identification, TorrentInfo
 
 logger = logging.getLogger(__name__)
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_TIMEOUT_SECONDS = 6.0
+
+_TRACKER_SECRET_RE = re.compile(
+    r"https?://\S+|magnet:\S+|www\.\S+"
+    r"|\b(?:passkey|token|password|authorization|cookie|bearer)\b\s*[:=]?\s*\S+"
+    r"|[A-Za-z0-9_-]{48,}",
+    re.IGNORECASE,
+)
+_NFO_DURATION_HM_RE = re.compile(r"\bDuration\s*:\s*(\d{1,2})\s*h\s*(\d{1,2})\s*min\b", re.IGNORECASE)
+_NFO_DURATION_M_RE = re.compile(r"\bDuration\s*:\s*(\d{1,4})\s*min\b", re.IGNORECASE)
+
+_LANGUAGE_TO_ISO: dict[str, set[str]] = {
+    "english": {"en"},
+    "en": {"en"},
+    "french": {"fr"},
+    "fr": {"fr"},
+    "italian": {"it"},
+    "it": {"it"},
+    "spanish": {"es"},
+    "es": {"es"},
+    "german": {"de"},
+    "de": {"de"},
+    "japanese": {"ja"},
+    "ja": {"ja"},
+    "korean": {"ko"},
+    "ko": {"ko"},
+    "chinese": {"zh", "cn"},
+    "cantonese": {"zh", "cn"},
+    "mandarin": {"zh", "cn"},
+    "zh": {"zh", "cn"},
+    "cn": {"zh", "cn"},
+    "russian": {"ru"},
+    "ru": {"ru"},
+    "polish": {"pl"},
+    "pl": {"pl"},
+    "portuguese": {"pt"},
+    "pt": {"pt"},
+    "swedish": {"sv"},
+    "sv": {"sv"},
+    "danish": {"da"},
+    "da": {"da"},
+    "norwegian": {"no", "nb"},
+    "finnish": {"fi"},
+    "dutch": {"nl"},
+    "hindi": {"hi"},
+    "persian": {"fa"},
+    "farsi": {"fa"},
+    "arabic": {"ar"},
+    "turkish": {"tr"},
+    "greek": {"el"},
+    "czech": {"cs"},
+    "hungarian": {"hu"},
+    "romanian": {"ro"},
+    "thai": {"th"},
+}
+
+
+def sanitize_tracker_text(raw: Optional[str], *, max_chars: int = 900) -> str:
+    """Scrub URLs, passkeys, cookies, and control chars from tracker text before LLM use."""
+    if not raw:
+        return ""
+    scrubbed = _TRACKER_SECRET_RE.sub("[redacted]", raw)
+    cleaned = "".join(" " if unicodedata.category(ch).startswith("C") else ch for ch in scrubbed)
+    collapsed = re.sub(r"\s+", " ", cleaned).strip()
+    if len(collapsed) > max_chars:
+        return collapsed[: max_chars - 3].rstrip() + "..."
+    return collapsed
+
+
+def extract_nfo_runtime_minutes(nfo_text: Optional[str]) -> Optional[int]:
+    """Extract video duration in minutes from MediaInfo/NFO text when unambiguous."""
+    if not nfo_text:
+        return None
+    found: set[int] = set()
+    for hours, mins in _NFO_DURATION_HM_RE.findall(nfo_text):
+        h_val, m_val = int(hours), int(mins)
+        if m_val < 60:
+            total = h_val * 60 + m_val
+            if 1 <= total <= 1440:
+                found.add(total)
+    if not found:
+        for mins in _NFO_DURATION_M_RE.findall(nfo_text):
+            total = int(mins)
+            if 1 <= total <= 1440:
+                found.add(total)
+    if len(found) == 1:
+        return next(iter(found))
+    return None
+
+
+def _audio_languages_match_iso(audio_languages: list[str], iso_lang: Optional[str]) -> bool:
+    if not audio_languages or not iso_lang:
+        return False
+    target = iso_lang.strip().lower()
+    for lang in audio_languages:
+        codes = _LANGUAGE_TO_ISO.get(lang.strip().lower())
+        if codes and target in codes:
+            return True
+    return False
+
+
+def _has_non_latin_letters(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    for ch in text:
+        if ch.isalpha():
+            name = unicodedata.name(ch, "")
+            if "LATIN" not in name:
+                return True
+    return False
 
 
 def _normalize_title_for_compare(text: str) -> str:
@@ -909,6 +1073,156 @@ def apply_tmdb_verification(
     return payload.model_copy(update={"identification": updated_ident})
 
 
+@dataclass(frozen=True)
+class TmdbLookupResult:
+    movie: Optional[TmdbMovie] = None
+    tracker_conflict: Optional[str] = None
+    trusted_for_cache: bool = False
+
+
+def check_tracker_movie_consistency(
+    movie: TmdbMovie,
+    *,
+    query_title: Optional[str],
+    query_year: Optional[int],
+    nfo_runtime: Optional[int] = None,
+    audio_languages: Optional[list[str]] = None,
+) -> Optional[str]:
+    """
+    Cross-check a tracker-supplied TMDB/IMDb candidate against the release string
+    and MediaInfo facts. Returns a human-readable conflict description when the
+    tracker appears to have mislinked the movie, or None when consistent.
+    """
+    reasons: list[str] = []
+
+    if query_year is not None and movie.year is not None and abs(movie.year - query_year) > 1:
+        reasons.append(f"year mismatch (release={query_year}, tracker={movie.year})")
+
+    if (
+        nfo_runtime is not None
+        and movie.runtime_minutes is not None
+        and abs(nfo_runtime - movie.runtime_minutes) > 15
+    ):
+        reasons.append(
+            f"runtime mismatch (MediaInfo={nfo_runtime}m, tracker={movie.runtime_minutes}m)"
+        )
+
+    if query_title:
+        norm_query = _normalize_title_for_compare(query_title)
+        cand_norms = [
+            _normalize_title_for_compare(t)
+            for t in (movie.canonical_title, movie.original_title or "")
+            if t and t.strip()
+        ]
+        title_matches = False
+        for cn in cand_norms:
+            if not cn:
+                continue
+            if norm_query == cn or _token_jaccard(norm_query, cn) >= 0.45:
+                title_matches = True
+                break
+            if len(norm_query) >= 4 and len(cn) >= 4 and (norm_query in cn or cn in norm_query):
+                title_matches = True
+                break
+
+        if not title_matches:
+            # Allow romanized non-Latin release titles only when corroborated by runtime or audio language
+            # (and no year/runtime conflict already detected).
+            non_latin_corroborated = (
+                not reasons
+                and _has_non_latin_letters(movie.original_title)
+                and (
+                    (
+                        nfo_runtime is not None
+                        and movie.runtime_minutes is not None
+                        and abs(nfo_runtime - movie.runtime_minutes) <= 10
+                    )
+                    or _audio_languages_match_iso(audio_languages or [], movie.original_language)
+                )
+            )
+            if not non_latin_corroborated:
+                reasons.append(
+                    f"title mismatch (release='{query_title}', tracker='{movie.canonical_title}'"
+                    + (f" / '{movie.original_title}'" if movie.original_title and movie.original_title != movie.canonical_title else "")
+                    + ")"
+                )
+
+    if not reasons:
+        return None
+
+    return (
+        f"Tracker-supplied ID resolved to '{movie.canonical_title}' ({movie.year}, "
+        f"imdb={movie.imdb_id or 'unknown'}, runtime={movie.runtime_minutes or '?'}m), "
+        f"which conflicts with release evidence: {'; '.join(reasons)}."
+    )
+
+
+def format_torrent_info_for_prompt(
+    torrent_info: Optional[TorrentInfo],
+    *,
+    conflict_warning: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Format sanitized, bounded tracker metadata and MediaInfo/NFO excerpts for Gemini.
+    Always frames tracker IDs and descriptions as fallible clues, while MediaInfo
+    duration/audio reflect the actual media file.
+    """
+    if torrent_info is None and not conflict_warning:
+        return None
+
+    lines = [
+        "TRACKER TORRENT INFO (corroborating context; tracker IDs/descriptions are uploader-supplied and can occasionally be wrong, whereas MediaInfo duration/audio reflect the actual file):"
+    ]
+    if conflict_warning:
+        lines.append(
+            f"- CONFLICT WARNING: {conflict_warning} "
+            "Treat the tracker's ID and synopsis as UNTRUSTED; verify the true film from the release string, MediaInfo facts, and Google Search, and note the tracker mismatch in disambiguation_note."
+        )
+
+    if torrent_info is not None:
+        meta_parts: list[str] = []
+        if torrent_info.indexer:
+            meta_parts.append(f"indexer={torrent_info.indexer}")
+        if torrent_info.category:
+            meta_parts.append(f"category={torrent_info.category}")
+        if torrent_info.resolution:
+            meta_parts.append(f"resolution={torrent_info.resolution}")
+        if torrent_info.source:
+            meta_parts.append(f"source={torrent_info.source}")
+        if torrent_info.size_gb is not None:
+            meta_parts.append(f"size={torrent_info.size_gb:.1f} GB")
+        if torrent_info.freeleech is not None:
+            meta_parts.append(f"freeleech={str(torrent_info.freeleech).lower()}")
+        if meta_parts:
+            lines.append("- Release metadata: " + ", ".join(meta_parts))
+
+        effective_runtime = torrent_info.runtime_minutes or extract_nfo_runtime_minutes(
+            torrent_info.nfo_text
+        )
+        if effective_runtime is not None:
+            lines.append(f"- MediaInfo file duration: {effective_runtime} minutes")
+        if torrent_info.audio_languages:
+            lines.append("- MediaInfo audio languages: " + ", ".join(torrent_info.audio_languages))
+
+        id_label = "untrusted/conflicting" if conflict_warning else "tracker-reported, cross-check"
+        if torrent_info.imdb_id:
+            lines.append(f"- Tracker IMDb ID ({id_label}): {torrent_info.imdb_id}")
+        if torrent_info.tmdb_id is not None:
+            lines.append(f"- Tracker TMDB ID ({id_label}): {torrent_info.tmdb_id}")
+
+        clean_desc = sanitize_tracker_text(torrent_info.description, max_chars=900)
+        if clean_desc:
+            lines.append(f"- Tracker description excerpt: {clean_desc}")
+
+        clean_nfo = sanitize_tracker_text(torrent_info.nfo_text, max_chars=900)
+        if clean_nfo:
+            lines.append(f"- MediaInfo / NFO excerpt: {clean_nfo}")
+
+    if len(lines) <= 1:
+        return None
+    return "\n".join(lines)
+
+
 class TmdbClient:
     def __init__(
         self,
@@ -958,7 +1272,7 @@ class TmdbClient:
         movie_id = movie_results[0].get("id")
         return int(movie_id) if movie_id is not None else None
 
-    def _search_tmdb_id(self, title: str, year: Optional[int] = None) -> Optional[int]:
+    def _search_results(self, title: str, year: Optional[int] = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"query": title, "include_adult": "false"}
         if year is not None:
             params["year"] = year
@@ -973,11 +1287,101 @@ class TmdbClient:
                 params={"query": title, "include_adult": "false"},
             )
             results = data.get("results") or []
+        return results
 
+    def _search_tmdb_id(self, title: str, year: Optional[int] = None) -> Optional[int]:
+        results = self._search_results(title, year)
         best = select_best_tmdb_candidate(results, title, year)
         if best is None or best.get("id") is None:
             return None
         return int(best["id"])
+
+    def _search_tmdb_movie(
+        self,
+        title: str,
+        year: Optional[int] = None,
+        *,
+        nfo_runtime: Optional[int] = None,
+        audio_languages: Optional[list[str]] = None,
+    ) -> Optional[TmdbMovie]:
+        results = self._search_results(title, year)
+        if not results:
+            return None
+
+        # Score candidates; when MediaInfo runtime/language is available and >=2 candidates
+        # are plausible, inspect up to top 3 via /movie/{id} to break ties deterministically.
+        norm_query = _normalize_title_for_compare(title)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in results[:10]:
+            cand_title = _normalize_title_for_compare(str(item.get("title") or ""))
+            cand_orig = _normalize_title_for_compare(str(item.get("original_title") or ""))
+            if norm_query in (cand_title, cand_orig):
+                title_score = 100.0
+            else:
+                sim = max(
+                    _token_jaccard(norm_query, cand_title),
+                    _token_jaccard(norm_query, cand_orig),
+                )
+                if sim < 0.6:
+                    continue
+                title_score = 65.0 * sim
+
+            cand_year = _parse_year(item.get("release_date"))
+            year_score = 0.0
+            if year is not None:
+                if cand_year == year:
+                    year_score = 50.0
+                elif cand_year is not None and abs(cand_year - year) == 1:
+                    year_score = 25.0
+                elif cand_year is not None:
+                    year_score = -80.0
+
+            pop_score = min(float(item.get("popularity") or 0.0), 30.0) * 0.5
+            scored.append((title_score + year_score + pop_score, item))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        min_threshold = 75.0 if year is not None else 100.0
+        top_score = scored[0][0]
+        if top_score < min_threshold:
+            return None
+
+        use_tiebreaker = (nfo_runtime is not None or bool(audio_languages)) and len(scored) >= 2
+        close_candidates = [
+            pair for pair in scored[:3] if pair[0] >= max(min_threshold - 10.0, top_score - 30.0)
+        ]
+
+        if not use_tiebreaker or len(close_candidates) < 2:
+            top_id = scored[0][1].get("id")
+            return self._fetch_movie_details(int(top_id)) if top_id is not None else None
+
+        best_final = -1e9
+        best_movie: Optional[TmdbMovie] = None
+        for base_score, item in close_candidates:
+            cid = item.get("id")
+            if cid is None:
+                continue
+            movie = self._fetch_movie_details(int(cid))
+            bonus = 0.0
+            if nfo_runtime is not None and movie.runtime_minutes is not None:
+                diff = abs(movie.runtime_minutes - nfo_runtime)
+                if diff <= 8:
+                    bonus += 35.0
+                elif diff <= 15:
+                    bonus += 15.0
+                elif diff > 20:
+                    bonus -= 30.0
+            if audio_languages and _audio_languages_match_iso(audio_languages, movie.original_language):
+                bonus += 15.0
+
+            final_score = base_score + bonus
+            if final_score > best_final:
+                best_final = final_score
+                best_movie = movie
+
+        return best_movie
 
     def _fetch_movie_details(self, tmdb_id: int) -> TmdbMovie:
         data = self._get_json(
@@ -1021,24 +1425,80 @@ class TmdbClient:
             original_language=str(data.get("original_language") or "").strip() or None,
         )
 
-    def _lookup_from_request_sync(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
-        imdb_id = extract_imdb_id(request.raw_text, request.extra_context)
-        tmdb_id: Optional[int] = None
-        if imdb_id:
-            tmdb_id = self._find_tmdb_id_by_imdb(imdb_id)
+    def _lookup_with_diagnostics_sync(self, request: EvaluateRequest) -> TmdbLookupResult:
+        query_title, query_year = extract_tmdb_query(
+            request.raw_text,
+            hint_title=request.hint_title,
+            hint_year=request.hint_year,
+        )
+        tinfo = request.torrent_info
+        nfo_runtime = (
+            tinfo.runtime_minutes
+            if tinfo is not None and tinfo.runtime_minutes is not None
+            else (extract_nfo_runtime_minutes(tinfo.nfo_text) if tinfo is not None else None)
+        )
+        audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
 
-        if tmdb_id is None:
-            query_title, query_year = extract_tmdb_query(
-                request.raw_text,
-                hint_title=request.hint_title,
-                hint_year=request.hint_year,
+        # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context (not tracker)
+        direct_imdb = extract_imdb_id(request.raw_text, request.extra_context)
+        if direct_imdb:
+            direct_tmdb_id = self._find_tmdb_id_by_imdb(direct_imdb)
+            if direct_tmdb_id is not None:
+                return TmdbLookupResult(
+                    movie=self._fetch_movie_details(direct_tmdb_id),
+                    tracker_conflict=None,
+                    trusted_for_cache=True,
+                )
+
+        # 2) Check tracker-supplied TMDB/IMDb ID — ALWAYS cross-checked against release & MediaInfo!
+        tracker_conflict: Optional[str] = None
+        if tinfo is not None and (tinfo.tmdb_id is not None or tinfo.imdb_id):
+            tracker_tmdb_id: Optional[int] = tinfo.tmdb_id
+            if tracker_tmdb_id is None and tinfo.imdb_id:
+                tracker_tmdb_id = self._find_tmdb_id_by_imdb(tinfo.imdb_id)
+            if tracker_tmdb_id is not None:
+                tracker_movie = self._fetch_movie_details(tracker_tmdb_id)
+                conflict = check_tracker_movie_consistency(
+                    tracker_movie,
+                    query_title=query_title,
+                    query_year=query_year,
+                    nfo_runtime=nfo_runtime,
+                    audio_languages=audio_languages,
+                )
+                if conflict is None:
+                    return TmdbLookupResult(
+                        movie=tracker_movie,
+                        tracker_conflict=None,
+                        trusted_for_cache=True,
+                    )
+                logger.warning("Rejecting tracker-supplied TMDB candidate: %s", conflict)
+                tracker_conflict = conflict
+
+        # 3) Clean title + year search (with MediaInfo runtime/language tie-breaking)
+        if query_title:
+            searched = self._search_tmdb_movie(
+                query_title,
+                query_year,
+                nfo_runtime=nfo_runtime,
+                audio_languages=audio_languages,
             )
-            if query_title:
-                tmdb_id = self._search_tmdb_id(query_title, query_year)
+            if searched is not None:
+                # If a tracker conflict occurred, still run Gemini with the conflict warning
+                # rather than silently serving a cached entry without disambiguation.
+                return TmdbLookupResult(
+                    movie=searched,
+                    tracker_conflict=tracker_conflict,
+                    trusted_for_cache=tracker_conflict is None,
+                )
 
-        if tmdb_id is None:
-            return None
-        return self._fetch_movie_details(tmdb_id)
+        return TmdbLookupResult(
+            movie=None,
+            tracker_conflict=tracker_conflict,
+            trusted_for_cache=False,
+        )
+
+    def _lookup_from_request_sync(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
+        return self._lookup_with_diagnostics_sync(request).movie
 
     def _verify_identification_sync(self, ident: Identification) -> Optional[TmdbMovie]:
         tmdb_id: Optional[int] = None
@@ -1059,20 +1519,24 @@ class TmdbClient:
             return None
         return movie
 
-    async def lookup_from_request(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
+    async def lookup_with_diagnostics(self, request: EvaluateRequest) -> TmdbLookupResult:
         if not self.enabled:
-            return None
+            return TmdbLookupResult()
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._lookup_from_request_sync, request),
-                timeout=self.timeout_seconds + 2.0,
+                asyncio.to_thread(self._lookup_with_diagnostics_sync, request),
+                timeout=self.timeout_seconds + 4.0,
             )
         except (urllib.error.URLError, TimeoutError, asyncio.TimeoutError, ValueError, KeyError) as exc:
             logger.warning("TMDB pre-lookup failed (falling back to Gemini-only): %s", exc)
-            return None
+            return TmdbLookupResult()
         except Exception as exc:
             logger.warning("Unexpected TMDB pre-lookup error: %s", exc)
-            return None
+            return TmdbLookupResult()
+
+    async def lookup_from_request(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
+        result = await self.lookup_with_diagnostics(request)
+        return result.movie
 
     async def verify_identification(self, ident: Identification) -> Optional[TmdbMovie]:
         if not self.enabled:
@@ -1153,6 +1617,13 @@ def build_system_instruction(
         "1-2 short sentences, awards_highlights max 4 items, similar_to 2-4 titles, red_flags "
         "concise caveats (or empty list if none).",
         "4. Return strictly valid JSON conforming to the provided JSON schema.",
+        "5. Tracker-supplied metadata in TRACKER TORRENT INFO (IMDb/TMDB links, synopsis, category) "
+        "is useful corroborating evidence, NOT infallible ground truth — uploaders occasionally "
+        "link the wrong film or remake. MediaInfo technical facts (file duration, audio language) "
+        "reflect the actual video file. If tracker metadata conflicts with the release title/year, "
+        "MediaInfo duration, or Google Search, trust the release string + MediaInfo + Google Search, "
+        "lower match_confidence if still ambiguous, and briefly note the tracker mismatch in "
+        "disambiguation_note.",
         "",
         "USER TASTE PROFILE:",
         taste_profile.strip(),
@@ -1174,6 +1645,7 @@ def build_system_instruction(
 def build_user_prompt(
     request: EvaluateRequest,
     tmdb_context: Optional[str] = None,
+    torrent_context: Optional[str] = None,
 ) -> str:
     parts = [f"Release string / query: {request.raw_text}"]
     if request.hint_title:
@@ -1182,9 +1654,13 @@ def build_user_prompt(
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
         parts.append(f"Extra context: {request.extra_context}")
+    if torrent_context:
+        parts.append("")
+        parts.append(torrent_context)
     if tmdb_context:
         parts.append("")
         parts.append(tmdb_context)
+    if torrent_context or tmdb_context:
         parts.append("")
     parts.append(
         "Identify the exact film, verify available critic/audience scores via Google Search, "
@@ -1232,6 +1708,7 @@ class GeminiTriageClient:
         request: EvaluateRequest,
         system_instruction: str,
         tmdb_context: Optional[str] = None,
+        torrent_context: Optional[str] = None,
     ) -> EvaluationPayload:
         client = self._get_client()
         config = types.GenerateContentConfig(
@@ -1242,7 +1719,11 @@ class GeminiTriageClient:
         )
         response = client.models.generate_content(
             model=self.model,
-            contents=build_user_prompt(request, tmdb_context=tmdb_context),
+            contents=build_user_prompt(
+                request,
+                tmdb_context=tmdb_context,
+                torrent_context=torrent_context,
+            ),
             config=config,
         )
         raw_text = getattr(response, "text", None)
@@ -1263,6 +1744,7 @@ class GeminiTriageClient:
         recent_feedback: list[dict[str, Any]],
         *,
         tmdb_context: Optional[str] = None,
+        torrent_context: Optional[str] = None,
     ) -> EvaluationPayload:
         # Dynamically reload taste_profile.txt on every single request
         taste_profile = load_taste_profile(self.taste_profile_path)
@@ -1270,7 +1752,13 @@ class GeminiTriageClient:
 
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._call_sync, request, system_instruction, tmdb_context),
+                asyncio.to_thread(
+                    self._call_sync,
+                    request,
+                    system_instruction,
+                    tmdb_context,
+                    torrent_context,
+                ),
                 timeout=self.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
@@ -1304,7 +1792,12 @@ from schemas import (
     HealthResponse,
     RecentEvaluationItem,
 )
-from tmdb_client import TmdbClient, apply_tmdb_verification, is_tmdb_compatible
+from tmdb_client import (
+    TmdbClient,
+    apply_tmdb_verification,
+    format_torrent_info_for_prompt,
+    is_tmdb_compatible,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -1359,10 +1852,16 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         if cached is not None:
             return EvaluateResponse(cached=True, **cached)
 
-    tmdb_movie = await tmdb_client.lookup_from_request(payload)
+    lookup = await tmdb_client.lookup_with_diagnostics(payload)
+    tmdb_movie = lookup.movie
 
-    # Cross-language/alias cache check via deterministic TMDB -> IMDb ID resolution
-    if not payload.force_refresh and tmdb_movie is not None and tmdb_movie.imdb_id:
+    # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
+    if (
+        not payload.force_refresh
+        and lookup.trusted_for_cache
+        and tmdb_movie is not None
+        and tmdb_movie.imdb_id
+    ):
         cached_by_imdb = db.get_cached_evaluation(
             payload.raw_text,
             hint_title=tmdb_movie.canonical_title,
@@ -1375,11 +1874,16 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
 
     recent_feedback = db.get_recent_feedback(limit=20)
     tmdb_context = tmdb_movie.to_prompt_block() if tmdb_movie is not None else None
+    torrent_context = format_torrent_info_for_prompt(
+        payload.torrent_info,
+        conflict_warning=lookup.tracker_conflict,
+    )
     try:
         result = await gemini_client.evaluate(
             payload,
             recent_feedback,
             tmdb_context=tmdb_context,
+            torrent_context=torrent_context,
         )
     except GeminiTimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc

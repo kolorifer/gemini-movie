@@ -18,7 +18,12 @@ from schemas import (
     HealthResponse,
     RecentEvaluationItem,
 )
-from tmdb_client import TmdbClient, apply_tmdb_verification, is_tmdb_compatible
+from tmdb_client import (
+    TmdbClient,
+    apply_tmdb_verification,
+    format_torrent_info_for_prompt,
+    is_tmdb_compatible,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -73,10 +78,16 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         if cached is not None:
             return EvaluateResponse(cached=True, **cached)
 
-    tmdb_movie = await tmdb_client.lookup_from_request(payload)
+    lookup = await tmdb_client.lookup_with_diagnostics(payload)
+    tmdb_movie = lookup.movie
 
-    # Cross-language/alias cache check via deterministic TMDB -> IMDb ID resolution
-    if not payload.force_refresh and tmdb_movie is not None and tmdb_movie.imdb_id:
+    # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
+    if (
+        not payload.force_refresh
+        and lookup.trusted_for_cache
+        and tmdb_movie is not None
+        and tmdb_movie.imdb_id
+    ):
         cached_by_imdb = db.get_cached_evaluation(
             payload.raw_text,
             hint_title=tmdb_movie.canonical_title,
@@ -89,11 +100,16 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
 
     recent_feedback = db.get_recent_feedback(limit=20)
     tmdb_context = tmdb_movie.to_prompt_block() if tmdb_movie is not None else None
+    torrent_context = format_torrent_info_for_prompt(
+        payload.torrent_info,
+        conflict_warning=lookup.tracker_conflict,
+    )
     try:
         result = await gemini_client.evaluate(
             payload,
             recent_feedback,
             tmdb_context=tmdb_context,
+            torrent_context=torrent_context,
         )
     except GeminiTimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
