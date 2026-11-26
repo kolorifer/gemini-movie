@@ -213,6 +213,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
             self.assertIn("deploy/port_check.py", text)
             self.assertIn("--max-time", text)
             self.assertIn("--connect-timeout", text)
+            self.assertIn('HEALTH_WAIT_SECONDS="${HEALTH_WAIT_SECONDS:-60}"', text)
+            self.assertIn("is-failed", text)
             self.assertNotIn("enable --now", text)
             # Zero piped ss|grep that can fail with SIGPIPE 141 under pipefail
             self.assertNotIn("ss -tlnH 2>/dev/null |", text)
@@ -256,6 +258,25 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotEqual(dry_conflict.returncode, 0)
             self.assertIn("already configured", dry_conflict.stderr)
+
+            # Invalid HEALTH_WAIT_SECONDS MUST fail fast even on --dry-run (and in deploy-ultra.sh before any action)
+            for bad_wait in ("0", "008", "abc", "301"):
+                dry_bad_wait = subprocess.run(
+                    ["bash", str(suite_script), "--shadow", "--dry-run"],
+                    env=dict(env, HEALTH_WAIT_SECONDS=bad_wait),
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(dry_bad_wait.returncode, 0, msg=f"Should reject HEALTH_WAIT_SECONDS={bad_wait}")
+                self.assertIn("HEALTH_WAIT_SECONDS", dry_bad_wait.stderr)
+                triage_bad_wait = subprocess.run(
+                    ["bash", str(triage_script)],
+                    env=dict(env, HEALTH_WAIT_SECONDS=bad_wait),
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(triage_bad_wait.returncode, 0, msg=f"deploy-ultra.sh should reject {bad_wait}")
+                self.assertIn("HEALTH_WAIT_SECONDS", triage_bad_wait.stderr)
 
         # Nginx template security invariants (§7.3)
         nginx_text = nginx_tpl.read_text(encoding="utf-8")
