@@ -425,6 +425,187 @@ class IntakeWorker:
                 payload["bound_movie_file_snapshot"] = dict(radarr.movie_file_snapshot)
         return payload
 
+    async def _retire_acknowledged_card(
+        self,
+        *,
+        row: dict[str, Any],
+        release_id: str,
+        source_occurrence_id: str,
+        expected_digest: str,
+        classified: ClassifiedWebhook,
+        retry_count: int,
+        suppression_reason: str,
+        retirement_note: str,
+        tl_result: Optional[TorrentLeechResult] = None,
+        movie: Optional[TmdbMovieRecord] = None,
+        radarr: Optional[RadarrStatusResponse] = None,
+        full_digest: Optional[str] = None,
+        eval_res: Optional[TriageEvalResult] = None,
+        prev_last_eval_digest: Optional[str] = None,
+    ) -> None:
+        """
+        Issue #13 §2a: When later evidence disqualifies an already-delivered card (e.g.
+        late "Quality is not wanted in profile" or Radarr watched/owned transition),
+        edit the acknowledged card to delivery_kind='retired' with zero buttons and
+        supersede all previously active action tokens while preserving any sent evaluation reply.
+        """
+        prev_card_rev = int(row.get("card_revision") or 0)
+        next_rev = prev_card_rev + 1
+        prev_eval_status = str(row.get("eval_reply_status") or "pending")
+        final_eval_status = (
+            prev_eval_status if prev_eval_status in ("sent", "ambiguous_reply") else "skipped"
+        )
+        eff_tmdb = movie.tmdb_id if movie is not None else row.get("verified_tmdb_id")
+        eff_imdb = movie.imdb_id if movie is not None else row.get("verified_imdb_id")
+        eff_title = movie.title if movie is not None else row.get("verified_title")
+        eff_year = movie.year if movie is not None else row.get("verified_year")
+        eff_gate_status = (
+            "verified"
+            if (movie is not None or str(row.get("identity_gate_status") or "") == "verified")
+            else str(row.get("identity_gate_status") or "evidence_review")
+        )
+        retired_card: dict[str, Any] = {
+            "release_id": release_id,
+            "card_revision": next_rev,
+            "source_occurrence_id": source_occurrence_id,
+            "delivery_kind": "retired",
+            "identity_gate_status": eff_gate_status,
+            "exact_release_name": classified.exact_release_name,
+            "indexer": classified.indexer_raw or classified.indexer_norm,
+            "external_id": classified.external_id_norm,
+            "category": classified.category,
+            "size_gb": classified.size_gb,
+            "freeleech": (
+                classified.freeleech
+                if classified.freeleech is not None
+                else (tl_result.freeleech_badge if tl_result is not None else None)
+            ),
+            "tl_outcome": tl_result.outcome if tl_result is not None else (row.get("tl_outcome") or "not_applicable"),
+            "radarr_status": radarr.status if radarr is not None else "disqualified",
+            "radarr_note": retirement_note,
+            "conflict_reason": retirement_note,
+            "observed_meta_imdb": classified.meta_imdb,
+            "observed_meta_tmdb": classified.meta_tmdb,
+            "observed_tl_imdb": tl_result.imdb_id if tl_result is not None else None,
+            "file_runtime_minutes": tl_result.file_runtime_minutes if tl_result is not None else None,
+            "audio_languages": list(tl_result.audio_languages) if tl_result is not None else [],
+            "preserve_eval_reply": True,
+        }
+        if isinstance(eff_tmdb, int) and not isinstance(eff_tmdb, bool) and eff_tmdb > 0:
+            retired_card["verified_tmdb_id"] = eff_tmdb
+        if isinstance(eff_imdb, str) and eff_imdb.strip():
+            retired_card["verified_imdb_id"] = eff_imdb.strip().lower()
+        if isinstance(eff_title, str) and eff_title.strip():
+            retired_card["verified_title"] = eff_title.strip()
+        if isinstance(eff_year, int) and not isinstance(eff_year, bool):
+            retired_card["verified_year"] = eff_year
+
+        retired_digest = compute_card_content_digest(retired_card)
+        prev_card_digest = str(row.get("last_card_digest") or "") or None
+        if prev_card_digest == retired_digest and str(row.get("suppression_reason") or "") == suppression_reason:
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="suppressed",
+                expected_incoming_digest=expected_digest,
+                suppression_reason=suppression_reason,
+                full_evidence_digest=full_digest,
+                last_evaluated_digest=(
+                    full_digest if (eval_res is not None and eval_res.ok and full_digest) else prev_last_eval_digest
+                ),
+                tl_outcome=tl_result.outcome if tl_result is not None else None,
+                identity_gate_status=eff_gate_status,
+                verified_tmdb_id=eff_tmdb,
+                verified_imdb_id=eff_imdb,
+                verified_title=eff_title,
+                verified_year=eff_year,
+                eval_reply_status=final_eval_status,
+                pending_card_supersede=None,
+                pending_eval_reply=None,
+                radarr_status_snapshot=radarr.to_dict() if radarr is not None else None,
+                evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
+            )
+            return
+
+        await asyncio.to_thread(
+            self.db.renew_lease,
+            release_id,
+            worker_id=self.worker_id,
+            lease_seconds=self.config.worker_lease_seconds,
+            new_state="delivering",
+        )
+        ret_resp = await self.actions_client.deliver_card(retired_card)
+        if _is_ambiguous_card_ack(ret_resp):
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="ambiguous_delivery",
+                expected_incoming_digest=expected_digest,
+                suppression_reason=suppression_reason,
+                full_evidence_digest=full_digest,
+                tl_outcome=tl_result.outcome if tl_result is not None else None,
+                identity_gate_status=eff_gate_status,
+                verified_tmdb_id=eff_tmdb,
+                verified_imdb_id=eff_imdb,
+                verified_title=eff_title,
+                verified_year=eff_year,
+                radarr_status_snapshot=radarr.to_dict() if radarr is not None else None,
+                evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
+            )
+            return
+        if ret_resp.status != "delivered" or ret_resp.ack_message_id is None:
+            await asyncio.to_thread(
+                self.db.finalize_release,
+                release_id,
+                worker_id=self.worker_id,
+                state="queued" if retry_count < 4 else "failed_terminal",
+                expected_incoming_digest=expected_digest,
+                suppression_reason=suppression_reason,
+                full_evidence_digest=full_digest,
+                tl_outcome=tl_result.outcome if tl_result is not None else None,
+                identity_gate_status=eff_gate_status,
+                verified_tmdb_id=eff_tmdb,
+                verified_imdb_id=eff_imdb,
+                verified_title=eff_title,
+                verified_year=eff_year,
+                radarr_status_snapshot=radarr.to_dict() if radarr is not None else None,
+                evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
+                next_attempt_at=self._retry_next_attempt_iso(),
+                increment_retry=True,
+            )
+            return
+
+        await asyncio.to_thread(
+            self.db.finalize_release,
+            release_id,
+            worker_id=self.worker_id,
+            state="suppressed",
+            expected_incoming_digest=expected_digest,
+            suppression_reason=suppression_reason,
+            card_revision=next_rev,
+            full_evidence_digest=full_digest,
+            last_evaluated_digest=(
+                full_digest if (eval_res is not None and eval_res.ok and full_digest) else prev_last_eval_digest
+            ),
+            last_card_digest=retired_digest,
+            tl_outcome=tl_result.outcome if tl_result is not None else None,
+            identity_gate_status=eff_gate_status,
+            verified_tmdb_id=eff_tmdb,
+            verified_imdb_id=eff_imdb,
+            verified_title=eff_title,
+            verified_year=eff_year,
+            ack_chat_id=ret_resp.ack_chat_id,
+            ack_message_id=ret_resp.ack_message_id,
+            ack_thread_id=ret_resp.ack_thread_id,
+            eval_reply_status=final_eval_status,
+            pending_card_supersede=None,
+            pending_eval_reply=None,
+            radarr_status_snapshot=radarr.to_dict() if radarr is not None else None,
+            evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
+        )
+
     async def _deliver_card_and_eval_reply(
         self,
         *,
@@ -703,15 +884,19 @@ class IntakeWorker:
                     eval_reply_status="skipped",
                 )
                 return
-            if not has_unsent_eval_for_ack:
-                await asyncio.to_thread(
-                    self.db.finalize_release,
-                    release_id,
-                    worker_id=self.worker_id,
-                    state="completed",
-                    expected_incoming_digest=expected_digest,
-                )
-                return
+            rej_detail = "; ".join(classified.rejections[:3]) if classified.rejections else (rej_class or "quality_rejected")
+            await self._retire_acknowledged_card(
+                row=row,
+                release_id=release_id,
+                source_occurrence_id=source_occurrence_id,
+                expected_digest=expected_digest,
+                classified=classified,
+                retry_count=retry_count,
+                suppression_reason="quality_rejected",
+                retirement_note=f"Disqualified by later Radarr rejection: {rej_detail}",
+                prev_last_eval_digest=prev_last_eval_digest,
+            )
+            return
 
         alt_grab_eligible = False
         preferred_topic_kind: Optional[str] = None
@@ -729,15 +914,19 @@ class IntakeWorker:
                         eval_reply_status="skipped",
                     )
                     return
-                if not has_unsent_eval_for_ack:
-                    await asyncio.to_thread(
-                        self.db.finalize_release,
-                        release_id,
-                        worker_id=self.worker_id,
-                        state="completed",
-                        expected_incoming_digest=expected_digest,
-                    )
-                    return
+                rej_detail = "; ".join(classified.rejections[:3]) if classified.rejections else (rej_class or "quality_rejected")
+                await self._retire_acknowledged_card(
+                    row=row,
+                    release_id=release_id,
+                    source_occurrence_id=source_occurrence_id,
+                    expected_digest=expected_digest,
+                    classified=classified,
+                    retry_count=retry_count,
+                    suppression_reason="quality_rejected",
+                    retirement_note=f"Disqualified by later Radarr rejection: {rej_detail}",
+                    prev_last_eval_digest=prev_last_eval_digest,
+                )
+                return
             elif alt_cap is None:
                 if retry_count < 4:
                     await asyncio.to_thread(
@@ -759,21 +948,18 @@ class IntakeWorker:
                         suppression_reason="quality_rejected",
                         eval_reply_status="skipped",
                     )
-                elif not has_unsent_eval_for_ack:
-                    await asyncio.to_thread(
-                        self.db.finalize_release,
-                        release_id,
-                        worker_id=self.worker_id,
-                        state="completed",
-                        expected_incoming_digest=expected_digest,
-                    )
                 else:
-                    await asyncio.to_thread(
-                        self.db.finalize_release,
-                        release_id,
-                        worker_id=self.worker_id,
-                        state="failed_terminal",
-                        expected_incoming_digest=expected_digest,
+                    rej_detail = "; ".join(classified.rejections[:3]) if classified.rejections else (rej_class or "quality_rejected")
+                    await self._retire_acknowledged_card(
+                        row=row,
+                        release_id=release_id,
+                        source_occurrence_id=source_occurrence_id,
+                        expected_digest=expected_digest,
+                        classified=classified,
+                        retry_count=retry_count,
+                        suppression_reason="quality_rejected",
+                        retirement_note=f"Disqualified by later Radarr rejection: {rej_detail}",
+                        prev_last_eval_digest=prev_last_eval_digest,
                     )
                 return
             else:
@@ -887,20 +1073,20 @@ class IntakeWorker:
                 alt_grab_rejection_class=rej_class,
             )
             if delivery_mode == "suppress":
-                if has_acknowledged_card and not has_unsent_eval_for_ack:
-                    await asyncio.to_thread(
-                        self.db.finalize_release,
-                        release_id,
-                        worker_id=self.worker_id,
-                        state="completed",
-                        expected_incoming_digest=expected_digest,
-                        tl_outcome=tl_result.outcome,
-                        identity_gate_status="verified",
-                        verified_tmdb_id=movie.tmdb_id,
-                        verified_imdb_id=movie.imdb_id,
-                        verified_title=movie.title,
-                        verified_year=movie.year,
-                        radarr_status_snapshot=radarr.to_dict(),
+                if has_acknowledged_card:
+                    await self._retire_acknowledged_card(
+                        row=row,
+                        release_id=release_id,
+                        source_occurrence_id=source_occurrence_id,
+                        expected_digest=expected_digest,
+                        classified=classified,
+                        retry_count=retry_count,
+                        suppression_reason=suppression_reason or "radarr_suppressed",
+                        retirement_note=f"Disqualified by Radarr state ({suppression_reason or radarr.status})",
+                        tl_result=tl_result,
+                        movie=movie,
+                        radarr=radarr,
+                        prev_last_eval_digest=prev_last_eval_digest,
                     )
                     return
                 await asyncio.to_thread(
@@ -1528,21 +1714,22 @@ class IntakeWorker:
                 alt_grab_rejection_class=rej_class,
             )
             if delivery_mode == "suppress":
-                if has_acknowledged_card and not has_unsent_eval_for_ack:
-                    await asyncio.to_thread(
-                        self.db.finalize_release,
-                        release_id,
-                        worker_id=self.worker_id,
-                        state="completed",
-                        expected_incoming_digest=expected_digest,
-                        full_evidence_digest=full_digest,
-                        tl_outcome=tl_result.outcome,
-                        identity_gate_status="verified",
-                        verified_tmdb_id=movie.tmdb_id,
-                        verified_imdb_id=movie.imdb_id,
-                        verified_title=movie.title,
-                        verified_year=movie.year,
-                        radarr_status_snapshot=radarr.to_dict(),
+                if has_acknowledged_card:
+                    await self._retire_acknowledged_card(
+                        row=row,
+                        release_id=release_id,
+                        source_occurrence_id=source_occurrence_id,
+                        expected_digest=expected_digest,
+                        classified=classified,
+                        retry_count=retry_count,
+                        suppression_reason=suppression_reason or "radarr_suppressed",
+                        retirement_note=f"Disqualified by Radarr state ({suppression_reason or radarr.status})",
+                        tl_result=tl_result,
+                        movie=movie,
+                        radarr=radarr,
+                        full_digest=full_digest,
+                        eval_res=eval_res,
+                        prev_last_eval_digest=prev_last_eval_digest,
                     )
                     return
                 await asyncio.to_thread(

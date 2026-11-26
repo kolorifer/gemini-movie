@@ -2796,6 +2796,417 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     assert row_unsent is not None
                     self.assertEqual(row_unsent["eval_reply_status"], "pending")
 
+    async def test_issue_13_2a_and_2b_retired_card_and_final_button_rechecks_after_get(self) -> None:
+        """Issue #13 §2a & §2b: Card retirement, post-GET Radarr drift checks, and Watched-then-Grab block."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            intake_push = ShadowStubIntakePushClient()
+            app = create_actions_app(
+                cfg,
+                telegram_client=tg,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=intake_push,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. §2a: Deliver actionable_grab rev 1 + eval reply -> retire at rev 2 -> buttons removed & 410!
+                    r_del1 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-retire-1",
+                            card_revision=1,
+                            tmdb_id=910001,
+                            imdb_id="tt9100010",
+                            title="Retire Film",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_del1.status_code, 200)
+                    ack_r1 = r_del1.json()
+                    toks_r1 = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+                    self.assertIn("add_grab", toks_r1)
+                    self.assertIn("watched_good", toks_r1)
+
+                    r_eval1 = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-retire-1",
+                            "card_revision": 1,
+                            "ack_chat_id": ack_r1["ack_chat_id"],
+                            "ack_message_id": ack_r1["ack_message_id"],
+                            "evaluation": {
+                                "identification": {"canonical_title": "Retire Film", "year": 2025},
+                                "ratings": {},
+                                "decision_aid": {"verdict": "MAYBE", "verdict_reason": "Initial eval"},
+                            },
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval1.status_code, 200)
+
+                    r_ret2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-retire-1",
+                            card_revision=2,
+                            delivery_kind="retired",
+                            tmdb_id=910001,
+                            imdb_id="tt9100010",
+                            title="Retire Film",
+                            poster_path=None,
+                            extra={
+                                "radarr_note": "Disqualified by later Radarr rejection: Quality is not wanted in profile",
+                                "conflict_reason": "Disqualified by later Radarr rejection: Quality is not wanted in profile",
+                                "preserve_eval_reply": True,
+                            },
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_ret2.status_code, 200)
+                    self.assertTrue(r_ret2.json().get("eval_reply_preserved"))
+                    self.assertEqual(tg.edited_texts[-1]["reply_markup"], {"inline_keyboard": []})
+                    self.assertIn("Proposal Retired", tg.edited_texts[-1]["text_html"])
+
+                    # Pressing retired buttons MUST return 410 with ZERO Radarr writes
+                    r_post_ret = await client.post(
+                        f"/action/{toks_r1['add_grab']}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_post_ret.status_code, 410)
+                    self.assertEqual(len(radarr.add_calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2. §2b: State changes AFTER GET confirmation page opens!
+                    r_del2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-drift-2",
+                            card_revision=1,
+                            tmdb_id=910002,
+                            imdb_id="tt9100020",
+                            title="Drift Film",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_del2.status_code, 200)
+                    toks_d2 = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+
+                    # Open GET while movie is ABSENT -> 200 confirmation page opens!
+                    r_get_open = await client.get(f"/action/{toks_d2['add_grab']}")
+                    self.assertEqual(r_get_open.status_code, 200)
+
+                    # 2a) After GET opened, movie becomes watched + unmonitored in Radarr -> POST MUST refuse 409!
+                    radarr.movies[92] = {
+                        "id": 92,
+                        "tmdbId": 910002,
+                        "imdbId": "tt9100020",
+                        "title": "Drift Film",
+                        "monitored": False,
+                        "hasFile": False,
+                        "tags": [7],  # watched
+                    }
+                    r_post_watched = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_post_watched.status_code, 409)
+                    self.assertIn("watched", r_post_watched.text.lower())
+                    self.assertEqual(len(radarr.add_calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2b) Movie now owns a file (hasFile=True, monitored=True) -> POST MUST refuse 409!
+                    radarr.movies[92].update({"monitored": True, "hasFile": True, "tags": []})
+                    r_post_owned = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_owned.status_code, 409)
+                    self.assertIn("file", r_post_owned.text.lower())
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2c) Movie's IMDb ID on its TMDb row drifted -> POST MUST refuse 409 (both Grab & Watched)!
+                    radarr.movies[92].update({"monitored": True, "hasFile": False, "imdbId": "tt9999999", "tags": []})
+                    r_post_imdb_drift = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_imdb_drift.status_code, 409)
+                    self.assertIn("imdb", r_post_imdb_drift.text.lower())
+                    r_post_watched_drift = await client.post(
+                        f"/action/{toks_d2['watched_good']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_watched_drift.status_code, 409)
+                    self.assertEqual(len(radarr.push_calls), 0)
+                    self.assertEqual(len(radarr.update_calls), 0)
+
+                    # 2d) Control: monitored movie with NO file & matching IMDb remains eligible -> succeeds!
+                    radarr.movies[92].update({"monitored": True, "hasFile": False, "imdbId": "tt9100020", "tags": []})
+                    r_post_ok = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_ok.status_code, 200)
+                    self.assertEqual(len(radarr.push_calls), 1)
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(fb.calls[-1]["note"], "Grabbed via Telegram")
+
+                    # 3. §2b: Watched Good / Bad followed by pressing previously issued Grab link -> 409 blocked!
+                    for suffix, watched_key, expected_dec, tid, iid in (
+                        ("good", "watched_good", "watch", 910003, "tt9100030"),
+                        ("bad", "watched_bad", "skip", 910004, "tt9100040"),
+                    ):
+                        r_del_w = await client.post(
+                            "/internal/deliver/card",
+                            json=_verified_card_payload(
+                                release_id=f"rel-watched-then-grab-{suffix}",
+                                card_revision=1,
+                                tmdb_id=tid,
+                                imdb_id=iid,
+                                title=f"Watched Block {suffix}",
+                                poster_path=None,
+                            ),
+                            headers=headers,
+                        )
+                        self.assertEqual(r_del_w.status_code, 200)
+                        toks_w = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+
+                        # Open Grab confirmation page BEFORE clicking Watched
+                        r_get_g = await client.get(f"/action/{toks_w['add_grab']}")
+                        self.assertEqual(r_get_g.status_code, 200)
+
+                        # User clicks Watched Good / Bad -> succeeds in Radarr + feedback
+                        r_w_post = await client.post(
+                            f"/action/{toks_w[watched_key]}",
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        self.assertEqual(r_w_post.status_code, 200)
+                        self.assertEqual(fb.calls[-1]["decision"], expected_dec)
+                        self.assertEqual(fb.calls[-1]["note"], "watched")
+
+                        # Now user submits the previously opened Grab link -> MUST refuse 409, ZERO pushes!
+                        pushes_before = len(radarr.push_calls)
+                        r_g_after_w = await client.post(
+                            f"/action/{toks_w['add_grab']}",
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        self.assertEqual(r_g_after_w.status_code, 409)
+                        self.assertIn("watched", r_g_after_w.text.lower())
+                        self.assertEqual(len(radarr.push_calls), pushes_before)
+
+    async def test_issue_13_4b_and_4c_alt_grab_strictness_and_missing_timestamp_reconciliation(self) -> None:
+        """Issue #13 §4b & §4c: Raw rejection validation, positive qBit autorun=false, and strict reconcile timestamps."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alt_cfg_path = self._write_alt_grab_config(tmpdir)
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            qbit = ShadowStubQbitClient(category="movies")
+
+            valid_torrent = _build_synthetic_v1_torrent(b"Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP.mkv")
+            fetcher = ShadowStubTorrentFetcher(torrent_bytes=valid_torrent)
+
+            class _MapPushStub(ShadowStubIntakePushClient):
+                async def fetch_push_payload(
+                    self, *, release_id: str, source_occurrence_id: str
+                ) -> IntakePushPayloadResult:
+                    return IntakePushPayloadResult(
+                        ok=True,
+                        push_payload={
+                            "title": "Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            "downloadUrl": "https://www.torrentleech.org/rss/download/920001/QBIT_SECRET_PASS/Strict.torrent",
+                            "protocol": "torrent",
+                            "publishDate": "2026-11-26T00:00:00Z",
+                            "indexer": "TorrentLeech",
+                        },
+                    )
+
+            radarr.download_clients = [
+                {
+                    "id": 1,
+                    "enable": True,
+                    "implementation": "QBittorrent",
+                    "fields": [
+                        {"name": "host", "value": "qbit.seedbox.invalid"},
+                        {"name": "port", "value": 443},
+                        {"name": "useSsl", "value": True},
+                        {"name": "urlBase", "value": "/qbittorrent"},
+                        {"name": "movieCategory", "value": "movies"},
+                    ],
+                }
+            ]
+            radarr.movies[88] = {
+                "id": 88,
+                "tmdbId": 920001,
+                "imdbId": "tt9200010",
+                "title": "Strict Film",
+                "year": 2025,
+                "monitored": True,
+                "qualityProfileId": 4,
+                "hasFile": True,
+                "tags": [],
+                "movieFile": {
+                    "id": 880,
+                    "relativePath": "Strict.Film.2025.1080p.BluRay.REMUX.mkv",
+                    "edition": "",
+                    "releaseGroup": "OLDGRP",
+                    "size": 30_000_000_000,
+                    "quality": {"quality": {"name": "Remux-1080p"}},
+                },
+            }
+            app = create_actions_app(
+                cfg,
+                telegram_client=tg,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=_MapPushStub(),
+                qbit_client=qbit,
+                torrent_fetcher=fetcher,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. §4b: Malformed non-string rejection entries MUST be refused at /internal/deliver/card (422)
+                    bad_alt_card = _verified_card_payload(
+                        release_id="rel-alt-bad-rej",
+                        delivery_kind="alternative_grab",
+                        tmdb_id=920001,
+                        imdb_id="tt9200010",
+                        title="Strict Film",
+                        release_name="Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP",
+                        poster_path=None,
+                        extra={
+                            "indexer": "TorrentLeech",
+                            "external_id": "920001",
+                            "bound_existing_movie_id": 88,
+                            "bound_existing_file_id": 880,
+                            "bound_rejection_class": "cutoff_met",
+                            "rejection_reasons": ["Existing file meets cutoff: Remux-1080p", 999],
+                            "bound_movie_file_snapshot": {
+                                "movie_id": 88,
+                                "file_id": 880,
+                                "monitored": True,
+                                "quality_profile_id": 4,
+                                "relative_path": "Strict.Film.2025.1080p.BluRay.REMUX.mkv",
+                                "edition": "",
+                                "release_group": "OLDGRP",
+                                "size": 30_000_000_000,
+                                "quality": "Remux-1080p",
+                            },
+                        },
+                    )
+                    r_bad = await client.post("/internal/deliver/card", json=bad_alt_card, headers=headers)
+                    self.assertEqual(r_bad.status_code, 400)
+
+                    # 2. §4b: Missing qBittorrent autorun preference keys MUST refuse (409) with 0 adds!
+                    good_alt_card = dict(bad_alt_card)
+                    good_alt_card["release_id"] = "rel-alt-missing-prefs"
+                    good_alt_card["rejection_reasons"] = ["Existing file meets cutoff: Remux-1080p"]
+                    r_ok_card = await client.post("/internal/deliver/card", json=good_alt_card, headers=headers)
+                    self.assertEqual(r_ok_card.status_code, 200)
+                    alt_tok = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["alternative_grab"]
+
+                    for bad_prefs in (
+                        {},
+                        {"autorun_enabled": False},  # missing autorun_on_torrent_added_enabled
+                        {"autorun_on_torrent_added_enabled": False},  # missing autorun_enabled
+                        {"autorun_enabled": None, "autorun_on_torrent_added_enabled": False},
+                        {"autorun_enabled": False, "autorun_on_torrent_added_enabled": "false"},
+                    ):
+                        qbit.preferences = dict(bad_prefs)
+                        r_pref = await client.post(f"/action/{alt_tok}", data={"confirm": "1"})
+                        self.assertEqual(r_pref.status_code, 409, f"Expected 409 for prefs={bad_prefs!r}")
+                        self.assertEqual(len(qbit.add_calls), 0)
+
+                    # 3. §4c: Ambiguous Radarr push reconciliation MUST reject absent/unreadable/stale timestamps
+                    # and NEVER emit 'Grabbed via Telegram' feedback when uncertain!
+                    rel_name = "Timestamp.Strict.2025.2160p.UHD.BluRay.REMUX-GRP"
+                    radarr.movies[99] = {
+                        "id": 99,
+                        "tmdbId": 920002,
+                        "imdbId": "tt9200020",
+                        "title": "Timestamp Strict",
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    r_ts_card = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-ts-strict",
+                            tmdb_id=920002,
+                            imdb_id="tt9200020",
+                            title="Timestamp Strict",
+                            release_name=rel_name,
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_ts_card.status_code, 200)
+                    add_tok = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["add_grab"]
+
+                    # Trigger ambiguous release push (lost ack)
+                    radarr.push_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_push_ambiguous:ReadTimeout")
+                    )
+                    r_amb = await client.post(f"/action/{add_tok}", data={"confirm": "1"})
+                    self.assertEqual(r_amb.status_code, 503)
+                    self.assertEqual(len(radarr.push_calls), 1)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3a) Queue/history/file match by release name with MISSING timestamps -> stays ambiguous_radarr!
+                    radarr.queue = [{"movieId": 99, "title": rel_name}]
+                    radarr.history = [{"movieId": 99, "eventType": "grabbed", "sourceTitle": rel_name, "data": {}}]
+                    radarr.movies[99]["movieFile"] = {"id": 990, "sceneName": rel_name}
+                    r_rec_missing = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_missing.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_missing.text)
+                    self.assertEqual(len(fb.calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 1)
+
+                    # 3b) UNREADABLE timestamps -> stays ambiguous_radarr, 0 feedback!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": "not-a-timestamp"}]
+                    radarr.history = [
+                        {"movieId": 99, "eventType": "grabbed", "sourceTitle": rel_name, "date": "bad-date", "data": {}}
+                    ]
+                    radarr.movies[99]["movieFile"] = {"id": 990, "sceneName": rel_name, "dateAdded": "???"}
+                    r_rec_bad = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_bad.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_bad.text)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3c) Stale timestamp (from 2020) -> stays ambiguous_radarr, 0 feedback!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": "2020-01-01T00:00:00Z"}]
+                    radarr.history = []
+                    radarr.movies[99].pop("movieFile", None)
+                    r_rec_stale = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_stale.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_stale.text)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3d) Valid in-window timestamp + exact release -> reconciles cleanly & sends feedback ONCE!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": utc_now_iso()}]
+                    r_rec_ok = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_ok.status_code, 200)
+                    self.assertNotIn("ambiguous_radarr", r_rec_ok.text)
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(fb.calls[0]["note"], "Grabbed via Telegram")
+                    self.assertEqual(len(radarr.push_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
