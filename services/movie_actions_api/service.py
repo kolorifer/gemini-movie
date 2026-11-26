@@ -8,13 +8,23 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Optional
 
+from .alternative_grab import (
+    QBittorrentClient,
+    TorrentFetcher,
+    build_movie_file_snapshot,
+    compare_movie_file_snapshots,
+    read_alt_grab_receipt,
+    validate_legacy_alt_grab_source,
+    validate_radarr_qbit_route,
+    write_alt_grab_receipt,
+)
 from .clients import (
     IntakePushClient,
     RadarrClient,
     TelegramClient,
     TriageFeedbackClient,
 )
-from .config import QUALITY_ONLY_REJECTION_CLASSES, ActionsConfig, AlternativeGrabPolicy
+from .config import ActionsConfig, AlternativeGrabConfig
 from .db import (
     ActionGroupSnapshot,
     ActionsDB,
@@ -25,7 +35,7 @@ from .db import (
     utc_now_iso,
 )
 from .html_views import render_confirmation_page, render_simple_status_page
-from .security import hash_token, mint_opaque_token, redact_secrets
+from .security import PrivateFileError, hash_token, mint_opaque_token, redact_secrets
 from .telegram_format import (
     TELEGRAM_CAPTION_UTF16_LIMIT,
     TELEGRAM_TEXT_UTF16_LIMIT,
@@ -40,6 +50,7 @@ logger = logging.getLogger(__name__)
 _NORM_SPACE_RE = re.compile(r"[\s._-]+")
 _MEDIA_EXT_RE = re.compile(r"\.(?:mkv|mp4|m2ts|iso|avi|ts|mov|wmv|torrent)$", re.IGNORECASE)
 _SAFE_GUID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[a-z0-9][a-z0-9._-]{0,127}$", re.IGNORECASE)
+_IMDB_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
 
 
 class DeliveryValidationError(ValueError):
@@ -111,7 +122,7 @@ def _find_watched_tag_id(tags: list[dict[str, Any]]) -> Optional[int]:
 
 def _feedback_spec_for_action(action_type: str) -> Optional[tuple[str, str]]:
     """Return (decision, note) for action types that post to movie-triage-api /feedback."""
-    if action_type in ("add_grab", "alternative_grab"):
+    if action_type == "add_grab":
         return ("watch", "Grabbed via Telegram")
     if action_type == "watched_good":
         return ("watch", "watched")
@@ -119,12 +130,12 @@ def _feedback_spec_for_action(action_type: str) -> Optional[tuple[str, str]]:
         return ("skip", "watched")
     if action_type == "skip":
         return ("skip", "Skipped via Telegram")
-    # watched_legacy_unrated sends NO feedback
+    # alternative_grab and watched_legacy_unrated send NO evaluator feedback
     return None
 
 
 class ActionsService:
-    """Authoritative coordinator for Radarr reads/writes, Telegram deliveries, actions, and feedback."""
+    """Authoritative coordinator for Radarr reads/writes, Telegram deliveries, actions, qBit alt-grab, and feedback."""
 
     def __init__(
         self,
@@ -136,7 +147,9 @@ class ActionsService:
         telegram_client: TelegramClient,
         intake_push_client: IntakePushClient,
         triage_feedback_client: TriageFeedbackClient,
-        alt_grab_policy: AlternativeGrabPolicy,
+        alt_grab_config: Optional[AlternativeGrabConfig] = None,
+        torrent_fetcher: Optional[TorrentFetcher] = None,
+        qbit_client: Optional[QBittorrentClient] = None,
     ) -> None:
         self.config = config
         self.db = db
@@ -145,7 +158,13 @@ class ActionsService:
         self.telegram = telegram_client
         self.intake_push = intake_push_client
         self.triage_feedback = triage_feedback_client
-        self.alt_grab_policy = alt_grab_policy
+        self.alt_grab_config = alt_grab_config
+        self.torrent_fetcher = torrent_fetcher
+        self.qbit_client = qbit_client
+
+    @property
+    def alternative_grab_configured(self) -> bool:
+        return self.alt_grab_config is not None
 
     def _lease_iso(self, upstream_timeout: float) -> str:
         seconds = upstream_timeout + self.config.write_lease_grace_seconds
@@ -164,57 +183,110 @@ class ActionsService:
     ) -> dict[str, Any]:
         clean_imdb = imdb_id.strip().lower() if imdb_id and imdb_id.strip() else None
         if tmdb_id is None and not clean_imdb:
-            return {"status": "ambiguous", "detail": "missing_movie_identifiers"}
+            return {
+                "status": "ambiguous",
+                "alternative_grab_configured": self.alternative_grab_configured,
+                "detail": "missing_movie_identifiers",
+            }
 
         tags_res = await self.radarr.get_tags()
         if not tags_res.ok:
-            return {"status": "lookup_failed", "detail": tags_res.error_redacted or "radarr_tags_failed"}
+            return {
+                "status": "lookup_failed",
+                "alternative_grab_configured": self.alternative_grab_configured,
+                "detail": tags_res.error_redacted or "radarr_tags_failed",
+            }
         watched_tag_id = _find_watched_tag_id(tags_res.data)
 
         matched_movie: Optional[dict[str, Any]] = None
         if tmdb_id is not None:
             m_res = await self.radarr.get_movies_by_tmdb(tmdb_id)
             if not m_res.ok:
-                return {"status": "lookup_failed", "detail": m_res.error_redacted or "radarr_tmdb_lookup_failed"}
+                return {
+                    "status": "lookup_failed",
+                    "alternative_grab_configured": self.alternative_grab_configured,
+                    "detail": m_res.error_redacted or "radarr_tmdb_lookup_failed",
+                }
             movies = [m for m in m_res.data if isinstance(m, dict)]
             if len(movies) > 1:
-                return {"status": "ambiguous", "detail": "multiple_radarr_movies_for_tmdb_id"}
+                return {
+                    "status": "ambiguous",
+                    "alternative_grab_configured": self.alternative_grab_configured,
+                    "detail": "multiple_radarr_movies_for_tmdb_id",
+                }
             if len(movies) == 1:
                 candidate = movies[0]
                 cand_imdb = str(candidate.get("imdbId") or "").strip().lower()
                 if clean_imdb and cand_imdb and cand_imdb != clean_imdb:
-                    return {"status": "ambiguous", "detail": "radarr_imdb_id_mismatch"}
+                    return {
+                        "status": "ambiguous",
+                        "alternative_grab_configured": self.alternative_grab_configured,
+                        "detail": "radarr_imdb_id_mismatch",
+                    }
                 matched_movie = candidate
             elif clean_imdb:
                 # Cross-check imdbId before declaring absence so conflicting entries are caught
                 i_res = await self.radarr.get_movies_by_imdb(clean_imdb)
                 if not i_res.ok:
-                    return {"status": "lookup_failed", "detail": i_res.error_redacted or "radarr_imdb_lookup_failed"}
+                    return {
+                        "status": "lookup_failed",
+                        "alternative_grab_configured": self.alternative_grab_configured,
+                        "detail": i_res.error_redacted or "radarr_imdb_lookup_failed",
+                    }
                 i_movies = [m for m in i_res.data if isinstance(m, dict)]
                 if len(i_movies) > 1:
-                    return {"status": "ambiguous", "detail": "multiple_radarr_movies_for_imdb_id"}
+                    return {
+                        "status": "ambiguous",
+                        "alternative_grab_configured": self.alternative_grab_configured,
+                        "detail": "multiple_radarr_movies_for_imdb_id",
+                    }
                 if len(i_movies) == 1:
                     cand = i_movies[0]
                     cand_tmdb = cand.get("tmdbId")
                     if isinstance(cand_tmdb, int) and not isinstance(cand_tmdb, bool) and cand_tmdb != tmdb_id:
-                        return {"status": "ambiguous", "detail": "radarr_tmdb_id_mismatch_on_imdb_match"}
+                        return {
+                            "status": "ambiguous",
+                            "alternative_grab_configured": self.alternative_grab_configured,
+                            "detail": "radarr_tmdb_id_mismatch_on_imdb_match",
+                        }
                     matched_movie = cand
         elif clean_imdb:
             i_res = await self.radarr.get_movies_by_imdb(clean_imdb)
             if not i_res.ok:
-                return {"status": "lookup_failed", "detail": i_res.error_redacted or "radarr_imdb_lookup_failed"}
+                return {
+                    "status": "lookup_failed",
+                    "alternative_grab_configured": self.alternative_grab_configured,
+                    "detail": i_res.error_redacted or "radarr_imdb_lookup_failed",
+                }
             i_movies = [m for m in i_res.data if isinstance(m, dict)]
             if len(i_movies) > 1:
-                return {"status": "ambiguous", "detail": "multiple_radarr_movies_for_imdb_id"}
+                return {
+                    "status": "ambiguous",
+                    "alternative_grab_configured": self.alternative_grab_configured,
+                    "detail": "multiple_radarr_movies_for_imdb_id",
+                }
             if len(i_movies) == 1:
                 matched_movie = i_movies[0]
 
         if matched_movie is None:
-            return {"status": "absent", "movie_id": None, "file_id": None, "existing_quality": None, "detail": None}
+            return {
+                "status": "absent",
+                "movie_id": None,
+                "file_id": None,
+                "existing_quality": None,
+                "monitored": None,
+                "movie_file_snapshot": None,
+                "alternative_grab_configured": self.alternative_grab_configured,
+                "detail": None,
+            }
 
         movie_id = matched_movie.get("id")
         if not isinstance(movie_id, int) or isinstance(movie_id, bool) or movie_id <= 0:
-            return {"status": "ambiguous", "detail": "radarr_movie_missing_valid_id"}
+            return {
+                "status": "ambiguous",
+                "alternative_grab_configured": self.alternative_grab_configured,
+                "detail": "radarr_movie_missing_valid_id",
+            }
 
         raw_tags = matched_movie.get("tags")
         movie_tags = [t for t in raw_tags if isinstance(t, int) and not isinstance(t, bool)] if isinstance(raw_tags, list) else []
@@ -230,14 +302,21 @@ class ActionsService:
                 "movie_id": movie_id,
                 "file_id": file_id,
                 "existing_quality": existing_quality,
+                "monitored": monitored,
+                "movie_file_snapshot": None,
+                "alternative_grab_configured": self.alternative_grab_configured,
                 "detail": "watched_tag_unmonitored",
             }
         if has_file:
+            mf_snap = build_movie_file_snapshot(matched_movie)
             return {
                 "status": "owned_file",
                 "movie_id": movie_id,
                 "file_id": file_id,
                 "existing_quality": existing_quality,
+                "monitored": monitored,
+                "movie_file_snapshot": mf_snap,
+                "alternative_grab_configured": self.alternative_grab_configured,
                 "detail": "has_file",
             }
         if monitored:
@@ -246,6 +325,9 @@ class ActionsService:
                 "movie_id": movie_id,
                 "file_id": None,
                 "existing_quality": None,
+                "monitored": True,
+                "movie_file_snapshot": None,
+                "alternative_grab_configured": self.alternative_grab_configured,
                 "detail": "monitored_without_file",
             }
         return {
@@ -253,6 +335,9 @@ class ActionsService:
             "movie_id": movie_id,
             "file_id": None,
             "existing_quality": None,
+            "monitored": False,
+            "movie_file_snapshot": None,
+            "alternative_grab_configured": self.alternative_grab_configured,
             "detail": "existing_unmonitored_no_file_unwatched",
         }
 
@@ -308,21 +393,49 @@ class ActionsService:
         bound_existing_file_id: Optional[int] = None
         bound_existing_file_quality: Optional[str] = None
         bound_rejection_class: Optional[str] = None
+        bound_snapshot_json: Optional[str] = None
+
+        clean_imdb = (
+            str(verified_imdb).strip().lower()
+            if isinstance(verified_imdb, str) and verified_imdb.strip()
+            else None
+        )
+        clean_year = (
+            verified_year
+            if isinstance(verified_year, int) and not isinstance(verified_year, bool)
+            else None
+        )
 
         if delivery_kind == "alternative_grab":
+            if not self.alternative_grab_configured:
+                raise DeliveryValidationError("Refused: Alternative Grab is not configured")
+            if not clean_imdb or not _IMDB_RE.fullmatch(clean_imdb):
+                raise DeliveryValidationError("Refused: alternative_grab requires valid verified_imdb_id")
+
             bound_existing_movie_id = card_payload.get("bound_existing_movie_id")
             bound_existing_file_id = card_payload.get("bound_existing_file_id")
-            bound_rejection_class = str(card_payload.get("bound_rejection_class") or "").strip().lower()
-            raw_q = card_payload.get("bound_existing_file_quality")
-            bound_existing_file_quality = str(raw_q).strip() if isinstance(raw_q, str) and raw_q.strip() else None
+            raw_reasons = card_payload.get("rejection_reasons")
+            reasons_list = [str(r).strip() for r in raw_reasons] if isinstance(raw_reasons, list) else []
+            indexer_str = str(card_payload.get("indexer") or "").strip()
+            external_id_str = str(card_payload.get("external_id") or "").strip()
 
-            if not self.alt_grab_policy.enabled:
-                raise DeliveryValidationError("Refused: Alternative Grab policy is disabled")
-            if (
-                bound_rejection_class not in QUALITY_ONLY_REJECTION_CLASSES
-                or bound_rejection_class not in self.alt_grab_policy.allowed_rejection_classes
-            ):
-                raise DeliveryValidationError("Refused: bound_rejection_class is not allowed by Alternative Grab policy")
+            src_ok, matched_classes, src_reason = validate_legacy_alt_grab_source(
+                indexer=indexer_str,
+                external_id=external_id_str,
+                exact_release_name=exact_release_name,
+                title=verified_title,
+                year=clean_year,
+                rejections=reasons_list,
+            )
+            if not src_ok:
+                raise DeliveryValidationError(f"Refused: alternative_grab source/rejection check failed ({src_reason})")
+            bound_rejection_class = matched_classes[0]
+
+            mf_snap = card_payload.get("bound_movie_file_snapshot")
+            if not isinstance(mf_snap, dict):
+                raise DeliveryValidationError("Refused: alternative_grab requires bound_movie_file_snapshot")
+            if mf_snap.get("monitored") is not True:
+                raise DeliveryValidationError("Refused: alternative_grab requires a monitored Radarr movie")
             if (
                 not isinstance(bound_existing_movie_id, int)
                 or isinstance(bound_existing_movie_id, bool)
@@ -330,10 +443,39 @@ class ActionsService:
                 or not isinstance(bound_existing_file_id, int)
                 or isinstance(bound_existing_file_id, bool)
                 or bound_existing_file_id <= 0
+                or mf_snap.get("movie_id") != bound_existing_movie_id
+                or mf_snap.get("file_id") != bound_existing_file_id
             ):
                 raise DeliveryValidationError(
-                    "Refused: alternative_grab requires positive bound_existing_movie_id and bound_existing_file_id"
+                    "Refused: alternative_grab requires matching positive movie_id and file_id in snapshot"
                 )
+            for req_int in ("quality_profile_id", "size"):
+                val = mf_snap.get(req_int)
+                if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                    raise DeliveryValidationError(f"Refused: alternative_grab snapshot missing valid {req_int}")
+            if not isinstance(mf_snap.get("relative_path"), str) or not mf_snap["relative_path"].strip():
+                raise DeliveryValidationError("Refused: alternative_grab snapshot missing relative_path")
+            if not isinstance(mf_snap.get("quality"), str) or not mf_snap["quality"].strip():
+                raise DeliveryValidationError("Refused: alternative_grab snapshot missing quality")
+
+            bound_existing_file_quality = str(mf_snap["quality"]).strip()
+            bound_snapshot_obj = {
+                "snapshot": {
+                    "movie_id": bound_existing_movie_id,
+                    "file_id": bound_existing_file_id,
+                    "monitored": True,
+                    "quality_profile_id": int(mf_snap["quality_profile_id"]),
+                    "relative_path": str(mf_snap["relative_path"]).strip(),
+                    "edition": str(mf_snap.get("edition") or "").strip(),
+                    "release_group": str(mf_snap.get("release_group") or "").strip(),
+                    "size": int(mf_snap["size"]),
+                    "quality": bound_existing_file_quality,
+                },
+                "rejection_reasons": reasons_list,
+                "indexer": indexer_str,
+                "external_id": external_id_str,
+            }
+            bound_snapshot_json = json.dumps(bound_snapshot_obj, sort_keys=True, separators=(",", ":"))
 
         expires_at = utc_now_iso(utc_now() + timedelta(seconds=self.config.action_ttl_seconds))
         action_types_to_mint: list[str] = []
@@ -347,16 +489,6 @@ class ActionsService:
 
         records: list[NewActionRecord] = []
         raw_tokens: dict[str, str] = {}
-        clean_imdb = (
-            str(verified_imdb).strip().lower()
-            if isinstance(verified_imdb, str) and verified_imdb.strip()
-            else None
-        )
-        clean_year = (
-            verified_year
-            if isinstance(verified_year, int) and not isinstance(verified_year, bool)
-            else None
-        )
 
         for act_type in action_types_to_mint:
             raw_tok = mint_opaque_token()
@@ -389,6 +521,7 @@ class ActionsService:
                     bound_existing_file_quality=bound_existing_file_quality if act_type == "alternative_grab" else None,
                     bound_rejection_class=bound_rejection_class if act_type == "alternative_grab" else None,
                     expires_at=expires_at,
+                    bound_snapshot_json=bound_snapshot_json if act_type == "alternative_grab" else None,
                 )
             )
         return records, raw_tokens
@@ -402,7 +535,14 @@ class ActionsService:
         target_chat_id = self.config.telegram_chat_id
         if not target_chat_id:
             return {"status": "failed", "detail": "telegram_chat_id_not_configured"}
-        target_thread_id = self.config.topic_for_delivery_kind(delivery_kind)
+        preferred_topic = (
+            str(card_payload.get("preferred_topic_kind") or "").strip() or None
+            if self.alternative_grab_configured
+            else None
+        )
+        target_thread_id = self.config.topic_for_delivery_kind(
+            delivery_kind, preferred_topic_kind=preferred_topic
+        )
 
         plan = await asyncio.to_thread(
             self.db.begin_card_delivery,
@@ -800,6 +940,22 @@ class ActionsService:
                 ),
             )
 
+        if act_type == "alternative_grab":
+            outcome_note = str(done_act.get("last_error_redacted") or "queued")
+            return HtmlResponseData(
+                status_code=200,
+                html=render_simple_status_page(
+                    title="Alternative Grab Completed",
+                    badge="completed_all",
+                    message=(
+                        f"Alternative Grab completed in qBittorrent ({outcome_note}). "
+                        "No Radarr mutations or evaluator feedback writes were made."
+                    ),
+                    tone="ok",
+                    details=details,
+                ),
+            )
+
         if fb_status == "saved" and fb_saved:
             msg = f"Radarr action completed and evaluator rating saved ({fb_saved})."
             if not same_action:
@@ -835,60 +991,118 @@ class ActionsService:
             ),
         )
 
+    def _parse_alt_grab_meta(self, action: dict[str, Any]) -> tuple[bool, Optional[dict[str, Any]], str]:
+        raw_json = action.get("bound_snapshot_json")
+        if not isinstance(raw_json, str) or not raw_json.strip():
+            return False, None, "Alternative Grab action lacks saved movie/file snapshot."
+        try:
+            meta = json.loads(raw_json)
+        except ValueError:
+            return False, None, "Alternative Grab snapshot metadata is corrupted."
+        if not isinstance(meta, dict):
+            return False, None, "Alternative Grab snapshot metadata is invalid."
+        snap = meta.get("snapshot")
+        reasons = meta.get("rejection_reasons")
+        indexer = str(meta.get("indexer") or "").strip()
+        external_id = str(meta.get("external_id") or "").strip()
+        if not isinstance(snap, dict) or not isinstance(reasons, list):
+            return False, None, "Alternative Grab snapshot or rejection reasons missing."
+        src_ok, _, src_reason = validate_legacy_alt_grab_source(
+            indexer=indexer,
+            external_id=external_id,
+            exact_release_name=str(action.get("bound_release_name") or ""),
+            title=str(action.get("bound_title") or ""),
+            year=action.get("bound_year"),
+            rejections=[str(r) for r in reasons],
+        )
+        if not src_ok:
+            return False, None, f"Alternative Grab source/rejection check failed ({src_reason})."
+        return True, {"snapshot": snap, "rejection_reasons": reasons, "indexer": indexer, "external_id": external_id}, "ok"
+
     async def _validate_alternative_grab_live(
         self,
         action: dict[str, Any],
-    ) -> tuple[bool, Optional[dict[str, Any]], int, str]:
-        """Revalidate exact movie/file/policy for alternative_grab. Returns (ok, movie, http_code, message)."""
-        rej_class = str(action.get("bound_rejection_class") or "").strip().lower()
-        if (
-            not self.alt_grab_policy.enabled
-            or rej_class not in QUALITY_ONLY_REJECTION_CLASSES
-            or rej_class not in self.alt_grab_policy.allowed_rejection_classes
-        ):
-            return False, None, 409, "Alternative Grab policy no longer permits this rejection class."
+    ) -> tuple[bool, Optional[dict[str, Any]], Optional[dict[str, Any]], int, str]:
+        """
+        Revalidate exact legacy Alternative Grab invariants against live Radarr movie/file snapshot
+        and single-enabled HTTPS qBittorrent download client route.
+        Returns (ok, movie, meta, http_code, message).
+        """
+        if self.alt_grab_config is None or self.qbit_client is None or self.torrent_fetcher is None:
+            return False, None, None, 409, "Alternative Grab is not configured on this service."
+
+        meta_ok, meta, meta_msg = self._parse_alt_grab_meta(action)
+        if not meta_ok or meta is None:
+            return False, None, None, 409, meta_msg
 
         tmdb_id = action.get("bound_tmdb_id")
+        imdb_id = str(action.get("bound_imdb_id") or "").strip().lower()
         exp_movie_id = action.get("bound_existing_movie_id")
         exp_file_id = action.get("bound_existing_file_id")
         if not (
             isinstance(tmdb_id, int)
-            and isinstance(exp_movie_id, int)
-            and isinstance(exp_file_id, int)
+            and not isinstance(tmdb_id, bool)
             and tmdb_id > 0
+            and bool(_IMDB_RE.fullmatch(imdb_id))
+            and isinstance(exp_movie_id, int)
+            and not isinstance(exp_movie_id, bool)
             and exp_movie_id > 0
+            and isinstance(exp_file_id, int)
+            and not isinstance(exp_file_id, bool)
             and exp_file_id > 0
         ):
-            return False, None, 409, "Alternative Grab action lacks valid movie/file bindings."
+            return False, None, None, 409, "Alternative Grab action lacks valid verified movie/file bindings."
 
-        tags_res, movies_res = await asyncio.gather(
+        tags_res, movies_res, dl_res = await asyncio.gather(
             self.radarr.get_tags(),
             self.radarr.get_movies_by_tmdb(tmdb_id),
+            self.radarr.get_download_clients(),
         )
-        if not tags_res.ok or not movies_res.ok:
-            return False, None, 503, "Radarr is temporarily unreachable; cannot revalidate Alternative Grab."
+        if not tags_res.ok or not movies_res.ok or not dl_res.ok:
+            return False, None, None, 503, "Radarr is temporarily unreachable; cannot revalidate Alternative Grab."
 
         movies = [m for m in movies_res.data if isinstance(m, dict)]
         if len(movies) != 1:
-            return False, None, 409, "Existing Radarr movie no longer matches uniquely; Alternative Grab refused."
+            return False, None, None, 409, "Existing Radarr movie no longer matches uniquely; Alternative Grab refused."
         movie = movies[0]
         if movie.get("id") != exp_movie_id:
-            return False, None, 409, "Bound Radarr movie ID changed; Alternative Grab refused."
+            return False, None, None, 409, "Bound Radarr movie ID changed; Alternative Grab refused."
+        live_imdb = str(movie.get("imdbId") or "").strip().lower()
+        if live_imdb != imdb_id:
+            return False, None, None, 409, "Radarr movie IMDb ID does not match verified binding; Alternative Grab refused."
 
         watched_tag_id = _find_watched_tag_id(tags_res.data)
         m_tags = movie.get("tags") if isinstance(movie.get("tags"), list) else []
         if watched_tag_id is not None and watched_tag_id in m_tags and not bool(movie.get("monitored", False)):
-            return False, None, 409, "Movie is now marked watched and unmonitored; Alternative Grab refused."
+            return False, None, None, 409, "Movie is now marked watched and unmonitored; Alternative Grab refused."
 
-        cur_file_id = _extract_file_id(movie)
-        if not bool(movie.get("hasFile", False)) or cur_file_id != exp_file_id:
+        current_snap = build_movie_file_snapshot(movie)
+        if current_snap is None:
+            return False, None, None, 409, "Radarr movie is no longer monitored with a valid existing file; Alternative Grab refused."
+        snap_ok, drift_reason = compare_movie_file_snapshots(meta["snapshot"], current_snap)
+        if not snap_ok:
             return (
                 False,
                 None,
+                None,
                 409,
-                "Existing movie file changed or was removed since card creation; Alternative Grab refused.",
+                f"Existing Radarr movie/file changed since card creation ({drift_reason}); Alternative Grab refused.",
             )
-        return True, movie, 200, "Eligible for Alternative Grab"
+
+        route_ok, route_reason = validate_radarr_qbit_route(
+            dl_res.data if isinstance(dl_res.data, list) else [],
+            configured_url=self.alt_grab_config.url,
+            configured_category=self.alt_grab_config.category,
+        )
+        if not route_ok:
+            return (
+                False,
+                None,
+                None,
+                409,
+                f"Radarr qBittorrent route validation failed ({route_reason}); Alternative Grab refused.",
+            )
+        return True, movie, meta, 200, "Eligible for Alternative Grab"
 
     async def render_action_get(self, raw_token: str) -> HtmlResponseData:
         """Strictly read-only confirmation / status view for GET /action/{token}."""
@@ -941,18 +1155,30 @@ class ActionsService:
                 details.append(("Last Checked", str(amb_act["last_reconciled_at"])))
             if amb_act.get("last_error_redacted"):
                 details.append(("Detail", str(amb_act["last_error_redacted"])))
+            is_alt_qbit = str(amb_act["action_type"]) == "alternative_grab"
             return HtmlResponseData(
                 status_code=200,
                 html=render_simple_status_page(
-                    title="Radarr Outcome Unconfirmed (Reconciliation Required)",
+                    title=(
+                        "Alternative Grab Outcome Uncertain (Reconciliation Required)"
+                        if is_alt_qbit
+                        else "Radarr Outcome Unconfirmed (Reconciliation Required)"
+                    ),
                     badge="ambiguous_radarr",
                     message=(
-                        "A previous Radarr request did not return a clear confirmation. "
+                        "A previous qBittorrent submission did not return a confirmed transfer. "
+                        "Click below to re-check live qBittorrent state read-only without repeating the add."
+                        if is_alt_qbit
+                        else "A previous Radarr request did not return a clear confirmation. "
                         "Click below to re-check live Radarr state safely without issuing duplicate release pushes."
                     ),
                     tone="warn",
                     details=details,
-                    post_button_label="Re-check Radarr Status & Reconcile",
+                    post_button_label=(
+                        "Re-check qBittorrent Status & Reconcile"
+                        if is_alt_qbit
+                        else "Re-check Radarr Status & Reconcile"
+                    ),
                     hidden_fields={"confirm": "1", "reconcile": "1"},
                 ),
             )
@@ -972,9 +1198,9 @@ class ActionsService:
             return HtmlResponseData(
                 status_code=200,
                 html=render_simple_status_page(
-                    title="Release Push Rejected by Radarr",
+                    title="Release Push Rejected",
                     badge="rejected_push",
-                    message=str(action.get("last_error_redacted") or "Radarr rejected this release push."),
+                    message=str(action.get("last_error_redacted") or "Release submission was refused."),
                     tone="err",
                     details=[("Release", str(action["bound_release_name"]))],
                 ),
@@ -1018,7 +1244,7 @@ class ActionsService:
             )
 
         if action_type == "alternative_grab":
-            ok, movie, code, msg = await self._validate_alternative_grab_live(action)
+            ok, movie, _meta, code, msg = await self._validate_alternative_grab_live(action)
             if not ok or movie is None:
                 return HtmlResponseData(
                     status_code=code,
@@ -1030,11 +1256,15 @@ class ActionsService:
                     ),
                 )
             quality_label = _extract_existing_quality(movie) or "existing file"
+            assert self.alt_grab_config is not None
             return HtmlResponseData(
                 status_code=200,
                 html=render_confirmation_page(
                     action=action,
-                    radarr_summary=f"Existing movie ID {movie['id']} with file ID {action['bound_existing_file_id']} ({quality_label})",
+                    radarr_summary=(
+                        f"Existing monitored movie ID {movie['id']} (file ID {action['bound_existing_file_id']}, {quality_label}). "
+                        f"Will submit validated .torrent bytes directly to qBittorrent category '{self.alt_grab_config.category}' (no Radarr or evaluator writes)."
+                    ),
                     root_folders=[],
                     quality_profiles=[],
                     needs_add_options=False,
@@ -2255,47 +2485,715 @@ class ActionsService:
             preopened_attempt_id=preopened_phase2_attempt_id,
         )
 
+    async def _confirm_qbit_transfer_bounded(
+        self,
+        qbit_http: Any,
+        *,
+        info_hash: str,
+        expected_category: str,
+        attempts: int = 3,
+    ) -> tuple[str, Optional[str]]:
+        """
+        Bounded read-only verification against qBittorrent GET /api/v2/torrents/info?hashes=<hash>.
+        Returns ('queued', None) iff exact hash exists in expected category,
+        ('wrong_category', found_cat) if hash exists in another category,
+        or ('absent', err_or_none) if not confirmed within bounded checks.
+        """
+        assert self.qbit_client is not None
+        last_err: Optional[str] = None
+        for idx in range(attempts):
+            info_res = await self.qbit_client.get_torrent_info(qbit_http, info_hash)
+            if info_res.ok and isinstance(info_res.data, list):
+                for entry in info_res.data:
+                    if isinstance(entry, dict) and str(entry.get("hash") or "").strip().lower() == info_hash:
+                        found_cat = str(entry.get("category") or "").strip()
+                        if found_cat == expected_category:
+                            return "queued", None
+                        return "wrong_category", found_cat
+            else:
+                last_err = info_res.error_redacted or "qbit_info_failed"
+            if idx + 1 < attempts:
+                await asyncio.sleep(0.15)
+        return "absent", last_err
+
     async def _execute_alternative_grab(
         self,
         action: dict[str, Any],
         form_data: dict[str, str],
     ) -> HtmlResponseData:
-        ok, movie, code, msg = await self._validate_alternative_grab_live(action)
-        if not ok or movie is None:
+        """
+        Legacy Alternative Grab ("Grab Anyway") execution via HTTPS qBittorrent Web API v2:
+        - Takes exclusive action lock (qbit_alt_preflight -> atomic handoff -> qbit_alternative_grab).
+        - Validates source, 1-8 rejection rules, live Radarr movie/file snapshot, and single enabled qBit route
+          BEFORE AND AFTER fetching the bound canonical TorrentLeech .torrent bytes (<= 4 MB, no redirects, v1 hash).
+        - Uses a fresh qBittorrent session (never reusing tracker cookies), checks already-present, category,
+          and autorun disabled, writes a durable 0600 receipt keyed to tracker external_id, submits ONE multipart
+          bytes-only POST /api/v2/torrents/add (no URLs, no pause/start override), and confirms via bounded read-only
+          torrents/info checks. Zero Radarr writes and zero evaluator /feedback writes.
+        """
+        if self.alt_grab_config is None or self.qbit_client is None or self.torrent_fetcher is None:
             return HtmlResponseData(
-                status_code=code,
+                status_code=409,
                 html=render_simple_status_page(
-                    title="Alternative Grab Refused",
-                    badge=str(code),
-                    message=msg,
-                    tone="err" if code == 409 else "warn",
-                ),
-            )
-
-        payload_res = await self.intake_push.fetch_push_payload(
-            release_id=str(action["release_id"]),
-            source_occurrence_id=str(action["source_occurrence_id"]),
-        )
-        if not payload_res.ok or not payload_res.push_payload:
-            return HtmlResponseData(
-                status_code=503,
-                html=render_simple_status_page(
-                    title="Release Payload Unavailable",
-                    badge="503",
-                    message="Could not resolve verified release push payload from intake archive. No Radarr write was attempted.",
+                    title="Alternative Grab Unavailable",
+                    badge="refused",
+                    message="Alternative Grab is not configured on this service.",
                     tone="err",
                 ),
             )
+        cfg = self.alt_grab_config
 
-        return await self._execute_release_push_phase(
-            action=action,
-            radarr_movie_id=int(movie["id"]),
-            push_payload=payload_res.push_payload,
+        # 1. Acquire exclusive preflight action lock immediately
+        lock_ok, preflight_att_id, lock_reason = await asyncio.to_thread(
+            self.db.begin_write_attempt,
+            action_id=str(action["action_id"]),
+            completion_group=str(action["completion_group"]),
+            phase="qbit_alt_preflight",
+            process_instance_id=self.process_instance_id,
+            lease_expires_at=self._lease_iso(self.config.radarr_timeout_seconds * 2),
+            request_fingerprint=json.dumps(
+                {"action_id": action["action_id"], "release_id": action["release_id"], "phase": "preflight"},
+                sort_keys=True,
+            ),
             allowed_action_statuses=frozenset({"active"}),
+        )
+        if not lock_ok or not preflight_att_id:
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Alternative Grab Conflict",
+                    badge="409",
+                    message=f"Alternative Grab cannot start ({lock_reason}). Refresh to view current status.",
+                    tone="warn",
+                ),
+            )
+
+        async def _release_preflight(
+            *,
+            http_code: int,
+            title: str,
+            badge: str,
+            message: str,
+            action_status: str = "active",
+            tone: str = "err",
+        ) -> HtmlResponseData:
+            await asyncio.to_thread(
+                self.db.finish_write_attempt,
+                attempt_id=preflight_att_id,
+                action_id=str(action["action_id"]),
+                attempt_status="failed_definitive",
+                action_status=action_status,
+                outcome_summary=badge,
+                last_error_redacted=message,
+            )
+            return HtmlResponseData(
+                status_code=http_code,
+                html=render_simple_status_page(title=title, badge=badge, message=message, tone=tone),
+            )
+
+        qbit_http: Any = None
+        owns_qbit = False
+        try:
+            # 2. Pre-fetch live Radarr movie/file snapshot + download-client route revalidation
+            ok1, movie1, meta, code1, msg1 = await self._validate_alternative_grab_live(action)
+            if not ok1 or movie1 is None or meta is None:
+                return await _release_preflight(
+                    http_code=code1,
+                    title="Alternative Grab Refused",
+                    badge="refused" if code1 == 409 else str(code1),
+                    message=msg1,
+                    tone="err" if code1 == 409 else "warn",
+                )
+            external_id = str(meta["external_id"])
+            movie_id = int(movie1["id"])
+
+            # 3. Check durable private receipt keyed to tracker external_id BEFORE any fetch/add
+            try:
+                existing_receipt = await asyncio.to_thread(read_alt_grab_receipt, cfg.state_dir, external_id)
+            except (PrivateFileError, OSError, ValueError) as exc:
+                return await _release_preflight(
+                    http_code=503,
+                    title="Alternative Grab Receipt Store Unsafe",
+                    badge="refused",
+                    message=f"Refused: private receipt directory check failed ({redact_secrets(exc.__class__.__name__, max_chars=80)}).",
+                )
+            if existing_receipt and existing_receipt.get("status") in ("submitting", "uncertain", "queued", "already_present"):
+                prior_status = str(existing_receipt.get("status") or "")
+                prior_hash = str(existing_receipt.get("info_hash") or "").strip().lower()
+                if prior_hash:
+                    qbit_http, owns_qbit, login_res = await self.qbit_client.open_authenticated_session()
+                    if login_res.ok:
+                        c_state, _ = await self._confirm_qbit_transfer_bounded(
+                            qbit_http, info_hash=prior_hash, expected_category=cfg.category, attempts=1
+                        )
+                        if c_state == "queued" or (
+                            c_state == "wrong_category" and prior_status == "already_present"
+                        ):
+                            outcome_lbl = "queued" if c_state == "queued" else "already_present"
+                            await asyncio.to_thread(
+                                self.db.finish_write_attempt,
+                                attempt_id=preflight_att_id,
+                                action_id=str(action["action_id"]),
+                                attempt_status="succeeded",
+                                action_status="completed_all",
+                                outcome_summary=outcome_lbl,
+                                radarr_movie_id=movie_id,
+                                last_error_redacted=outcome_lbl,
+                            )
+                            return HtmlResponseData(
+                                status_code=200,
+                                html=render_simple_status_page(
+                                    title="Alternative Grab Already Recorded",
+                                    badge=outcome_lbl,
+                                    message=f"Existing receipt confirmed in qBittorrent ({outcome_lbl}); zero duplicate adds sent.",
+                                    tone="ok",
+                                ),
+                            )
+                # Prior submission receipt exists (even if hash missing or unconfirmed) -> mark uncertain without re-adding
+                await asyncio.to_thread(
+                    self.db.finish_write_attempt,
+                    attempt_id=preflight_att_id,
+                    action_id=str(action["action_id"]),
+                    attempt_status="ambiguous",
+                    action_status="ambiguous_radarr",
+                    outcome_summary="uncertain_prior_receipt",
+                    radarr_movie_id=movie_id,
+                    last_error_redacted="Prior receipt exists for this tracker release; refusing duplicate submission.",
+                )
+                return HtmlResponseData(
+                    status_code=503,
+                    html=render_simple_status_page(
+                        title="Alternative Grab Uncertain",
+                        badge="uncertain",
+                        message="A prior submission receipt exists for this tracker release. Re-check qBittorrent status rather than re-submitting.",
+                        tone="warn",
+                        post_button_label="Re-check qBittorrent Status & Reconcile",
+                        hidden_fields={"confirm": "1", "reconcile": "1"},
+                    ),
+                )
+
+            # 4. Resolve ephemeral bound download URL and fetch + validate v1 .torrent bytes (<= 4 MB, no redirects)
+            payload_res = await self.intake_push.fetch_push_payload(
+                release_id=str(action["release_id"]),
+                source_occurrence_id=str(action["source_occurrence_id"]),
+            )
+            if not payload_res.ok or not payload_res.push_payload:
+                return await _release_preflight(
+                    http_code=503,
+                    title="Release Payload Unavailable",
+                    badge="503",
+                    message="Could not resolve verified release payload from intake archive. No download-client write was attempted.",
+                    tone="warn",
+                )
+            dl_url = str(payload_res.push_payload.get("downloadUrl") or "").strip()
+            fetch_res = await self.torrent_fetcher.fetch_bound_torrent(
+                download_url=dl_url, external_id=external_id
+            )
+            if not fetch_res.ok or not fetch_res.torrent_bytes or not fetch_res.info_hash:
+                return await _release_preflight(
+                    http_code=409,
+                    title="Alternative Grab Refused",
+                    badge="refused",
+                    message=f"Bound torrent fetch/validation failed ({fetch_res.error_redacted or 'invalid_torrent'}). Zero qBittorrent writes made.",
+                )
+            torrent_bytes = fetch_res.torrent_bytes
+            info_hash = fetch_res.info_hash
+
+            # 5. Post-fetch revalidation (exact legacy invariant before any submission!)
+            ok2, movie2, _meta2, code2, msg2 = await self._validate_alternative_grab_live(action)
+            if not ok2 or movie2 is None:
+                return await _release_preflight(
+                    http_code=code2,
+                    title="Alternative Grab Refused",
+                    badge="refused" if code2 == 409 else str(code2),
+                    message=f"Post-fetch revalidation failed: {msg2}",
+                    tone="err" if code2 == 409 else "warn",
+                )
+
+            # 6. Open fresh isolated HTTPS qBittorrent session (never sharing tracker cookies)
+            qbit_http, owns_qbit, login_res = await self.qbit_client.open_authenticated_session()
+            if not login_res.ok:
+                return await _release_preflight(
+                    http_code=503,
+                    title="qBittorrent Unavailable",
+                    badge="503",
+                    message=f"Could not authenticate to qBittorrent ({login_res.error_redacted or 'login_failed'}). Zero writes made.",
+                    tone="warn",
+                )
+
+            # Check already present by v1 info hash (leave existing transfer & category completely untouched!)
+            info_pre = await self.qbit_client.get_torrent_info(qbit_http, info_hash)
+            if not info_pre.ok:
+                return await _release_preflight(
+                    http_code=503,
+                    title="qBittorrent Unavailable",
+                    badge="503",
+                    message=f"Could not query qBittorrent torrents/info ({info_pre.error_redacted}). Zero writes made.",
+                    tone="warn",
+                )
+            if any(
+                isinstance(item, dict) and str(item.get("hash") or "").strip().lower() == info_hash
+                for item in (info_pre.data or [])
+            ):
+                try:
+                    await asyncio.to_thread(
+                        write_alt_grab_receipt,
+                        cfg.state_dir,
+                        external_id,
+                        {
+                            "tracker": "torrentleech",
+                            "external_id": external_id,
+                            "release_id": str(action["release_id"]),
+                            "action_id": str(action["action_id"]),
+                            "info_hash": info_hash,
+                            "category": cfg.category,
+                            "status": "already_present",
+                            "updated_at": utc_now_iso(),
+                        },
+                    )
+                except (PrivateFileError, OSError):
+                    pass
+                await asyncio.to_thread(
+                    self.db.finish_write_attempt,
+                    attempt_id=preflight_att_id,
+                    action_id=str(action["action_id"]),
+                    attempt_status="succeeded",
+                    action_status="completed_all",
+                    outcome_summary="already_present",
+                    radarr_movie_id=movie_id,
+                    last_error_redacted="already_present",
+                )
+                return HtmlResponseData(
+                    status_code=200,
+                    html=render_simple_status_page(
+                        title="Already Present in qBittorrent",
+                        badge="already_present",
+                        message="Torrent is already present in qBittorrent; existing transfer and category were left untouched.",
+                        tone="ok",
+                    ),
+                )
+
+            # Confirm fixed Radarr category exists in qBittorrent
+            cats_res = await self.qbit_client.get_categories(qbit_http)
+            if not cats_res.ok or not isinstance(cats_res.data, dict):
+                return await _release_preflight(
+                    http_code=503,
+                    title="qBittorrent Unavailable",
+                    badge="503",
+                    message=f"Could not read qBittorrent categories ({cats_res.error_redacted}). Zero writes made.",
+                    tone="warn",
+                )
+            if cfg.category not in cats_res.data:
+                return await _release_preflight(
+                    http_code=409,
+                    title="Alternative Grab Refused",
+                    badge="refused",
+                    message=f"Configured category '{cfg.category}' does not exist in qBittorrent; Alternative Grab refused.",
+                )
+
+            # Confirm qBittorrent autorun hooks are disabled
+            prefs_res = await self.qbit_client.get_preferences(qbit_http)
+            if not prefs_res.ok or not isinstance(prefs_res.data, dict):
+                return await _release_preflight(
+                    http_code=503,
+                    title="qBittorrent Unavailable",
+                    badge="503",
+                    message=f"Could not read qBittorrent preferences ({prefs_res.error_redacted}). Zero writes made.",
+                    tone="warn",
+                )
+            if bool(prefs_res.data.get("autorun_enabled")) or bool(
+                prefs_res.data.get("autorun_on_torrent_added_enabled")
+            ):
+                return await _release_preflight(
+                    http_code=409,
+                    title="Alternative Grab Refused",
+                    badge="refused",
+                    message="qBittorrent autorun hooks are enabled; Alternative Grab refused.",
+                )
+
+            # 7. Write durable 0600 receipt keyed to external_id BEFORE opening qbit_alternative_grab attempt
+            receipt_base = {
+                "tracker": "torrentleech",
+                "external_id": external_id,
+                "release_id": str(action["release_id"]),
+                "action_id": str(action["action_id"]),
+                "info_hash": info_hash,
+                "category": cfg.category,
+                "status": "submitting",
+                "updated_at": utc_now_iso(),
+            }
+            try:
+                await asyncio.to_thread(write_alt_grab_receipt, cfg.state_dir, external_id, receipt_base)
+            except (PrivateFileError, OSError) as exc:
+                return await _release_preflight(
+                    http_code=503,
+                    title="Alternative Grab Receipt Failed",
+                    badge="refused",
+                    message=f"Could not write durable private receipt before submission ({redact_secrets(exc.__class__.__name__, max_chars=80)}). Zero qBittorrent writes made.",
+                )
+
+            # Atomic lock handoff: qbit_alt_preflight (succeeded) -> qbit_alternative_grab (attempting)
+            fp_qbit = json.dumps(
+                {"info_hash_prefix": info_hash[:12], "category": cfg.category, "external_id": external_id},
+                sort_keys=True,
+            )
+            add_att_id = await asyncio.to_thread(
+                self.db.complete_alt_preflight_and_begin_qbit_add,
+                preflight_attempt_id=preflight_att_id,
+                action_id=str(action["action_id"]),
+                completion_group=str(action["completion_group"]),
+                radarr_movie_id=movie_id,
+                preflight_outcome=f"preflight_ok:{info_hash[:12]}",
+                process_instance_id=self.process_instance_id,
+                qbit_lease_expires_at=self._lease_iso(self.config.radarr_timeout_seconds),
+                qbit_request_fingerprint=fp_qbit,
+            )
+            if add_att_id is None:
+                return HtmlResponseData(
+                    status_code=409,
+                    html=render_simple_status_page(
+                        title="Alternative Grab Conflict",
+                        badge="409",
+                        message="Another qBittorrent submission already exists or preflight claim was superseded; refusing duplicate add.",
+                        tone="warn",
+                    ),
+                )
+
+            # 8. Submit ONE multipart POST /api/v2/torrents/add (validated bytes + fixed category ONLY)
+            add_res = await self.qbit_client.add_torrent_bytes(
+                qbit_http,
+                torrent_bytes=torrent_bytes,
+                category=cfg.category,
+                filename=f"{external_id}.torrent",
+            )
+            if add_res.outcome in ("failed_not_transmitted", "refused"):
+                final_status = "rejected_push" if add_res.outcome == "refused" else "active"
+                try:
+                    await asyncio.to_thread(
+                        write_alt_grab_receipt,
+                        cfg.state_dir,
+                        external_id,
+                        dict(receipt_base, status="refused", updated_at=utc_now_iso()),
+                    )
+                except (PrivateFileError, OSError):
+                    pass
+                await asyncio.to_thread(
+                    self.db.finish_write_attempt,
+                    attempt_id=add_att_id,
+                    action_id=str(action["action_id"]),
+                    attempt_status="failed_definitive",
+                    action_status=final_status,
+                    outcome_summary=add_res.error_redacted or "qbit_add_refused",
+                    radarr_movie_id=movie_id,
+                    last_error_redacted=add_res.error_redacted or "qBittorrent refused torrent submission.",
+                )
+                return HtmlResponseData(
+                    status_code=502 if add_res.outcome == "failed_not_transmitted" else 200,
+                    html=render_simple_status_page(
+                        title="Alternative Grab Refused by qBittorrent",
+                        badge="refused",
+                        message=str(add_res.error_redacted or "qBittorrent refused the torrent submission."),
+                        tone="err",
+                    ),
+                )
+
+            # 9. Bounded read-only confirmation (even after a lost HTTP ack!)
+            confirm_state, confirm_detail = await self._confirm_qbit_transfer_bounded(
+                qbit_http, info_hash=info_hash, expected_category=cfg.category, attempts=3
+            )
+            if confirm_state == "queued":
+                try:
+                    await asyncio.to_thread(
+                        write_alt_grab_receipt,
+                        cfg.state_dir,
+                        external_id,
+                        dict(receipt_base, status="queued", updated_at=utc_now_iso()),
+                    )
+                except (PrivateFileError, OSError):
+                    pass
+                await asyncio.to_thread(
+                    self.db.finish_write_attempt,
+                    attempt_id=add_att_id,
+                    action_id=str(action["action_id"]),
+                    attempt_status="succeeded",
+                    action_status="completed_all",
+                    outcome_summary="queued",
+                    radarr_movie_id=movie_id,
+                    last_error_redacted="queued",
+                )
+                return HtmlResponseData(
+                    status_code=200,
+                    html=render_simple_status_page(
+                        title="Alternative Grab Queued in qBittorrent",
+                        badge="queued",
+                        message=(
+                            f"Validated torrent queued in qBittorrent category '{cfg.category}'. "
+                            "No Radarr mutations or evaluator feedback writes were made."
+                        ),
+                        tone="ok",
+                        details=[
+                            ("Movie", str(action["bound_title"])),
+                            ("Release", str(action["bound_release_name"])),
+                            ("Category", cfg.category),
+                        ],
+                    ),
+                )
+
+            # Unconfirmed / lost ack -> uncertain (NEVER auto-repeat torrents/add!)
+            uncertain_note = (
+                f"qbit_transfer_wrong_category:{confirm_detail}"
+                if confirm_state == "wrong_category"
+                else (add_res.error_redacted or confirm_detail or "qbit_transfer_not_confirmed_in_category")
+            )
+            try:
+                await asyncio.to_thread(
+                    write_alt_grab_receipt,
+                    cfg.state_dir,
+                    external_id,
+                    dict(receipt_base, status="uncertain", updated_at=utc_now_iso()),
+                )
+            except (PrivateFileError, OSError):
+                pass
+            await asyncio.to_thread(
+                self.db.finish_write_attempt,
+                attempt_id=add_att_id,
+                action_id=str(action["action_id"]),
+                attempt_status="ambiguous",
+                action_status="ambiguous_radarr",
+                outcome_summary="uncertain",
+                radarr_movie_id=movie_id,
+                last_error_redacted=uncertain_note,
+            )
+            return HtmlResponseData(
+                status_code=503,
+                html=render_simple_status_page(
+                    title="Alternative Grab Outcome Uncertain",
+                    badge="uncertain",
+                    message=(
+                        "qBittorrent did not confirm the transfer in the expected category. "
+                        "Submission will NOT be automatically repeated; re-check live qBittorrent status below."
+                    ),
+                    tone="warn",
+                    details=[("Detail", uncertain_note)],
+                    post_button_label="Re-check qBittorrent Status & Reconcile",
+                    hidden_fields={"confirm": "1", "reconcile": "1"},
+                ),
+            )
+        finally:
+            if owns_qbit and qbit_http is not None:
+                await qbit_http.aclose()
+
+    async def _reconcile_ambiguous_qbit_alt_grab(
+        self,
+        amb_act: dict[str, Any],
+        qbit_att: Optional[dict[str, Any]],
+        preflight_att: Optional[dict[str, Any]],
+    ) -> HtmlResponseData:
+        """Read-only reconciliation for uncertain qBittorrent Alternative Grab (zero duplicate adds)."""
+        if self.alt_grab_config is None or self.qbit_client is None:
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Cannot Reconcile Alternative Grab",
+                    badge="409",
+                    message="Alternative Grab qBittorrent client is not configured.",
+                    tone="err",
+                ),
+            )
+        cfg = self.alt_grab_config
+
+        # If ONLY preflight crashed (no qbit_alternative_grab attempt was ever opened), check receipt first
+        if qbit_att is None and preflight_att is not None:
+            meta_ok, meta, _ = self._parse_alt_grab_meta(amb_act)
+            ext_id = str(meta["external_id"]) if (meta_ok and meta) else ""
+            prior_receipt = None
+            if ext_id:
+                try:
+                    prior_receipt = await asyncio.to_thread(read_alt_grab_receipt, cfg.state_dir, ext_id)
+                except (PrivateFileError, OSError, ValueError):
+                    prior_receipt = None
+            if not prior_receipt or prior_receipt.get("status") not in ("submitting", "uncertain", "queued", "already_present"):
+                if self._is_expired(amb_act):
+                    await asyncio.to_thread(
+                        self.db.mark_action_expired,
+                        action_id=str(amb_act["action_id"]),
+                        detail="expired_after_interrupted_preflight",
+                    )
+                    return HtmlResponseData(
+                        status_code=410,
+                        html=render_simple_status_page(
+                            title="Action Expired",
+                            badge="expired",
+                            message="This Alternative Grab link expired after an interrupted read-only preflight; zero qBittorrent writes were made.",
+                            tone="warn",
+                        ),
+                    )
+                # Safe: crashed during read-only preflight before any submission or receipt write
+                reset_ok = await asyncio.to_thread(
+                    self.db.reset_interrupted_alt_preflight,
+                    attempt_id=str(preflight_att["attempt_id"]),
+                    action_id=str(amb_act["action_id"]),
+                    completion_group=str(amb_act["completion_group"]),
+                )
+                if not reset_ok:
+                    return HtmlResponseData(
+                        status_code=409,
+                        html=render_simple_status_page(
+                            title="Alternative Grab Conflict",
+                            badge="409",
+                            message="Preflight state changed concurrently; refresh to view current status.",
+                            tone="warn",
+                        ),
+                    )
+                return HtmlResponseData(
+                    status_code=200,
+                    html=render_simple_status_page(
+                        title="Preflight Reset (Zero Writes Sent)",
+                        badge="active",
+                        message="The previous read-only preflight was interrupted before contacting qBittorrent. You may now confirm Alternative Grab again.",
+                        tone="warn",
+                        post_button_label="Confirm Alternative Grab",
+                        hidden_fields={"confirm": "1"},
+                    ),
+                )
+            # Receipt exists -> fall through to read-only qBittorrent hash check
+            info_hash = str(prior_receipt.get("info_hash") or "").strip().lower()
+            expected_cat = str(prior_receipt.get("category") or cfg.category).strip()
+            att_id = str(preflight_att["attempt_id"])
+            external_id = ext_id
+        else:
+            info_hash = ""
+            expected_cat = cfg.category
+            external_id = ""
+            att_id = str(qbit_att["attempt_id"]) if qbit_att else None
+            if qbit_att and isinstance(qbit_att.get("request_fingerprint"), str):
+                try:
+                    fp = json.loads(qbit_att["request_fingerprint"])
+                    if isinstance(fp, dict):
+                        cand_hash = str(fp.get("info_hash") or "").strip().lower()
+                        if len(cand_hash) == 40 and all(ch in "0123456789abcdef" for ch in cand_hash):
+                            info_hash = cand_hash
+                        expected_cat = str(fp.get("category") or cfg.category).strip()
+                        external_id = str(fp.get("external_id") or "").strip()
+                except ValueError:
+                    pass
+            if not external_id:
+                meta_ok, meta, _ = self._parse_alt_grab_meta(amb_act)
+                if meta_ok and meta:
+                    external_id = str(meta["external_id"])
+            if (len(info_hash) != 40 or not all(ch in "0123456789abcdef" for ch in info_hash)) and external_id:
+                try:
+                    rec = await asyncio.to_thread(read_alt_grab_receipt, cfg.state_dir, external_id)
+                    if rec:
+                        rec_hash = str(rec.get("info_hash") or "").strip().lower()
+                        if len(rec_hash) == 40 and all(ch in "0123456789abcdef" for ch in rec_hash):
+                            info_hash = rec_hash
+                        if rec.get("category"):
+                            expected_cat = str(rec.get("category")).strip()
+                except (PrivateFileError, OSError, ValueError):
+                    pass
+
+        if len(info_hash) != 40 or not all(ch in "0123456789abcdef" for ch in info_hash):
+            return HtmlResponseData(
+                status_code=200,
+                html=render_simple_status_page(
+                    title="Alternative Grab Remains Uncertain",
+                    badge="uncertain",
+                    message="Missing stored torrent info hash for read-only reconciliation; refusing duplicate submission.",
+                    tone="warn",
+                ),
+            )
+
+        qbit_http, owns_qbit, login_res = await self.qbit_client.open_authenticated_session()
+        if not login_res.ok:
+            return HtmlResponseData(
+                status_code=503,
+                html=render_simple_status_page(
+                    title="qBittorrent Unavailable",
+                    badge="uncertain",
+                    message="qBittorrent is unreachable during reconciliation. Status remains uncertain; zero writes made.",
+                    tone="warn",
+                    post_button_label="Re-check qBittorrent Status & Reconcile",
+                    hidden_fields={"confirm": "1", "reconcile": "1"},
+                ),
+            )
+        try:
+            c_state, c_detail = await self._confirm_qbit_transfer_bounded(
+                qbit_http, info_hash=info_hash, expected_category=expected_cat, attempts=1
+            )
+        finally:
+            if owns_qbit and qbit_http is not None:
+                await qbit_http.aclose()
+
+        if c_state == "queued":
+            outcome_lbl = "queued"
+            if external_id:
+                try:
+                    await asyncio.to_thread(
+                        write_alt_grab_receipt,
+                        cfg.state_dir,
+                        external_id,
+                        {
+                            "tracker": "torrentleech",
+                            "external_id": external_id,
+                            "release_id": str(amb_act["release_id"]),
+                            "action_id": str(amb_act["action_id"]),
+                            "info_hash": info_hash,
+                            "category": expected_cat,
+                            "status": outcome_lbl,
+                            "updated_at": utc_now_iso(),
+                        },
+                    )
+                except (PrivateFileError, OSError):
+                    pass
+            await asyncio.to_thread(
+                self.db.seal_reconciled_attempt,
+                attempt_id=att_id,
+                action_id=str(amb_act["action_id"]),
+                radarr_movie_id=amb_act.get("radarr_movie_id") or amb_act.get("bound_existing_movie_id"),
+                outcome_summary=outcome_lbl,
+                needs_feedback=False,
+            )
+            return HtmlResponseData(
+                status_code=200,
+                html=render_simple_status_page(
+                    title="Alternative Grab Confirmed in qBittorrent",
+                    badge=outcome_lbl,
+                    message=(
+                        f"Reconciliation confirmed the transfer in qBittorrent ({outcome_lbl}) with zero duplicate adds. "
+                        "No Radarr mutations or evaluator feedback writes were made."
+                    ),
+                    tone="ok",
+                ),
+            )
+
+        still_detail = (
+            f"qbit_transfer_wrong_category:{c_detail}"
+            if c_state == "wrong_category"
+            else (c_detail or "qbit_transfer_not_yet_visible_in_category")
+        )
+        await asyncio.to_thread(
+            self.db.mark_action_reconciled_still_ambiguous,
+            action_id=str(amb_act["action_id"]),
+            detail=still_detail,
+        )
+        return HtmlResponseData(
+            status_code=200,
+            html=render_simple_status_page(
+                title="Alternative Grab Still Uncertain",
+                badge="uncertain",
+                message=(
+                    "Torrent is not yet visible in qBittorrent in the expected category. "
+                    "Status remains uncertain and NO second submission was sent."
+                ),
+                tone="warn",
+                post_button_label="Re-check qBittorrent Status & Reconcile",
+                hidden_fields={"confirm": "1", "reconcile": "1"},
+            ),
         )
 
     # =========================================================================
-    # 5. Ambiguous Radarr Reconciliation (§6.3 & Mandatory Case 5b / 5f)
+    # 5. Ambiguous Radarr / qBittorrent Reconciliation (§6.3 & Mandatory Case 5b / 5f)
     # =========================================================================
 
     def _within_attempt_window(
@@ -2366,6 +3264,39 @@ class ActionsService:
         group_attempts: tuple[dict[str, Any], ...],
         form_data: dict[str, str],
     ) -> HtmlResponseData:
+        # Handle qBittorrent Alternative Grab reconciliation separately (zero Radarr writes / zero duplicate adds)
+        if str(amb_act["action_type"]) == "alternative_grab":
+            qbit_att = next(
+                (
+                    a
+                    for a in group_attempts
+                    if a["action_id"] == amb_act["action_id"]
+                    and a["phase"] == "qbit_alternative_grab"
+                    and a["status"] == "ambiguous"
+                ),
+                None,
+            )
+            if qbit_att is None:
+                qbit_att = next(
+                    (
+                        a
+                        for a in group_attempts
+                        if a["action_id"] == amb_act["action_id"]
+                        and a["phase"] == "qbit_alternative_grab"
+                    ),
+                    None,
+                )
+            preflight_att = next(
+                (
+                    a
+                    for a in group_attempts
+                    if a["action_id"] == amb_act["action_id"]
+                    and a["phase"] == "qbit_alt_preflight"
+                ),
+                None,
+            )
+            return await self._reconcile_ambiguous_qbit_alt_grab(amb_act, qbit_att, preflight_att)
+
         # Hard single-push invariant: if ANY radarr_release_push attempt for this action is ambiguous,
         # ALWAYS reconcile as Phase B (never fall back to Phase A under clock skew).
         radarr_att = next(

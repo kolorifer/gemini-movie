@@ -5,15 +5,53 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
-from .config import AlternativeGrabPolicy
 from .security import redact_secrets
 
+MAX_ALT_GRAB_REJECTION_REASONS = 8
+MAX_ALT_GRAB_RELEASE_NAME_LEN = 512
+
 _IMDB_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
+_NUMERIC_ID_RE = re.compile(r"^\d{1,12}$")
+_YEAR_TOKEN_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
+_RELEASE_TECH_STOP_TOKENS = frozenset(
+    {
+        "2160p", "1080p", "1080i", "720p", "576p", "480p", "4k", "uhd",
+        "bluray", "blu", "bdrip", "brrip", "remux", "web", "webdl", "webrip",
+        "hdtv", "dvdrip", "x264", "x265", "h264", "h265", "hevc", "avc", "av1",
+    }
+)
 _EPISODIC_RELEASE_RE = re.compile(
     r"(?<![a-z0-9])(?:s\d{1,2}e\d{1,3}|s\d{1,2}(?![a-z0-9])|season[\s._-]?\d{1,2}|episode[\s._-]?\d{1,3}|complete[\s._-]?series)(?![a-z0-9])",
     re.IGNORECASE,
 )
+
+
+def _extract_title_year_from_release_name(exact_name: str) -> tuple[Optional[str], Optional[int]]:
+    cleaned = re.sub(r"\.(?:mkv|mp4|m2ts|iso|torrent)$", "", (exact_name or "").strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"-[A-Za-z0-9]{2,24}$", "", cleaned)
+    tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", cleaned) if t]
+    if len(tokens) < 2:
+        return None, None
+    tech_stop = len(tokens)
+    for idx in range(1, len(tokens)):
+        if tokens[idx].lower() in _RELEASE_TECH_STOP_TOKENS:
+            tech_stop = idx
+            break
+    pre_tech = [tok for tok in tokens[:tech_stop] if not _IMDB_RE.fullmatch(tok.lower())]
+    for idx in range(len(pre_tech) - 1, 0, -1):
+        if _YEAR_TOKEN_RE.fullmatch(pre_tech[idx]):
+            year = int(pre_tech[idx])
+            if 1888 <= year <= 2100:
+                title = " ".join(pre_tech[:idx]).strip()
+                if title:
+                    return title, year
+    return None, None
+
+_TL_DOWNLOAD_HOSTS = frozenset({"www.torrentleech.org", "torrentleech.org"})
+_TL_RSS_DOWNLOAD_PATH_RE = re.compile(r"^/rss/download/(\d{1,12})/[^/]+/[^/]+\.torrent$", re.IGNORECASE)
+_TL_DIRECT_DOWNLOAD_PATH_RE = re.compile(r"^/download/(\d{1,12})/[^/]+\.torrent$", re.IGNORECASE)
 
 _NON_MOVIE_EVENT_TYPES = frozenset(
     {
@@ -83,6 +121,38 @@ _NON_MOVIE_CATEGORY_TOKENS = frozenset(
 )
 _MOVIE_CATEGORY_TOKENS = frozenset({"movie", "movies", "film", "films", "cinema"})
 
+# Exact 4 legacy allowed Radarr rejection forms (OPS-REPORT #3 §2).
+# Forms 1 & 2 strictly accept only Remux, Bluray, WEBDL, WEBRip, or HDTV with 720p, 1080p, or 2160p.
+_LEGACY_ALLOWED_QUALITY_TOKEN = r"(?:Remux|Bluray|WEBDL|WEBRip|HDTV)-(?:720p|1080p|2160p)"
+_LEGACY_ALT_GRAB_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "cutoff_met",
+        re.compile(rf"^Existing file meets cutoff:\s*{_LEGACY_ALLOWED_QUALITY_TOKEN}$", re.IGNORECASE),
+    ),
+    (
+        "equal_or_higher_preference",
+        re.compile(
+            rf"^Existing file(?: on disk)? is of equal or higher preference:\s*{_LEGACY_ALLOWED_QUALITY_TOKEN}\s+v[1-9]\d*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "upgrades_disallowed",
+        re.compile(
+            r"^(?:Upgrades are not allowed (?:by|for) (?:the|this) quality profile|Quality profile does not allow upgrades)\.?$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "custom_format_score",
+        re.compile(
+            r"^(?:Existing file(?: on disk)? has an? equal or higher Custom Format score(?:\s*[:(][^)\n]{1,120}\)?)?|Not a Custom Format upgrade for existing movie file\(s\)\.?\s*New:\s*.+do not improve on Existing:\s*.+)$",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+# Broader routine quality-rejection patterns used to suppress non-eligible quality rejections early.
 _QUALITY_REJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "cutoff_met",
@@ -91,7 +161,7 @@ _QUALITY_REJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "not_upgrade",
         re.compile(
-            r"\b(?:not\s+an?\s+(?:quality\s+)?upgrade|does\s+not\s+improve|equal\s+or\s+higher\s+quality|lower\s+quality|existing\s+file\s+is\s+better)\b",
+            r"\b(?:not\s+an?\s+(?:quality\s+)?upgrade|does\s+not\s+improve|equal\s+or\s+higher\s+(?:quality|preference)|lower\s+quality|existing\s+file\s+is\s+better|upgrades\s+are\s+not\s+allowed|does\s+not\s+allow\s+upgrades)\b",
             re.IGNORECASE,
         ),
     ),
@@ -104,13 +174,69 @@ _QUALITY_REJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "custom_format_score",
-        re.compile(r"\b(?:custom\s+format\s+score|minimum\s+custom\s+format)\b", re.IGNORECASE),
+        re.compile(r"\b(?:custom\s+format\s+score|minimum\s+custom\s+format|not\s+a\s+custom\s+format\s+upgrade)\b", re.IGNORECASE),
     ),
     (
         "size_limit",
         re.compile(r"\b(?:exceeds\s+maximum\s+size|below\s+minimum\s+size|size\s+is\s+(?:above|below))\b", re.IGNORECASE),
     ),
 )
+
+
+def is_canonical_tl_download_url(download_url: str, external_id: str) -> bool:
+    """
+    Verify `download_url` is a canonical HTTPS TorrentLeech torrent download URL
+    bound to the exact same numeric tracker release ID (`external_id`).
+    Never stores, returns, or logs the URL.
+    """
+    ext = str(external_id or "").strip()
+    if not _NUMERIC_ID_RE.fullmatch(ext):
+        return False
+    raw = str(download_url or "").strip()
+    if not raw or any(ch in raw for ch in ("\r", "\n", "\x00", " ", "\t")):
+        return False
+    parsed = urlparse(raw)
+    if parsed.scheme != "https":
+        return False
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    if parsed.port is not None and parsed.port != 443:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in _TL_DOWNLOAD_HOSTS:
+        return False
+    path = parsed.path or ""
+    if ".." in path or "\\" in path:
+        return False
+    m = _TL_RSS_DOWNLOAD_PATH_RE.fullmatch(path) or _TL_DIRECT_DOWNLOAD_PATH_RE.fullmatch(path)
+    if not m:
+        return False
+    return m.group(1) == ext
+
+
+def match_legacy_alt_grab_rejection_reason(reason: str) -> Optional[str]:
+    text = str(reason or "").strip()
+    if not text:
+        return None
+    for class_name, pattern in _LEGACY_ALT_GRAB_PATTERNS:
+        if pattern.fullmatch(text):
+            return class_name
+    return None
+
+
+def validate_legacy_alt_grab_rejections(reasons: list[str]) -> tuple[bool, list[str]]:
+    if not isinstance(reasons, list) or not (1 <= len(reasons) <= MAX_ALT_GRAB_REJECTION_REASONS):
+        return False, []
+    classes: list[str] = []
+    for item in reasons:
+        if not isinstance(item, str) or not item.strip():
+            return False, []
+        matched = match_legacy_alt_grab_rejection_reason(item)
+        if matched is None:
+            return False, []
+        if matched not in classes:
+            classes.append(matched)
+    return True, classes
 
 
 def _clean_str(value: Any) -> Optional[str]:
@@ -205,10 +331,12 @@ def _extract_indexer_name(raw_payload: dict[str, Any], data_dict: dict[str, Any]
     return ""
 
 
-def _extract_rejections(raw_payload: dict[str, Any], data_dict: dict[str, Any]) -> tuple[bool, list[str]]:
+def _extract_action_info(raw_payload: dict[str, Any], data_dict: dict[str, Any]) -> tuple[bool, bool, list[str]]:
     action = raw_payload.get("action")
     action_dict = action if isinstance(action, dict) else {}
     rejected = bool(_clean_bool(action_dict.get("rejected")) or False)
+    raw_type = _clean_str(action_dict.get("type"))
+    action_is_radarr = raw_type is None or raw_type.lower() == "radarr"
 
     result = data_dict.get("result")
     result_dict = result if isinstance(result, dict) else {}
@@ -217,50 +345,11 @@ def _extract_rejections(raw_payload: dict[str, Any], data_dict: dict[str, Any]) 
     if isinstance(raw_rejections, list):
         for item in raw_rejections:
             if isinstance(item, str) and item.strip():
-                rejections.append(redact_secrets(item.strip(), max_chars=200))
+                rejections.append(redact_secrets(item.strip(), max_chars=240))
     elif isinstance(raw_rejections, str) and raw_rejections.strip():
-        rejections.append(redact_secrets(raw_rejections.strip(), max_chars=200))
+        rejections.append(redact_secrets(raw_rejections.strip(), max_chars=240))
 
-    return rejected, rejections
-
-
-def classify_rejection_reasons(
-    action_rejected: bool,
-    rejections: list[str],
-    policy: AlternativeGrabPolicy,
-) -> tuple[str, Optional[str]]:
-    """
-    Classify autobrr/Radarr rejection signals:
-      - ("not_rejected", None): not rejected
-      - ("quality_rejected_suppress", matched_class): exclusively routine quality rejection,
-        not allowed by Alternative Grab policy -> suppress early
-      - ("alternative_grab_candidate", matched_class): exclusively routine quality rejection
-        AND every matched class is explicitly permitted by Alternative Grab policy
-      - ("needs_identity_and_radarr_check", None): empty, existing-movie, or unknown rejection;
-        must continue to identity verification + live Radarr check (never suppress blindly)
-    """
-    if not action_rejected:
-        return "not_rejected", None
-    if not rejections:
-        return "needs_identity_and_radarr_check", None
-
-    matched_classes: list[str] = []
-    for reason in rejections:
-        matched: Optional[str] = None
-        for class_name, pattern in _QUALITY_REJECTION_PATTERNS:
-            if pattern.search(reason):
-                matched = class_name
-                break
-        if matched is None:
-            # Any unknown / existing-movie / identity rejection must NOT be silently dropped as quality-only
-            return "needs_identity_and_radarr_check", None
-        if matched not in matched_classes:
-            matched_classes.append(matched)
-
-    primary_class = matched_classes[0]
-    if policy.enabled and all(c in policy.allowed_rejection_classes for c in matched_classes):
-        return "alternative_grab_candidate", primary_class
-    return "quality_rejected_suppress", primary_class
+    return rejected, action_is_radarr, rejections
 
 
 @dataclass(frozen=True)
@@ -284,8 +373,12 @@ class ClassifiedWebhook:
     size_gb: Optional[float] = None
     freeleech: Optional[bool] = None
     action_rejected: bool = False
+    action_is_radarr: bool = True
     rejections: list[str] = field(default_factory=list)
     has_download_url: bool = False
+    has_canonical_tl_download_ref: bool = False
+    has_season_or_episode: bool = False
+    has_parsed_title_year: bool = False
     incoming_evidence_digest: str = ""
 
     def to_sanitized_snapshot(self) -> dict[str, Any]:
@@ -308,20 +401,32 @@ class ClassifiedWebhook:
             "size_gb": self.size_gb,
             "freeleech": self.freeleech,
             "action_rejected": self.action_rejected,
+            "action_is_radarr": self.action_is_radarr,
             "rejections": list(self.rejections),
             "has_download_url": self.has_download_url,
+            "has_canonical_tl_download_ref": self.has_canonical_tl_download_ref,
+            "has_season_or_episode": self.has_season_or_episode,
+            "has_parsed_title_year": self.has_parsed_title_year,
         }
 
     @classmethod
     def from_sanitized_snapshot(cls, snap: dict[str, Any], incoming_digest: str) -> "ClassifiedWebhook":
+        exact_name = str(snap.get("exact_release_name") or "")
+        hint_title = snap.get("hint_title")
+        hint_year = snap.get("hint_year")
+        if "has_parsed_title_year" in snap:
+            has_ty = bool(snap.get("has_parsed_title_year"))
+        else:
+            pt, py = _extract_title_year_from_release_name(exact_name)
+            has_ty = bool((hint_title or pt) and (hint_year or py))
         return cls(
             classification="movie_candidate",
             indexer_raw=str(snap.get("indexer_raw") or ""),
             indexer_norm=str(snap.get("indexer_norm") or ""),
             external_id_norm=str(snap.get("external_id_norm") or ""),
-            exact_release_name=str(snap.get("exact_release_name") or ""),
-            hint_title=snap.get("hint_title"),
-            hint_year=snap.get("hint_year"),
+            exact_release_name=exact_name,
+            hint_title=hint_title,
+            hint_year=hint_year,
             category=snap.get("category"),
             meta_imdb=snap.get("meta_imdb"),
             meta_tmdb=snap.get("meta_tmdb"),
@@ -333,10 +438,66 @@ class ClassifiedWebhook:
             size_gb=snap.get("size_gb"),
             freeleech=snap.get("freeleech"),
             action_rejected=bool(snap.get("action_rejected")),
+            action_is_radarr=bool(snap.get("action_is_radarr", True)),
             rejections=list(snap.get("rejections") or []),
             has_download_url=bool(snap.get("has_download_url")),
+            has_canonical_tl_download_ref=bool(snap.get("has_canonical_tl_download_ref")),
+            has_season_or_episode=bool(snap.get("has_season_or_episode")),
+            has_parsed_title_year=has_ty,
             incoming_evidence_digest=incoming_digest,
         )
+
+
+def classify_rejection_reasons(classified: ClassifiedWebhook) -> tuple[str, Optional[str]]:
+    """
+    Classify autobrr/Radarr rejection signals per legacy Alternative Grab rules (OPS-REPORT #3):
+      - ("not_rejected", None): not rejected
+      - ("legacy_alt_grab_eligible", primary_class): Radarr rejection on a TorrentLeech movie
+        release with valid title/year, no season/episode, release name <= 512 chars, numeric
+        external_id, canonical HTTPS TL download URL bound to external_id, and 1-8 rejection
+        reasons EVERY ONE of which matches one of the 4 strict legacy forms.
+        (Worker must still verify movie-actions-api reports alternative_grab_configured=True!)
+      - ("quality_rejected_suppress", matched_class): exclusively routine quality rejection
+        that does not satisfy legacy Alternative Grab eligibility -> suppress early.
+      - ("needs_identity_and_radarr_check", None): empty, existing-movie, or unknown/mixed
+        non-quality rejection -> must continue to identity verification + live Radarr check.
+    """
+    if not classified.action_rejected:
+        return "not_rejected", None
+    if not classified.rejections:
+        return "needs_identity_and_radarr_check", None
+
+    legacy_ok, legacy_classes = validate_legacy_alt_grab_rejections(classified.rejections)
+    if legacy_ok:
+        source_eligible = (
+            classified.action_is_radarr
+            and classified.indexer_norm == "torrentleech"
+            and bool(_NUMERIC_ID_RE.fullmatch(classified.external_id_norm))
+            and 1 <= len(classified.exact_release_name) <= MAX_ALT_GRAB_RELEASE_NAME_LEN
+            and not classified.has_season_or_episode
+            and classified.has_parsed_title_year
+            and classified.has_canonical_tl_download_ref
+        )
+        if source_eligible:
+            return "legacy_alt_grab_eligible", legacy_classes[0]
+        return "quality_rejected_suppress", legacy_classes[0]
+
+    # Not strictly eligible for legacy Alternative Grab; check if ALL reasons are routine quality rejections.
+    matched_classes: list[str] = []
+    for reason in classified.rejections:
+        matched: Optional[str] = match_legacy_alt_grab_rejection_reason(reason)
+        if matched is None:
+            for class_name, pattern in _QUALITY_REJECTION_PATTERNS:
+                if pattern.search(reason):
+                    matched = class_name
+                    break
+        if matched is None:
+            # Any unknown / existing-movie / identity rejection must NOT be silently dropped as quality-only
+            return "needs_identity_and_radarr_check", None
+        if matched not in matched_classes:
+            matched_classes.append(matched)
+
+    return "quality_rejected_suppress", matched_classes[0]
 
 
 def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
@@ -421,9 +582,22 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
             diagnostic_note=f"unclassified_non_movie:cat={redact_secrets(category or 'none', max_chars=40)},type={release_type or 'none'}",
         )
 
-    action_rejected, rejections = _extract_rejections(raw_payload, data)
+    action_rejected, action_is_radarr, rejections = _extract_action_info(raw_payload, data)
     hint_title = _clean_str(release.get("title"))
     hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
+    parsed_title, parsed_year = _extract_title_year_from_release_name(exact_name)
+    has_parsed_title_year = bool((hint_title or parsed_title) and (hint_year or parsed_year))
+
+    raw_season = release.get("season")
+    raw_episode = release.get("episode")
+    has_season_or_episode = bool(
+        (isinstance(raw_season, int) and not isinstance(raw_season, bool) and raw_season > 0)
+        or (isinstance(raw_episode, int) and not isinstance(raw_episode, bool) and raw_episode > 0)
+        or (isinstance(raw_season, str) and raw_season.strip() not in ("", "0"))
+        or (isinstance(raw_episode, str) and raw_episode.strip() not in ("", "0"))
+        or _EPISODIC_RELEASE_RE.search(exact_name)
+    )
+
     meta_imdb = _clean_imdb(release.get("meta_imdb") or release.get("imdb_id"))
     meta_tmdb = _clean_int(release.get("meta_tmdb") or release.get("tmdb_id"), min_val=1)
     resolution = _clean_str(release.get("resolution"))
@@ -439,14 +613,23 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
     elif "is_freeleech" in release:
         freeleech = _clean_bool(release.get("is_freeleech"))
 
-    has_download_url = any(
-        isinstance(container.get(k), str)
-        and (
-            str(container.get(k)).strip().startswith("https://")
-            or str(container.get(k)).strip().startswith("http://")
-        )
-        for container in (release, data, raw_payload)
-        for k in ("download_url", "downloadUrl", "torrent_url", "torrentUrl")
+    # Inspect the first non-empty download URL strictly in memory (never stored/logged!)
+    first_download_url: Optional[str] = None
+    for container in (release, data, raw_payload):
+        for k in ("download_url", "downloadUrl", "torrent_url", "torrentUrl"):
+            val = container.get(k)
+            if isinstance(val, str) and val.strip():
+                first_download_url = val.strip()
+                break
+        if first_download_url:
+            break
+
+    has_download_url = bool(
+        first_download_url
+        and (first_download_url.startswith("https://") or first_download_url.startswith("http://"))
+    )
+    has_canonical_tl_download_ref = bool(
+        first_download_url and is_canonical_tl_download_url(first_download_url, external_id_norm)
     )
 
     digest_input = {
@@ -466,7 +649,10 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
         "size_gb": size_gb,
         "freeleech": freeleech,
         "action_rejected": action_rejected,
+        "action_is_radarr": action_is_radarr,
         "rejections": rejections,
+        "has_canonical_tl_download_ref": has_canonical_tl_download_ref,
+        "has_season_or_episode": has_season_or_episode,
     }
     incoming_digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -491,7 +677,11 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
         size_gb=size_gb,
         freeleech=freeleech,
         action_rejected=action_rejected,
+        action_is_radarr=action_is_radarr,
         rejections=rejections,
         has_download_url=has_download_url,
+        has_canonical_tl_download_ref=has_canonical_tl_download_ref,
+        has_season_or_episode=has_season_or_episode,
+        has_parsed_title_year=has_parsed_title_year,
         incoming_evidence_digest=incoming_digest,
     )

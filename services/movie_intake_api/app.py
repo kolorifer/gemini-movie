@@ -28,7 +28,7 @@ from .clients import (
     ShadowStubTriageClient,
     TriageApiClient,
 )
-from .config import AlternativeGrabPolicy, IntakeConfig
+from .config import IntakeConfig
 from .db import IntakeDB, generate_uuid7, utc_now, utc_now_iso
 from .security import constant_time_equals, install_log_redaction, redact_secrets
 from .tmdb_verifier import TmdbIndependentClient
@@ -122,18 +122,12 @@ def create_app(
     tmdb_client: Optional[TmdbIndependentClient] = None,
     triage_client: Optional[TriageApiClient] = None,
     actions_client: Optional[ActionsApiClient] = None,
-    alt_grab_policy: Optional[AlternativeGrabPolicy] = None,
     start_worker: bool = True,
 ) -> FastAPI:
     cfg = config or IntakeConfig.from_env()
     install_log_redaction()
 
     intake_db = db or IntakeDB(cfg.intake_db_path)
-    policy = (
-        alt_grab_policy
-        if alt_grab_policy is not None
-        else AlternativeGrabPolicy.load_from_file(cfg.alternative_grab_config_path)
-    )
     scraper = tl_scraper or TorrentLeechScraper(
         db=intake_db,
         cookie_file=cfg.tl_cookie_file,
@@ -170,7 +164,6 @@ def create_app(
         tmdb_client=tmdb,
         triage_client=triage,
         actions_client=actions,
-        alt_grab_policy=policy,
     )
 
     def require_internal_token(

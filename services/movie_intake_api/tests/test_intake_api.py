@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 
 from services.movie_intake_api.app import create_app
 from services.movie_intake_api.archive import archive_raw_webhook
-from services.movie_intake_api.classifier import classify_webhook_payload
+from services.movie_intake_api.classifier import (
+    classify_rejection_reasons,
+    classify_webhook_payload,
+    is_canonical_tl_download_url,
+    validate_legacy_alt_grab_rejections,
+)
 from services.movie_intake_api.clients import (
     ActionsApiClient,
     DeliveryCardResponse,
@@ -26,7 +31,7 @@ from services.movie_intake_api.clients import (
     TriageApiClient,
     TriageEvalResult,
 )
-from services.movie_intake_api.config import AlternativeGrabPolicy, IntakeConfig
+from services.movie_intake_api.config import IntakeConfig
 from services.movie_intake_api.db import IntakeDB, utc_now_iso
 from services.movie_intake_api.security import PrivateFileError, redact_secrets
 from services.movie_intake_api.tmdb_verifier import (
@@ -58,10 +63,16 @@ def _make_autobrr_movie_webhook(
     size: int = 68_500_000_000,
     freeleech: Optional[bool] = False,
     action_rejected: bool = False,
+    action_type: Optional[str] = "RADARR",
     rejections: Optional[list[str]] = None,
-    download_url: str = "https://tracker.invalid/download/9001001/passkey=SUPER_SECRET_PASSKEY_VALUE",
+    download_url: Optional[str] = None,
     event: str = "PUSH_APPROVED",
 ) -> dict[str, Any]:
+    effective_dl_url = (
+        download_url
+        if download_url is not None
+        else f"https://www.torrentleech.org/rss/download/{external_id}/SUPER_SECRET_PASSKEY_VALUE/{release_name}.torrent"
+    )
     rel: dict[str, Any] = {
         "name": release_name,
         "type": release_type,
@@ -73,7 +84,7 @@ def _make_autobrr_movie_webhook(
         "hdr": ["DV", "HDR10"] if "DV" in release_name else [],
         "media_processing": "REMUX",
         "group": "CiNEPHiLES" if "CiNEPHiLES" in release_name else "FraMeSToR",
-        "download_url": download_url,
+        "download_url": effective_dl_url,
         "protocol": "torrent",
         "timestamp": "2026-11-25T12:00:00Z",
     }
@@ -88,9 +99,13 @@ def _make_autobrr_movie_webhook(
     if freeleech is not None:
         rel["freeleech"] = freeleech
 
+    action_obj: dict[str, Any] = {"rejected": action_rejected}
+    if action_type is not None:
+        action_obj["type"] = action_type
+
     return {
         "event": event,
-        "action": {"rejected": action_rejected},
+        "action": action_obj,
         "data": {
             "indexer": indexer,
             "result": {"rejections": rejections or []},
@@ -204,16 +219,27 @@ class StubActionsClient(ActionsApiClient):
         radarr_handler: Any,
         card_handler: Optional[Any] = None,
         eval_reply_handler: Optional[Any] = None,
+        alternative_grab_configured: bool = False,
+        capabilities_handler: Optional[Any] = None,
     ) -> None:
         super().__init__(base_url="http://127.0.0.1:40721", internal_token="stub")
         self._radarr_handler = radarr_handler
         self._card_handler = card_handler
         self._eval_reply_handler = eval_reply_handler
+        self.alternative_grab_configured = alternative_grab_configured
+        self._capabilities_handler = capabilities_handler
+        self.capability_calls: int = 0
         self.radarr_calls: list[dict[str, Any]] = []
         self.card_calls: list[dict[str, Any]] = []
         self.eval_reply_calls: list[dict[str, Any]] = []
         self._next_msg_id = 500
         self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+
+    async def get_capabilities(self) -> Optional[bool]:
+        self.capability_calls += 1
+        if self._capabilities_handler is not None:
+            return self._capabilities_handler()
+        return self.alternative_grab_configured
 
     async def get_radarr_status(
         self,
@@ -263,10 +289,9 @@ def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
         "tl_metadata_enabled": True,
         "tl_cookie_file": tmpdir / "cookies.json",
         "tmdb_api_token": "stub-tmdb",
-        "tmdb_cache_path": tmpdir / "tmdb-cache.json",
+        "tmdb_cache_path": tmpdir / "intake-tmdb-cache.json",
         "webhook_archive_dir": tmpdir / "webhook-archive",
         "intake_db_path": tmpdir / "intake.db",
-        "alternative_grab_config_path": None,
         "triage_api_url": "http://127.0.0.1:40716",
         "actions_api_url": "http://127.0.0.1:40721",
         "shadow_replay_enabled": False,
@@ -280,7 +305,7 @@ def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
 
 
 class TestMovieIntakeApi(unittest.TestCase):
-    def test_config_enforces_absolute_paths_loopback_and_quality_only_policy(self) -> None:
+    def test_config_enforces_absolute_paths_loopback_and_least_privilege_isolation(self) -> None:
         with self.assertRaises(ValueError):
             IntakeConfig.from_env({"MOVIE_INTEL_HOST": "0.0.0.0"})
         with self.assertRaises(ValueError):
@@ -288,24 +313,10 @@ class TestMovieIntakeApi(unittest.TestCase):
         with self.assertRaises(ValueError):
             IntakeConfig.from_env({"MOVIE_INTEL_TL_COOKIE_FILE": "~/.config/cookies.json"})
 
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "alt-policy.json"
-            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}))
-            os.chmod(p, 0o600)
-            policy = AlternativeGrabPolicy.load_from_file(p)
-            self.assertTrue(policy.enabled)
-            self.assertEqual(policy.allowed_rejection_classes, frozenset({"cutoff_met"}))
-
-            # Non-quality rejection class must be rejected
-            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["identity_conflict"]}))
-            with self.assertRaises(ValueError):
-                AlternativeGrabPolicy.load_from_file(p)
-
-            # World-readable policy file must be rejected
-            p.write_text(json.dumps({"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}))
-            os.chmod(p, 0o644)
-            with self.assertRaises(PrivateFileError):
-                AlternativeGrabPolicy.load_from_file(p)
+        # Default TMDB cache path is isolated from legacy tmdb-cache.json, and intake NEVER reads alt-grab qBit config
+        default_cfg = IntakeConfig.from_env({"MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG": "/etc/nonexistent-qbit.json"})
+        self.assertEqual(default_cfg.tmdb_cache_path.name, "intake-tmdb-cache.json")
+        self.assertFalse(hasattr(default_cfg, "alternative_grab_config_path"))
 
         # Redaction scrubs webhook/action secrets and passkeys
         redacted = redact_secrets(
@@ -888,9 +899,9 @@ Language : German
                     ),
                 )
             )
-            actions = StubActionsClient(radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"))
-            alt_policy = AlternativeGrabPolicy(
-                enabled=True, allowed_rejection_classes=frozenset({"cutoff_met"})
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent", alternative_grab_configured=True),
+                alternative_grab_configured=True,
             )
 
             app = create_app(
@@ -900,7 +911,6 @@ Language : German
                 tmdb_client=tmdb,
                 triage_client=triage,
                 actions_client=actions,
-                alt_grab_policy=alt_policy,
                 start_worker=False,
             )
             with TestClient(app) as client:
@@ -911,7 +921,7 @@ Language : German
                     year=2024,
                     meta_imdb="tt0099999",
                     action_rejected=True,
-                    rejections=["Quality cutoff already met"],
+                    rejections=["Existing file meets cutoff: Remux-1080p"],
                 )
                 r = client.post("/webhook/test-webhook-secret", json=webhook)
                 self.assertEqual(r.status_code, 200)
@@ -925,11 +935,13 @@ Language : German
             self.assertEqual(triage.calls[0]["torrent_info"]["freeleech"], False)
             self.assertIn("extra_context", triage.calls[0])
 
-            # Identity conflict MUST render evidence_review ONLY (never actionable_grab or alternative_grab!)
+            # Identity conflict MUST render evidence_review ONLY (never actionable_grab or alternative_grab!),
+            # routed to Grab Anyway topic via preferred_topic_kind with 0 buttons
             self.assertEqual(len(actions.card_calls), 1)
             card = actions.card_calls[0]
             self.assertEqual(card["delivery_kind"], "evidence_review")
             self.assertEqual(card["identity_gate_status"], "evidence_review")
+            self.assertEqual(card.get("preferred_topic_kind"), "alternative_grab")
             self.assertNotIn("verified_tmdb_id", card)
             self.assertEqual(len(actions.eval_reply_calls), 1)
             self.assertEqual(actions.eval_reply_calls[0]["ack_message_id"], 501)
@@ -1081,7 +1093,11 @@ Language : German
                 )
             )
 
-            radarr_next = {"resp": RadarrStatusResponse(status="watched_unmonitored", movie_id=77)}
+            radarr_next = {
+                "resp": RadarrStatusResponse(
+                    status="watched_unmonitored", movie_id=77, monitored=False, alternative_grab_configured=True
+                )
+            }
             card_override: dict[str, Optional[DeliveryCardResponse]] = {"resp": None}
 
             def _card_handler(payload: dict[str, Any]) -> DeliveryCardResponse:
@@ -1097,9 +1113,7 @@ Language : German
             actions = StubActionsClient(
                 radarr_handler=lambda _t, _i: radarr_next["resp"],
                 card_handler=_card_handler,
-            )
-            alt_policy = AlternativeGrabPolicy(
-                enabled=True, allowed_rejection_classes=frozenset({"cutoff_met"})
+                alternative_grab_configured=True,
             )
             app = create_app(
                 cfg,
@@ -1108,7 +1122,6 @@ Language : German
                 tmdb_client=tmdb,
                 triage_client=triage,
                 actions_client=actions,
-                alt_grab_policy=alt_policy,
                 start_worker=False,
             )
 
@@ -1133,7 +1146,9 @@ Language : German
                 self.assertEqual(len(triage.calls), 0)
 
                 # 4b: Monitored, hasFile=false -> NOT suppressed, labeled explicitly
-                radarr_next["resp"] = RadarrStatusResponse(status="monitored_no_file", movie_id=77)
+                radarr_next["resp"] = RadarrStatusResponse(
+                    status="monitored_no_file", movie_id=77, monitored=True, alternative_grab_configured=True
+                )
                 client.post(
                     "/webhook/test-webhook-secret",
                     json=_make_autobrr_movie_webhook(
@@ -1148,8 +1163,28 @@ Language : German
                 self.assertEqual(actions.card_calls[-1]["delivery_kind"], "actionable_grab")
                 self.assertIn("Monitored in Radarr", actions.card_calls[-1]["radarr_note"])
 
+                owned_snapshot = {
+                    "movie_id": 77,
+                    "file_id": 888,
+                    "monitored": True,
+                    "quality_profile_id": 1,
+                    "relative_path": "Library.Film.2024.Remux-1080p.mkv",
+                    "edition": "",
+                    "release_group": "FraMeSToR",
+                    "size": 31_000_000_000,
+                    "quality": "Remux-1080p",
+                }
+
                 # 4c: Already owned (no Alternative Grab trigger) -> suppressed before delivery
-                radarr_next["resp"] = RadarrStatusResponse(status="owned_file", movie_id=77, file_id=888)
+                radarr_next["resp"] = RadarrStatusResponse(
+                    status="owned_file",
+                    movie_id=77,
+                    file_id=888,
+                    existing_quality="Remux-1080p",
+                    monitored=True,
+                    movie_file_snapshot=owned_snapshot,
+                    alternative_grab_configured=True,
+                )
                 cards_before = len(actions.card_calls)
                 r_4c = client.post(
                     "/webhook/test-webhook-secret",
@@ -1165,7 +1200,7 @@ Language : German
                 self.assertEqual(db.get_release(r_4c.json()["release_id"])["suppression_reason"], "already_owned")  # type: ignore[index]
                 self.assertEqual(len(actions.card_calls), cards_before)
 
-                # 4c-alt: Already owned + allowed quality-only cutoff_met -> alternative_grab bound to exact movie/file
+                # 4c-alt: Already owned (monitored) + allowed legacy cutoff_met -> alternative_grab bound to full 9-field snapshot
                 client.post(
                     "/webhook/test-webhook-secret",
                     json=_make_autobrr_movie_webhook(
@@ -1175,7 +1210,7 @@ Language : German
                         year=2024,
                         meta_imdb="tt4024001",
                         action_rejected=True,
-                        rejections=["Quality cutoff already met"],
+                        rejections=["Existing file meets cutoff: Remux-1080p"],
                     ),
                 )
                 asyncio.run(app.state.worker.process_next_queued())
@@ -1184,6 +1219,36 @@ Language : German
                 self.assertEqual(alt_card["bound_existing_movie_id"], 77)
                 self.assertEqual(alt_card["bound_existing_file_id"], 888)
                 self.assertEqual(alt_card["bound_rejection_class"], "cutoff_met")
+                self.assertEqual(alt_card["external_id"], "4004")
+                self.assertEqual(alt_card["rejection_reasons"], ["Existing file meets cutoff: Remux-1080p"])
+                self.assertEqual(alt_card["bound_movie_file_snapshot"], owned_snapshot)
+
+                # Unmonitored owned movie MUST NOT mint Alternative Grab (suppressed as already_owned)
+                radarr_next["resp"] = RadarrStatusResponse(
+                    status="owned_file",
+                    movie_id=77,
+                    file_id=888,
+                    existing_quality="Remux-1080p",
+                    monitored=False,
+                    movie_file_snapshot=dict(owned_snapshot, monitored=False),
+                    alternative_grab_configured=True,
+                )
+                cards_before_unmon = len(actions.card_calls)
+                r_unmon = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX.DV-OTHER",
+                        external_id="40041",
+                        title="Library Film",
+                        year=2024,
+                        meta_imdb="tt4024001",
+                        action_rejected=True,
+                        rejections=["Existing file meets cutoff: Remux-1080p"],
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(db.get_release(r_unmon.json()["release_id"])["suppression_reason"], "already_owned")  # type: ignore[index]
+                self.assertEqual(len(actions.card_calls), cards_before_unmon)
 
                 # Routine disallowed quality rejection -> suppressed early (0 TL calls, 0 cards)
                 tl_before = len(tl.calls)
@@ -3055,6 +3120,180 @@ Language : German
                 self.assertEqual(len(actions.card_calls), cards_before)
                 self.assertEqual(len(actions.eval_reply_calls), replies_before + 1)
                 self.assertEqual(actions.eval_reply_calls[-1]["ack_message_id"], ack_msg_3)
+
+    def test_legacy_alternative_grab_rejection_matrix_and_capability_boundary(self) -> None:
+        """Exact 4 legacy Radarr rejection forms, source checks, /internal/capabilities, and zero URL persistence."""
+        # 1) Exact 4 legacy forms pass across allowed sources/resolutions
+        allowed_cases = [
+            (["Existing file meets cutoff: Remux-2160p"], "cutoff_met"),
+            (["Existing file meets cutoff: Bluray-1080p"], "cutoff_met"),
+            (["Existing file meets cutoff: WEBDL-720p"], "cutoff_met"),
+            (["Existing file meets cutoff: WEBRip-1080p"], "cutoff_met"),
+            (["Existing file meets cutoff: HDTV-720p"], "cutoff_met"),
+            (["Existing file on disk is of equal or higher preference: Remux-1080p v1"], "equal_or_higher_preference"),
+            (["Existing file is of equal or higher preference: Bluray-2160p v2"], "equal_or_higher_preference"),
+            (["Upgrades are not allowed by the quality profile"], "upgrades_disallowed"),
+            (["Quality profile does not allow upgrades."], "upgrades_disallowed"),
+            (["Existing file on disk has an equal or higher Custom Format score (100 >= 50)"], "custom_format_score"),
+            (
+                ["Not a Custom Format upgrade for existing movie file(s). New: [DV] (10) do not improve on Existing: [DV FEL] (20)"],
+                "custom_format_score",
+            ),
+        ]
+        for reasons, expected_class in allowed_cases:
+            wh = _make_autobrr_movie_webhook(
+                external_id="77001",
+                action_rejected=True,
+                rejections=reasons,
+            )
+            cw = classify_webhook_payload(wh)
+            self.assertTrue(cw.has_canonical_tl_download_ref)
+            mode, matched = classify_rejection_reasons(cw)
+            self.assertEqual(mode, "legacy_alt_grab_eligible", msg=f"Failed for {reasons}")
+            self.assertEqual(matched, expected_class)
+
+        # 2) Disallowed quality forms, v0, >8 reasons, mixed list, non-Radarr action, non-canonical URL, long name
+        disallowed_quality_payloads = [
+            # Unsupported source/resolution
+            _make_autobrr_movie_webhook(
+                external_id="77002", action_rejected=True, rejections=["Existing file meets cutoff: DVD-480p"]
+            ),
+            # v0 version is not positive
+            _make_autobrr_movie_webhook(
+                external_id="77003",
+                action_rejected=True,
+                rejections=["Existing file on disk is of equal or higher preference: Remux-1080p v0"],
+            ),
+            # > 8 rejection reasons
+            _make_autobrr_movie_webhook(
+                external_id="77004",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p"] * 9,
+            ),
+            # Mixed quality list (1 allowed + 1 disallowed quality reason)
+            _make_autobrr_movie_webhook(
+                external_id="77005",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p", "Exceeds maximum size"],
+            ),
+            # Non-Radarr action type
+            _make_autobrr_movie_webhook(
+                external_id="77006",
+                action_rejected=True,
+                action_type="QBITTORRENT",
+                rejections=["Existing file meets cutoff: Remux-1080p"],
+            ),
+            # Non-TorrentLeech indexer
+            _make_autobrr_movie_webhook(
+                indexer="PrivateHD",
+                external_id="77007",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p"],
+            ),
+            # Non-canonical download URL (mismatched external_id in URL path)
+            _make_autobrr_movie_webhook(
+                external_id="77008",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p"],
+                download_url="https://www.torrentleech.org/rss/download/99999/KEY/Release.torrent",
+            ),
+            # Non-HTTPS download URL
+            _make_autobrr_movie_webhook(
+                external_id="77009",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p"],
+                download_url="http://www.torrentleech.org/rss/download/77009/KEY/Release.torrent",
+            ),
+            # Release name > 512 chars
+            _make_autobrr_movie_webhook(
+                release_name="Example.Film.2024." + ("A" * 510) + ".2160p.REMUX-GRP",
+                external_id="77010",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p"],
+            ),
+        ]
+        for payload in disallowed_quality_payloads:
+            cw = classify_webhook_payload(payload)
+            mode, _ = classify_rejection_reasons(cw)
+            self.assertEqual(mode, "quality_rejected_suppress", msg=f"Should suppress: {payload}")
+
+        # Mixed list containing an unknown / non-quality rejection MUST continue to identity + Radarr check (not blindly drop!)
+        mixed_unknown = classify_webhook_payload(
+            _make_autobrr_movie_webhook(
+                external_id="77011",
+                action_rejected=True,
+                rejections=["Existing file meets cutoff: Remux-1080p", "Unknown movie in Radarr"],
+            )
+        )
+        self.assertEqual(classify_rejection_reasons(mixed_unknown), ("needs_identity_and_radarr_check", None))
+
+        # 3) Worker capability check: False suppresses early (0 TL calls); None re-queues cleanly; zero URL in intake.db
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _ext, _n: TorrentLeechResult(outcome="listing_id_missing"),
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+            triage = StubTriageClient(lambda _b: TriageEvalResult(ok=False, error_redacted="unused"))
+            cap_state: dict[str, Optional[bool]] = {"val": False}
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: RadarrStatusResponse(status="absent"),
+                capabilities_handler=lambda: cap_state["val"],
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                # 3a: alternative_grab_configured=False -> suppressed early with 0 TL calls
+                r_off = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        external_id="78001",
+                        action_rejected=True,
+                        rejections=["Existing file meets cutoff: Remux-1080p"],
+                    ),
+                )
+                self.assertEqual(r_off.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                rel_off = db.get_release(r_off.json()["release_id"])
+                assert rel_off is not None
+                self.assertEqual(rel_off["state"], "suppressed")
+                self.assertEqual(rel_off["suppression_reason"], "quality_rejected")
+                self.assertEqual(len(tl.calls), 0)
+                self.assertEqual(actions.capability_calls, 1)
+
+                # 3b: capabilities endpoint transiently unavailable (None) -> re-queued cleanly (not permanently dropped)
+                cap_state["val"] = None
+                r_transient = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        external_id="78002",
+                        action_rejected=True,
+                        rejections=["Existing file meets cutoff: Remux-1080p"],
+                    ),
+                )
+                asyncio.run(app.state.worker.process_next_queued())
+                rel_t = db.get_release(r_transient.json()["release_id"])
+                assert rel_t is not None
+                self.assertEqual(rel_t["state"], "queued")
+                self.assertEqual(rel_t["retry_count"], 1)
+                self.assertEqual(len(tl.calls), 0)
+
+            # Raw download URL & passkey MUST NEVER appear in intake.db
+            db_bytes = cfg.intake_db_path.read_bytes()
+            self.assertNotIn(b"SUPER_SECRET_PASSKEY_VALUE", db_bytes)
+            self.assertNotIn(b"/rss/download/", db_bytes)
 
 
 if __name__ == "__main__":

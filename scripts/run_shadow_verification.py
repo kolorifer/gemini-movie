@@ -405,7 +405,7 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
         radarr_stub = _ShadowRadarr()
         tg_stub = _ShadowTelegram()
         tl_stub = _ShadowTl(state_root / "unused-cookies.json", tl_outcomes)
-        tmdb_stub = _ShadowTmdb(state_root / "tmdb-cache.json", tmdb_records)
+        tmdb_stub = _ShadowTmdb(state_root / "intake-tmdb-cache.json", tmdb_records)
 
         # Seed Radarr states for Case 4
         radarr_stub.movies = {
@@ -450,10 +450,9 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
             tl_metadata_enabled=True,
             tl_cookie_file=state_root / "unused-cookies.json",
             tmdb_api_token="shadow-unused",
-            tmdb_cache_path=state_root / "tmdb-cache.json",
+            tmdb_cache_path=state_root / "intake-tmdb-cache.json",
             webhook_archive_dir=state_root / "webhook-archive",
             intake_db_path=state_root / "intake.db",
-            alternative_grab_config_path=None,
             triage_api_url="http://triage.local",
             actions_api_url="http://actions.local",
             shadow_replay_enabled=False,

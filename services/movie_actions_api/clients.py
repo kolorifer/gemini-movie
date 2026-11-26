@@ -353,6 +353,12 @@ class RadarrClient:
             return RadarrReadResult(ok=False, status_code=res.status_code, error_redacted="radarr_profiles_not_list")
         return res
 
+    async def get_download_clients(self) -> RadarrReadResult:
+        res = await self._get_json("/api/v3/downloadclient")
+        if res.ok and not isinstance(res.data, list):
+            return RadarrReadResult(ok=False, status_code=res.status_code, error_redacted="radarr_downloadclients_not_list")
+        return res
+
     async def get_movies_by_tmdb(self, tmdb_id: int) -> RadarrReadResult:
         res = await self._get_json("/api/v3/movie", params={"tmdbId": tmdb_id})
         if not res.ok:
@@ -855,6 +861,7 @@ class ShadowStubRadarrClient(RadarrClient):
         self.tags: list[dict[str, Any]] = [{"id": 7, "label": "watched"}]
         self.root_folders: list[dict[str, Any]] = [{"id": 1, "path": "/media/movies"}]
         self.quality_profiles: list[dict[str, Any]] = [{"id": 4, "name": "Remux-2160p"}]
+        self.download_clients: list[dict[str, Any]] = []
         self.movies: dict[int, dict[str, Any]] = {}
         self.queue: list[dict[str, Any]] = []
         self.history: list[dict[str, Any]] = []
@@ -871,6 +878,9 @@ class ShadowStubRadarrClient(RadarrClient):
 
     async def get_quality_profiles(self) -> RadarrReadResult:
         return RadarrReadResult(ok=True, data=list(self.quality_profiles), status_code=200)
+
+    async def get_download_clients(self) -> RadarrReadResult:
+        return RadarrReadResult(ok=True, data=list(self.download_clients), status_code=200)
 
     async def get_movies_by_tmdb(self, tmdb_id: int) -> RadarrReadResult:
         matches = [dict(m) for m in self.movies.values() if m.get("tmdbId") == tmdb_id]

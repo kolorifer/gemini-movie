@@ -43,6 +43,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
                         'MOVIE_INTEL_WEBHOOK_SECRET="sec#with spaces\\"and\\\\slash"',
                         "MOVIE_INTEL_TL_COOKIE_FILE=/custom/tl-cookies.json",
                         "TMDB_API_TOKEN=tmdb-token-xyz",
+                        "TMDB_CACHE_PATH=/home/legacy/.local/state/movie-intel/tmdb-cache.json",
+                        "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG=/home/legacy/.config/movie-intel/alternative-grab.json",
                         "RADARR_URL=https://seedbox.invalid/u/radarr",
                         "RADARR_API_KEY=radarr-secret-123",
                         "TELEGRAM_BOT_TOKEN=123456:AAH_BOT_SECRET",
@@ -83,8 +85,17 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
                 shadow_mode=False,
             )
             # Strict least-privilege isolation: zero forbidden secrets cross boundaries
+            self.assertIn("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", INTAKE_FORBIDDEN_KEYS)
             self.assertFalse(set(intake_env.keys()) & INTAKE_FORBIDDEN_KEYS)
             self.assertFalse(set(actions_env.keys()) & ACTIONS_FORBIDDEN_KEYS)
+            self.assertNotIn("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", intake_env)
+            self.assertEqual(
+                actions_env["MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG"],
+                "/home/legacy/.config/movie-intel/alternative-grab.json",
+            )
+            # Must NOT inherit legacy tmdb-cache.json (incompatible schema); use distinct intake-tmdb-cache.json
+            self.assertTrue(intake_env["TMDB_CACHE_PATH"].endswith("intake-tmdb-cache.json"))
+            self.assertNotIn("/home/legacy/", intake_env["TMDB_CACHE_PATH"])
             self.assertEqual(intake_env["MOVIE_INTEL_WEBHOOK_SECRET"], 'sec#with spaces"and\\slash')
             self.assertEqual(actions_env["RADARR_API_KEY"], "radarr-secret-123")
             self.assertEqual(actions_env["TELEGRAM_BOT_TOKEN"], "123456:AAH_BOT_SECRET")
@@ -141,6 +152,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sh_intake["TMDB_API_TOKEN"], "")
             self.assertEqual(sh_actions["RADARR_API_KEY"], "")
             self.assertEqual(sh_actions["TELEGRAM_BOT_TOKEN"], "")
+            self.assertEqual(sh_actions["MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG"], "")
+            self.assertTrue(sh_intake["TMDB_CACHE_PATH"].endswith("intake-tmdb-cache.json"))
             self.assertIn("movie-intel-shadow", sh_intake["INTAKE_DB_PATH"])
             self.assertIn("movie-intel-shadow", sh_actions["ACTIONS_DB_PATH"])
 

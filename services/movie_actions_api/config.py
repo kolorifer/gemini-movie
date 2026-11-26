@@ -13,9 +13,6 @@ MAX_POLICY_CONFIG_BYTES = 65_536
 MAX_ACTION_FORM_BYTES = 16_384
 
 ALLOWED_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-QUALITY_ONLY_REJECTION_CLASSES = frozenset(
-    {"cutoff_met", "not_upgrade", "quality_unwanted", "custom_format_score", "size_limit"}
-)
 
 
 def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -82,33 +79,57 @@ def _validate_service_url(env_name: str, raw: str) -> str:
 
 
 @dataclass(frozen=True)
-class AlternativeGrabPolicy:
-    enabled: bool = False
-    allowed_rejection_classes: frozenset[str] = field(default_factory=frozenset)
+class AlternativeGrabConfig:
+    """
+    Live Ultra.cc Alternative Grab ("Grab Anyway") configuration held exclusively by
+    movie-actions-api (owner-only 0600 JSON with keys: url, username, password, category, state).
+    """
+
+    url: str
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+    category: str = ""
+    state_dir: Path = field(default_factory=lambda: Path("/nonexistent"))
 
     @classmethod
-    def load_from_file(cls, path: Optional[Path]) -> "AlternativeGrabPolicy":
+    def load_from_file(cls, path: Optional[Path]) -> Optional["AlternativeGrabConfig"]:
         if path is None:
-            return cls(enabled=False, allowed_rejection_classes=frozenset())
+            return None
         raw_bytes = read_owner_private_regular_file(path, max_bytes=MAX_POLICY_CONFIG_BYTES)
         parsed = json.loads(raw_bytes.decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG must contain a JSON object")
-        enabled = bool(parsed.get("enabled", True))
-        raw_classes = parsed.get("allowed_rejection_classes") or []
-        if not isinstance(raw_classes, list):
-            raise ValueError("allowed_rejection_classes must be a list of strings")
-        normalized = {
-            str(item).strip().lower()
-            for item in raw_classes
-            if isinstance(item, str) and item.strip()
-        }
-        invalid = normalized - QUALITY_ONLY_REJECTION_CLASSES
-        if invalid:
+
+        required = ("url", "username", "password", "category", "state")
+        values: dict[str, str] = {}
+        for key in required:
+            raw_val = parsed.get(key)
+            if not isinstance(raw_val, str) or not raw_val.strip():
+                raise ValueError(f"MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG missing non-empty string field: {key}")
+            val = raw_val.strip()
+            if "\n" in val or "\r" in val or "\x00" in val:
+                raise ValueError(f"MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG contains control characters in field: {key}")
+            values[key] = val
+
+        parsed_url = urlparse(values["url"].rstrip("/"))
+        if parsed_url.scheme != "https" or not parsed_url.hostname:
+            raise ValueError("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG.url must be an HTTPS URL")
+        if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
             raise ValueError(
-                f"Alternative Grab config contains non-quality rejection classes: {sorted(invalid)}"
+                "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG.url must not contain userinfo, query parameters, or fragments"
             )
-        return cls(enabled=enabled and bool(normalized), allowed_rejection_classes=frozenset(normalized))
+
+        state_raw = values["state"]
+        if state_raw.startswith("~") or not os.path.isabs(state_raw):
+            raise ValueError("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG.state must be an absolute path")
+
+        return cls(
+            url=values["url"].rstrip("/"),
+            username=values["username"],
+            password=values["password"],
+            category=values["category"],
+            state_dir=Path(state_raw),
+        )
 
 
 @dataclass(frozen=True)
@@ -137,14 +158,19 @@ class ActionsConfig:
     intake_timeout_seconds: float = 15.0
     write_lease_grace_seconds: float = 30.0
 
-    def topic_for_delivery_kind(self, delivery_kind: str) -> Optional[int]:
-        if delivery_kind == "actionable_grab":
+    def topic_for_delivery_kind(
+        self, delivery_kind: str, *, preferred_topic_kind: Optional[str] = None
+    ) -> Optional[int]:
+        effective = delivery_kind
+        if delivery_kind == "evidence_review" and preferred_topic_kind == "alternative_grab":
+            effective = "alternative_grab"
+        if effective == "actionable_grab":
             return (
                 self.telegram_add_grab_topic_id
                 if self.telegram_add_grab_topic_id is not None
                 else self.telegram_topic_id
             )
-        if delivery_kind == "alternative_grab":
+        if effective == "alternative_grab":
             return (
                 self.telegram_grab_anyway_topic_id
                 if self.telegram_grab_anyway_topic_id is not None
