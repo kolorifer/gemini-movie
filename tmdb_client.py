@@ -30,11 +30,20 @@ TMDB_TIMEOUT_SECONDS = 6.0
 
 _TRACKER_SECRET_RE = re.compile(
     r"https?://\S+|magnet:\S+|www\.\S+"
-    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|authorization|cookie|bearer)\b\s*[:=]?\s*\S+"
-    r"|\bkey\s*=\s*\S+"
-    r"|[A-Za-z0-9_-]{48,}",
+    r"|/webhook/[^/\s?\"']+"
+    r"|/action/[^/\s?\"']+"
+    r"|bot\d{5,15}:[A-Za-z0-9_-]{20,}"
+    r"|\b\d{5,15}:[A-Za-z0-9_-]{25,}\b"
+    r"|AIza[A-Za-z0-9_-]{20,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]*)?"
+    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|passwd|authorization|cookie|set-cookie|x-internal-token|x-api-key|key)\s*[:=]\s*[^\s\"'&;,]+"
+    r"|\b(?:passkey|authkey|api[_-]?key|apikey|x-internal-token|x-api-key)\s+[^\s\"'&;,]+"
+    r"|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"
+    r"|\b[A-Fa-f0-9]{32,}\b"
+    r"|\b[A-Za-z0-9_]{48,}\b",
     re.IGNORECASE,
 )
+_IMDB_ID_STRICT_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
 _NFO_DURATION_HM_RE = re.compile(r"\bDuration\s*:\s*(\d{1,2})\s*h\s*(\d{1,2})\s*min\b", re.IGNORECASE)
 _NFO_DURATION_M_RE = re.compile(r"\bDuration\s*:\s*(\d{1,4})\s*min\b", re.IGNORECASE)
 
@@ -770,27 +779,47 @@ def format_torrent_info_for_prompt(
         "TRACKER TORRENT INFO (corroborating context; tracker IDs/descriptions are uploader-supplied and can occasionally be wrong, whereas MediaInfo duration/audio reflect the actual file):"
     ]
     if conflict_warning:
-        lines.append(
-            f"- CONFLICT WARNING: {conflict_warning} "
-            "Treat the tracker's ID and synopsis as UNTRUSTED; verify the true film from the release string, MediaInfo facts, and Google Search, and note the tracker mismatch in disambiguation_note."
-        )
+        clean_warn = sanitize_tracker_text(conflict_warning, max_chars=400)
+        if clean_warn:
+            lines.append(
+                f"- CONFLICT WARNING: {clean_warn} "
+                "Treat the tracker's ID and synopsis as UNTRUSTED; verify the true film from the release string, MediaInfo facts, and Google Search, and note the tracker mismatch in disambiguation_note."
+            )
 
     if torrent_info is not None:
         meta_parts: list[str] = []
         if torrent_info.indexer:
-            meta_parts.append(f"indexer={torrent_info.indexer}")
+            v = sanitize_tracker_text(torrent_info.indexer, max_chars=80)
+            if v:
+                meta_parts.append(f"indexer={v}")
         if torrent_info.category:
-            meta_parts.append(f"category={torrent_info.category}")
+            v = sanitize_tracker_text(torrent_info.category, max_chars=120)
+            if v:
+                meta_parts.append(f"category={v}")
         if torrent_info.resolution:
-            meta_parts.append(f"resolution={torrent_info.resolution}")
+            v = sanitize_tracker_text(torrent_info.resolution, max_chars=40)
+            if v:
+                meta_parts.append(f"resolution={v}")
         if torrent_info.source:
-            meta_parts.append(f"source={torrent_info.source}")
+            v = sanitize_tracker_text(torrent_info.source, max_chars=60)
+            if v:
+                meta_parts.append(f"source={v}")
         if torrent_info.media_processing:
-            meta_parts.append(f"processing={torrent_info.media_processing}")
+            v = sanitize_tracker_text(torrent_info.media_processing, max_chars=60)
+            if v:
+                meta_parts.append(f"processing={v}")
         if torrent_info.dynamic_range:
-            meta_parts.append("dynamic_range=" + "+".join(torrent_info.dynamic_range))
+            dr_clean = [
+                sanitize_tracker_text(d, max_chars=40)
+                for d in torrent_info.dynamic_range
+            ]
+            dr_clean = [d for d in dr_clean if d]
+            if dr_clean:
+                meta_parts.append("dynamic_range=" + "+".join(dr_clean))
         if torrent_info.group:
-            meta_parts.append(f"group={torrent_info.group}")
+            v = sanitize_tracker_text(torrent_info.group, max_chars=80)
+            if v:
+                meta_parts.append(f"group={v}")
         if torrent_info.size_gb is not None:
             meta_parts.append(f"size={torrent_info.size_gb:.1f} GB")
         if torrent_info.freeleech is not None:
@@ -804,11 +833,19 @@ def format_torrent_info_for_prompt(
         if effective_runtime is not None:
             lines.append(f"- MediaInfo file duration: {effective_runtime} minutes")
         if torrent_info.audio_languages:
-            lines.append("- MediaInfo audio languages: " + ", ".join(torrent_info.audio_languages))
+            clean_langs = [
+                sanitize_tracker_text(lang, max_chars=40)
+                for lang in torrent_info.audio_languages
+            ]
+            clean_langs = [lang for lang in clean_langs if lang]
+            if clean_langs:
+                lines.append("- MediaInfo audio languages: " + ", ".join(clean_langs))
 
         id_label = "untrusted/conflicting" if conflict_warning else "tracker-reported, cross-check"
         if torrent_info.imdb_id:
-            lines.append(f"- Tracker IMDb ID ({id_label}): {torrent_info.imdb_id}")
+            clean_imdb = torrent_info.imdb_id.strip().lower()
+            if _IMDB_ID_STRICT_RE.fullmatch(clean_imdb):
+                lines.append(f"- Tracker IMDb ID ({id_label}): {clean_imdb}")
         if torrent_info.tmdb_id is not None:
             lines.append(f"- Tracker TMDB ID ({id_label}): {torrent_info.tmdb_id}")
 

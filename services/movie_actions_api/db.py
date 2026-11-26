@@ -1060,6 +1060,7 @@ class ActionsDB:
         card_revision: int,
         expected_ack_chat_id: Optional[str],
         expected_ack_message_id: Optional[int],
+        expected_ack_thread_id: Optional[int] = None,
         process_instance_id: str,
         lease_expires_at: str,
     ) -> EvalReplyPlan:
@@ -1107,6 +1108,7 @@ class ActionsDB:
             ack_chat = str(row["ack_chat_id"] or "")
             ack_msg = row["ack_message_id"]
             ack_thread = row["ack_thread_id"]
+            target_thread = row["target_thread_id"]
             if (
                 del_status == "ambiguous_delivery"
                 or del_status != "delivered"
@@ -1120,6 +1122,17 @@ class ActionsDB:
                     detail=f"cannot_reply_to_delivery_status:{del_status}",
                 )
 
+            # Issue #13 §6c: Distinguish topic chats (`target_thread_id IS NOT NULL`) from known
+            # non-topic chats (`target_thread_id IS NULL`). If a topic was requested but Telegram
+            # omitted `message_thread_id` in its acknowledgement, topic correlation is unknown and
+            # dependent replies MUST NOT guess the destination.
+            if target_thread is not None and ack_thread is None:
+                conn.execute("COMMIT;")
+                return EvalReplyPlan(
+                    mode="reject_unanchored",
+                    detail="ack_thread_id_omitted_for_topic_chat",
+                )
+
             if expected_ack_message_id is not None and int(expected_ack_message_id) != int(ack_msg):
                 conn.execute("COMMIT;")
                 return EvalReplyPlan(
@@ -1131,6 +1144,14 @@ class ActionsDB:
                 return EvalReplyPlan(
                     mode="reject_receipt_mismatch",
                     detail="ack_chat_id_mismatch",
+                )
+            if expected_ack_thread_id is not None and (
+                ack_thread is None or int(expected_ack_thread_id) != int(ack_thread)
+            ):
+                conn.execute("COMMIT;")
+                return EvalReplyPlan(
+                    mode="reject_receipt_mismatch",
+                    detail="ack_thread_id_mismatch",
                 )
 
             current_card_rev = int(row["card_revision"] or 0)
