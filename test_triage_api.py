@@ -708,16 +708,29 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertEqual(client.get("/feedback", headers=headers).status_code, 200)
                 self.assertEqual(client.get("/recent", headers=headers).status_code, 200)
 
-            # Backward-compatible mode when INTERNAL_API_SECRET is empty
+            # Issue #13 §5b: Fail closed (503) when INTERNAL_API_SECRET is empty, tested independently
             with (
                 patch.object(main, "db", test_db),
                 patch.object(main, "INTERNAL_API_SECRET", ""),
                 TestClient(main.app) as client,
             ):
-                health_open = client.get("/health")
-                self.assertEqual(health_open.status_code, 200)
-                self.assertFalse(health_open.json()["auth_enabled"])
-                self.assertEqual(client.get("/recent").status_code, 200)
+                health_unconf = client.get("/health")
+                self.assertEqual(health_unconf.status_code, 200)
+                self.assertFalse(health_unconf.json()["auth_enabled"])
+                self.assertEqual(client.get("/recent").status_code, 503)
+                self.assertEqual(client.get("/recent", headers={"X-Internal-Token": "anything"}).status_code, 503)
+                self.assertEqual(client.get("/feedback").status_code, 503)
+                self.assertEqual(
+                    client.post(
+                        "/feedback",
+                        json={"title": "La Chimera", "imdb_id": "tt14561712", "decision": "watch"},
+                    ).status_code,
+                    503,
+                )
+                self.assertEqual(
+                    client.post("/evaluate", json={"raw_text": "La.Chimera.2023.1080p.REMUX-GRP"}).status_code,
+                    503,
+                )
 
     def test_compute_evidence_key_sensitivity_and_empty_parity(self) -> None:
         from schemas import TorrentInfo
@@ -1579,6 +1592,87 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                     "rotten_tomatoes_audience": "rottentomatoes.com",
                 },
             )
+
+    def test_issue_13_5a_every_outbound_prompt_field_redacts_secret_markers(self) -> None:
+        """Issue #13 §5a: Every outbound LLM prompt field scrubs secret markers without mangling normal titles."""
+        from gemini_client import build_system_instruction, build_user_prompt
+        from schemas import TorrentInfo
+        from tmdb_client import format_torrent_info_for_prompt, sanitize_tracker_text
+
+        markers = [
+            "MARK_RAW_PASS",
+            "MARK_HINT_KEY",
+            "MARK_EXTRA_COOK",
+            "MARK_RQ_TOK",
+            "MARK_IDX_URL",
+            "MARK_CAT_KEY",
+            "MARK_RES_SEC",
+            "MARK_SRC_BEAR",
+            "MARK_PROC_WH",
+            "MARK_DR_ACT",
+            "MARK_GRP_BOT",
+            "MARK_AUD_AIZA",
+            "MARK_IMDB_LEAK",
+            "MARK_DESC_JWT",
+            "MARK_NFO_PASS",
+            "MARK_WARN_TOK",
+            "MARK_FB_TITLE",
+            "MARK_FB_NOTE",
+        ]
+        tinfo = TorrentInfo(
+            indexer="TorrentLeech https://tracker.invalid/MARK_IDX_URL",
+            category="Movies :: 4K api_key=MARK_CAT_KEY",
+            resolution="2160p secret=MARK_RES_SEC",
+            source="UHD BluRay Bearer MARK_SRC_BEAR_123456",
+            media_processing="REMUX /webhook/MARK_PROC_WH",
+            dynamic_range=["HDR10 /action/MARK_DR_ACT"],
+            group="GRP 123456789:AAH_MARK_GRP_BOT_0123456789",
+            audio_languages=["English AIzaSyMARK_AUD_AIZA_1234567890"],
+            imdb_id="tt0000000 passkey=MARK_IMDB_LEAK",
+            description="Synopsis eyJhbGciOiJIUzI1NiJ9.eyJtIjoiTUFSS19ERVNDX0pXVCJ9.MARK_DESC_JWT",
+            nfo_text="Duration: 1 h 55 min passkey=MARK_NFO_PASS",
+        )
+        req = EvaluateRequest(
+            raw_text="Example.Film.2025.2160p.UHD.BluRay.REMUX passkey=MARK_RAW_PASS",
+            hint_title="Example Film api_key=MARK_HINT_KEY",
+            hint_year=2025,
+            extra_context="cookie=MARK_EXTRA_COOK",
+            torrent_info=tinfo,
+        )
+        torrent_ctx = format_torrent_info_for_prompt(
+            tinfo,
+            conflict_warning="Mismatch token=MARK_WARN_TOK",
+        )
+        user_prompt = build_user_prompt(
+            req,
+            torrent_context=torrent_ctx,
+            release_quality_context="Release quality: Remux-2160p token=MARK_RQ_TOK",
+        )
+        sys_prompt = build_system_instruction(
+            "Taste profile",
+            [
+                {
+                    "decision": "WATCH",
+                    "title": "Harbor Film passkey=MARK_FB_TITLE",
+                    "imdb_id": "tt1234567",
+                    "note": "watched cookie=MARK_FB_NOTE",
+                }
+            ],
+        )
+        combined = f"{user_prompt}\n{sys_prompt}"
+        for m in markers:
+            self.assertNotIn(m, combined, f"Secret marker {m} leaked into outbound LLM prompt!")
+
+        # Non-regression: ordinary movie titles containing 'Secret' or 'Cookie' MUST NOT be mangled!
+        self.assertEqual(
+            sanitize_tracker_text("The.Secret.Agent.2025.2160p.UHD.BluRay.REMUX-GRP"),
+            "The.Secret.Agent.2025.2160p.UHD.BluRay.REMUX-GRP",
+        )
+        self.assertEqual(
+            sanitize_tracker_text("The Secret Life of Walter Mitty"),
+            "The Secret Life of Walter Mitty",
+        )
+        self.assertEqual(sanitize_tracker_text("Cookie's Fortune"), "Cookie's Fortune")
 
 
 if __name__ == "__main__":

@@ -687,35 +687,53 @@ class ClassifiedWebhook:
     has_canonical_tl_download_ref: bool = False
     has_season_or_episode: bool = False
     has_parsed_title_year: bool = False
+    release_name_too_long: bool = False
     incoming_evidence_digest: str = ""
 
     def to_sanitized_snapshot(self) -> dict[str, Any]:
-        """Serialize strictly sanitized non-secret intake evidence (no URLs/passkeys)."""
+        """Serialize strictly sanitized non-secret intake evidence (no URLs/passkeys/tokens)."""
+        def _opt(val: Optional[str], limit: int) -> Optional[str]:
+            if not val:
+                return None
+            clean = redact_secrets(val, max_chars=limit)
+            return clean or None
+
         return {
-            "indexer_raw": self.indexer_raw,
-            "indexer_norm": self.indexer_norm,
-            "external_id_norm": self.external_id_norm,
-            "exact_release_name": self.exact_release_name,
-            "hint_title": self.hint_title,
+            "indexer_raw": redact_secrets(self.indexer_raw, max_chars=80),
+            "indexer_norm": redact_secrets(self.indexer_norm, max_chars=80).lower(),
+            "external_id_norm": redact_secrets(self.external_id_norm, max_chars=80),
+            "exact_release_name": redact_secrets(self.exact_release_name, max_chars=512),
+            "hint_title": _opt(self.hint_title, 240),
             "hint_year": self.hint_year,
-            "category": self.category,
+            "category": _opt(self.category, 120),
             "meta_imdb": self.meta_imdb,
             "meta_tmdb": self.meta_tmdb,
-            "resolution": self.resolution,
-            "source": self.source,
-            "dynamic_range": list(self.dynamic_range),
-            "media_processing": self.media_processing,
-            "group": self.group,
+            "resolution": _opt(self.resolution, 40),
+            "source": _opt(self.source, 60),
+            "dynamic_range": [
+                clean
+                for d in self.dynamic_range
+                for clean in (redact_secrets(d, max_chars=40),)
+                if clean
+            ],
+            "media_processing": _opt(self.media_processing, 60),
+            "group": _opt(self.group, 80),
             "size_gb": self.size_gb,
             "freeleech": self.freeleech,
             "action_rejected": self.action_rejected,
             "action_is_radarr": self.action_is_radarr,
-            "rejections": list(self.rejections),
+            "rejections": [
+                clean
+                for r in self.rejections
+                for clean in (redact_secrets(r, max_chars=240),)
+                if clean
+            ],
             "has_malformed_rejections": self.has_malformed_rejections,
             "has_download_url": self.has_download_url,
             "has_canonical_tl_download_ref": self.has_canonical_tl_download_ref,
             "has_season_or_episode": self.has_season_or_episode,
             "has_parsed_title_year": self.has_parsed_title_year,
+            "release_name_too_long": self.release_name_too_long,
         }
 
     @classmethod
@@ -754,6 +772,7 @@ class ClassifiedWebhook:
             has_canonical_tl_download_ref=bool(snap.get("has_canonical_tl_download_ref")),
             has_season_or_episode=bool(snap.get("has_season_or_episode")),
             has_parsed_title_year=has_ty,
+            release_name_too_long=bool(snap.get("release_name_too_long", len(exact_name) > MAX_ALT_GRAB_RELEASE_NAME_LEN)),
             incoming_evidence_digest=incoming_digest,
         )
 
@@ -784,6 +803,7 @@ def classify_rejection_reasons(classified: ClassifiedWebhook) -> tuple[str, Opti
             classified.action_is_radarr
             and classified.indexer_norm == "torrentleech"
             and bool(_NUMERIC_ID_RE.fullmatch(classified.external_id_norm))
+            and not classified.release_name_too_long
             and 1 <= len(classified.exact_release_name) <= MAX_ALT_GRAB_RELEASE_NAME_LEN
             and not classified.has_season_or_episode
             and classified.has_parsed_title_year
@@ -1021,20 +1041,44 @@ def classify_webhook_payload(
         first_download_url and is_canonical_tl_download_url(first_download_url, external_id_norm)
     )
 
+    def _san_opt(val: Optional[str], limit: int) -> Optional[str]:
+        if not val:
+            return None
+        cleaned = redact_secrets(val, max_chars=limit)
+        return cleaned or None
+
+    release_name_too_long = len(exact_name) > MAX_ALT_GRAB_RELEASE_NAME_LEN
+    safe_indexer_raw = redact_secrets(indexer_raw, max_chars=80)
+    safe_indexer_norm = safe_indexer_raw.lower()
+    safe_external_id_norm = redact_secrets(external_id_norm, max_chars=80)
+    safe_exact_name = redact_secrets(exact_name, max_chars=512)
+    safe_hint_title = _san_opt(hint_title, 240)
+    safe_category = _san_opt(category, 120)
+    safe_resolution = _san_opt(resolution, 40)
+    safe_source = _san_opt(source, 60)
+    safe_dynamic_range = [
+        clean
+        for d in dynamic_range
+        for clean in (redact_secrets(d, max_chars=40),)
+        if clean
+    ]
+    safe_media_processing = _san_opt(media_processing, 60)
+    safe_group = _san_opt(group, 80)
+
     digest_input = {
-        "indexer": indexer_norm,
-        "external_id": external_id_norm,
-        "exact_release_name": exact_name,
-        "hint_title": hint_title.lower() if hint_title else None,
+        "indexer": safe_indexer_norm,
+        "external_id": safe_external_id_norm,
+        "exact_release_name": safe_exact_name,
+        "hint_title": safe_hint_title.lower() if safe_hint_title else None,
         "hint_year": hint_year,
-        "category": category.lower() if category else None,
+        "category": safe_category.lower() if safe_category else None,
         "meta_imdb": meta_imdb,
         "meta_tmdb": meta_tmdb,
-        "resolution": resolution.lower() if resolution else None,
-        "source": source.lower() if source else None,
-        "dynamic_range": sorted({d.lower() for d in dynamic_range}),
-        "media_processing": media_processing.lower() if media_processing else None,
-        "group": group.lower() if group else None,
+        "resolution": safe_resolution.lower() if safe_resolution else None,
+        "source": safe_source.lower() if safe_source else None,
+        "dynamic_range": sorted({d.lower() for d in safe_dynamic_range}),
+        "media_processing": safe_media_processing.lower() if safe_media_processing else None,
+        "group": safe_group.lower() if safe_group else None,
         "size_gb": size_gb,
         "freeleech": freeleech,
         "action_rejected": action_rejected,
@@ -1043,6 +1087,7 @@ def classify_webhook_payload(
         "has_malformed_rejections": has_malformed_rejections,
         "has_canonical_tl_download_ref": has_canonical_tl_download_ref,
         "has_season_or_episode": has_season_or_episode,
+        "release_name_too_long": release_name_too_long,
     }
     incoming_digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -1050,20 +1095,20 @@ def classify_webhook_payload(
 
     return ClassifiedWebhook(
         classification="movie_candidate",
-        indexer_raw=indexer_raw,
-        indexer_norm=indexer_norm,
-        external_id_norm=external_id_norm,
-        exact_release_name=exact_name,
-        hint_title=hint_title,
+        indexer_raw=safe_indexer_raw,
+        indexer_norm=safe_indexer_norm,
+        external_id_norm=safe_external_id_norm,
+        exact_release_name=safe_exact_name,
+        hint_title=safe_hint_title,
         hint_year=hint_year,
-        category=category,
+        category=safe_category,
         meta_imdb=meta_imdb,
         meta_tmdb=meta_tmdb,
-        resolution=resolution,
-        source=source,
-        dynamic_range=dynamic_range,
-        media_processing=media_processing,
-        group=group,
+        resolution=safe_resolution,
+        source=safe_source,
+        dynamic_range=safe_dynamic_range,
+        media_processing=safe_media_processing,
+        group=safe_group,
         size_gb=size_gb,
         freeleech=freeleech,
         action_rejected=action_rejected,
@@ -1074,5 +1119,6 @@ def classify_webhook_payload(
         has_canonical_tl_download_ref=has_canonical_tl_download_ref,
         has_season_or_episode=has_season_or_episode,
         has_parsed_title_year=has_parsed_title_year,
+        release_name_too_long=release_name_too_long,
         incoming_evidence_digest=incoming_digest,
     )

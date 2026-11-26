@@ -657,7 +657,9 @@ class ActionsService:
                 thread_id=target_thread_id,
             )
             if photo_res.outcome == "ok" and photo_res.ack_chat_id and photo_res.ack_message_id:
-                final_thread = photo_res.ack_thread_id if photo_res.ack_thread_id is not None else target_thread_id
+                # Issue #13 §6c: Store ONLY the thread ID Telegram actually acknowledged.
+                # Never fabricate ack_thread_id from target_thread_id when Telegram omits it.
+                final_thread = photo_res.ack_thread_id
                 await asyncio.to_thread(
                     self.db.finish_card_delivery_success,
                     release_id,
@@ -698,7 +700,8 @@ class ActionsService:
             thread_id=target_thread_id,
         )
         if msg_res.outcome == "ok" and msg_res.ack_chat_id and msg_res.ack_message_id:
-            final_thread = msg_res.ack_thread_id if msg_res.ack_thread_id is not None else target_thread_id
+            # Issue #13 §6c: Store ONLY the thread ID Telegram actually acknowledged.
+            final_thread = msg_res.ack_thread_id
             await asyncio.to_thread(
                 self.db.finish_card_delivery_success,
                 release_id,
@@ -751,12 +754,18 @@ class ActionsService:
 
         expected_chat = eval_payload.get("ack_chat_id")
         expected_msg = eval_payload.get("ack_message_id")
+        expected_thread = eval_payload.get("ack_thread_id")
         plan = await asyncio.to_thread(
             self.db.begin_eval_reply,
             release_id=release_id,
             card_revision=card_revision,
             expected_ack_chat_id=str(expected_chat) if expected_chat is not None else None,
             expected_ack_message_id=int(expected_msg) if isinstance(expected_msg, int) and not isinstance(expected_msg, bool) else None,
+            expected_ack_thread_id=(
+                int(expected_thread)
+                if isinstance(expected_thread, int) and not isinstance(expected_thread, bool)
+                else None
+            ),
             process_instance_id=self.process_instance_id,
             lease_expires_at=self._lease_iso(self.config.telegram_timeout_seconds),
         )
@@ -770,9 +779,12 @@ class ActionsService:
         assert plan.ack_chat_id is not None and plan.ack_message_id is not None
         assert plan.reply_attempt_id is not None
         reply_attempt_id = plan.reply_attempt_id
+        evaluation_obj = (
+            eval_payload.get("evaluation") if isinstance(eval_payload.get("evaluation"), dict) else None
+        )
         formatted = format_evaluation_reply(
             release_id=release_id,
-            evaluation=eval_payload.get("evaluation") if isinstance(eval_payload.get("evaluation"), dict) else None,
+            evaluation=evaluation_obj,
             error_redacted=str(eval_payload.get("error_redacted") or "") or None,
         )
 
@@ -822,11 +834,16 @@ class ActionsService:
 
         doc_msg_id: Optional[int] = None
         if formatted.attach_txt and formatted.txt_content and formatted.txt_filename:
+            doc_caption = (
+                "Full evaluation report"
+                if evaluation_obj is not None
+                else "Full sanitized evaluator error details"
+            )
             doc_res = await self.telegram.send_document(
                 chat_id=plan.ack_chat_id,
                 filename=formatted.txt_filename,
                 content_bytes=formatted.txt_content.encode("utf-8"),
-                caption="Full evaluation report",
+                caption=doc_caption,
                 thread_id=plan.ack_thread_id,
                 reply_to_message_id=plan.ack_message_id,
             )

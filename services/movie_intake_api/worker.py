@@ -177,9 +177,13 @@ def build_triage_evaluate_request(
     """
     tinfo: dict[str, Any] = {}
     if classified.indexer_raw:
-        tinfo["indexer"] = classified.indexer_raw
+        clean_idx = redact_secrets(classified.indexer_raw, max_chars=80)
+        if clean_idx:
+            tinfo["indexer"] = clean_idx
     if classified.category:
-        tinfo["category"] = classified.category
+        clean_cat = redact_secrets(classified.category, max_chars=120)
+        if clean_cat:
+            tinfo["category"] = clean_cat
 
     # Prefer verified TL listing IMDb over autobrr meta_imdb when available, else autobrr hint
     observed_imdb = tl_result.imdb_id or classified.meta_imdb
@@ -192,18 +196,32 @@ def build_triage_evaluate_request(
     if tl_result.file_runtime_minutes is not None:
         tinfo["runtime_minutes"] = tl_result.file_runtime_minutes
     if tl_result.audio_languages:
-        tinfo["audio_languages"] = list(tl_result.audio_languages)
+        clean_audio = [redact_secrets(a, max_chars=40) for a in tl_result.audio_languages if a]
+        clean_audio = [a for a in clean_audio if a]
+        if clean_audio:
+            tinfo["audio_languages"] = clean_audio
 
     if classified.resolution:
-        tinfo["resolution"] = classified.resolution
+        clean_res = redact_secrets(classified.resolution, max_chars=40)
+        if clean_res:
+            tinfo["resolution"] = clean_res
     if classified.source:
-        tinfo["source"] = classified.source
+        clean_src = redact_secrets(classified.source, max_chars=60)
+        if clean_src:
+            tinfo["source"] = clean_src
     if classified.dynamic_range:
-        tinfo["dynamic_range"] = list(classified.dynamic_range)
+        clean_dr = [redact_secrets(d, max_chars=40) for d in classified.dynamic_range if d]
+        clean_dr = [d for d in clean_dr if d]
+        if clean_dr:
+            tinfo["dynamic_range"] = clean_dr
     if classified.media_processing:
-        tinfo["media_processing"] = classified.media_processing
+        clean_mp = redact_secrets(classified.media_processing, max_chars=60)
+        if clean_mp:
+            tinfo["media_processing"] = clean_mp
     if classified.group:
-        tinfo["group"] = classified.group
+        clean_grp = redact_secrets(classified.group, max_chars=80)
+        if clean_grp:
+            tinfo["group"] = clean_grp
     if classified.size_gb is not None:
         tinfo["size_gb"] = classified.size_gb
 
@@ -215,16 +233,18 @@ def build_triage_evaluate_request(
         tinfo["freeleech"] = bool(effective_freeleech)
 
     if tl_result.sanitized_description:
-        tinfo["description"] = tl_result.sanitized_description
+        tinfo["description"] = redact_secrets(tl_result.sanitized_description, max_chars=900)
     if tl_result.sanitized_nfo:
-        tinfo["nfo_text"] = tl_result.sanitized_nfo
+        tinfo["nfo_text"] = redact_secrets(tl_result.sanitized_nfo, max_chars=900)
 
     body: dict[str, Any] = {
-        "raw_text": classified.exact_release_name,
+        "raw_text": redact_secrets(classified.exact_release_name, max_chars=512),
         "force_refresh": bool(force_refresh),
     }
     if classified.hint_title:
-        body["hint_title"] = classified.hint_title
+        clean_hint = redact_secrets(classified.hint_title, max_chars=240)
+        if clean_hint:
+            body["hint_title"] = clean_hint
     if classified.hint_year is not None:
         body["hint_year"] = classified.hint_year
     if extra_conflict_note:
@@ -310,7 +330,12 @@ class IntakeWorker:
                 if processed:
                     continue
             except Exception as exc:
-                logger.exception("Intake worker loop error: %s", redact_secrets(str(exc), max_chars=240))
+                # Issue #13 §5a: Never pass active unsanitized exception traceback to logger.exception
+                logger.error(
+                    "Intake worker loop error (%s): %s",
+                    exc.__class__.__name__,
+                    redact_secrets(str(exc), max_chars=240),
+                )
 
             self._wakeup.clear()
             try:
@@ -385,6 +410,24 @@ class IntakeWorker:
         preferred_topic_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         movie = gate.verified_movie
+        # Issue #13 §6a: Build concise explanation of accepted evidence or disagreements
+        accepted_evidence: Optional[str] = None
+        if gate.status == "verified" and movie is not None:
+            basis_bits: list[str] = []
+            if tl_result.imdb_id and tl_result.imdb_id == movie.imdb_id:
+                basis_bits.append("TL listing IMDb")
+            elif classified.meta_imdb and classified.meta_imdb == movie.imdb_id:
+                basis_bits.append("autobrr IMDb")
+            if classified.meta_tmdb and classified.meta_tmdb == movie.tmdb_id:
+                basis_bits.append("autobrr TMDB")
+            if not basis_bits:
+                basis_bits.append("evaluator high-confidence match")
+            if tl_result.file_runtime_minutes is not None:
+                basis_bits.append(f"MediaInfo {tl_result.file_runtime_minutes}m")
+            basis_bits.append("TMDB bidirectional + title/year verified")
+            accepted_evidence = (
+                f"{movie.imdb_id or '?'} / TMDB {movie.tmdb_id} via {', '.join(basis_bits)}"
+            )
         # Defense in depth: only supply verified IDs for actionable/alternative cards when gate passed
         payload: dict[str, Any] = {
             "release_id": release_id,
@@ -402,6 +445,9 @@ class IntakeWorker:
             "radarr_status": radarr.status if radarr else "unchecked",
             "radarr_note": radarr_note,
             "conflict_reason": gate.conflict_reason,
+            "checks_passed": list(gate.checks_passed),
+            "checks_failed": list(gate.checks_failed),
+            "accepted_evidence": accepted_evidence,
             "observed_meta_imdb": classified.meta_imdb,
             "observed_meta_tmdb": classified.meta_tmdb,
             "observed_tl_imdb": tl_result.imdb_id,

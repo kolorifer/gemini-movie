@@ -3207,6 +3207,272 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(fb.calls[0]["note"], "Grabbed via Telegram")
                     self.assertEqual(len(radarr.push_calls), 1)
 
+    async def test_issue_13_6a_6b_6c_listing_link_error_attachments_and_omitted_topic_handling(self) -> None:
+        """Issue #13 §6a, §6b, §6c: Canonical TL listing links, bounded error .txt attachments, and omitted topic handling."""
+        from services.movie_actions_api.telegram_format import (
+            MAX_TELEGRAM_ERROR_REPORT_CHARS,
+            TELEGRAM_TEXT_UTF16_LIMIT,
+            build_card_html,
+            format_evaluation_reply,
+            utf16_len,
+        )
+
+        # 1. §6a: Canonical TorrentLeech listing link on BOTH evidence_review and verified cards; never download links!
+        ev_card_html = build_card_html(
+            {
+                "delivery_kind": "evidence_review",
+                "exact_release_name": "North.Crossing.2021.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566",
+                "category": "Movies :: 4K",
+                "conflict_reason": "Release title 'North Crossing' does not match TMDB 'North Crossing II'",
+                "tl_outcome": "listing_no_imdb",
+                "observed_meta_imdb": "tt1111111",
+                "observed_tl_imdb": "tt2222222",
+                "checks_passed": ["source_tl_integrity"],
+                "checks_failed": ["release_title_mismatch"],
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertIn('https://www.torrentleech.org/torrent/445566', ev_card_html)
+        self.assertIn("TL Listing (445566)", ev_card_html)
+        self.assertNotIn("/download/", ev_card_html)
+        self.assertIn("Failed Checks:", ev_card_html)
+        self.assertIn("Passed Checks:", ev_card_html)
+        self.assertIn("meta_imdb=tt1111111", ev_card_html)
+        self.assertIn("tl_imdb=tt2222222", ev_card_html)
+
+        ver_card_html = build_card_html(
+            {
+                "delivery_kind": "actionable_grab",
+                "exact_release_name": "North.Crossing.2021.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566",
+                "category": "Movies :: 4K",
+                "verified_title": "North Crossing",
+                "verified_year": 2021,
+                "verified_imdb_id": "tt1111111",
+                "verified_tmdb_id": 654321,
+                "accepted_evidence": "tt1111111 / TMDB 654321 via TL listing IMDb, TMDB bidirectional + title/year verified",
+                "checks_passed": ["source_tl_integrity", "release_title_year_match", "imdb_tmdb_bidirectional_agreement"],
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertIn('https://www.torrentleech.org/torrent/445566', ver_card_html)
+        self.assertIn("TL Listing (445566)", ver_card_html)
+        self.assertIn("IMDb (tt1111111)", ver_card_html)
+        self.assertIn("TMDB (654321)", ver_card_html)
+        self.assertIn("Accepted Evidence:", ver_card_html)
+        self.assertNotIn("/download/", ver_card_html)
+
+        # Malformed non-numeric external_id or ineligible indexer MUST NOT emit a TL link
+        bad_id_html = build_card_html(
+            {
+                "delivery_kind": "evidence_review",
+                "exact_release_name": "Example.2025.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566/../download/secret",
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertNotIn("torrentleech.org/torrent/", bad_id_html)
+
+        # 2. §6b: Evaluator error rendering: inline when it fits (> 600 chars preserved!), .txt when > 4096, explicit truncation notice!
+        med_err = ("error detail segment " * 50) + "passkey=ERR_SECRET_111 DIAGNOSTIC_ENDING_999"
+        fmt_med = format_evaluation_reply(release_id="rel-err-med", evaluation=None, error_redacted=med_err)
+        self.assertFalse(fmt_med.attach_txt)
+        self.assertIn("DIAGNOSTIC_ENDING_999", fmt_med.html_text)
+        self.assertNotIn("ERR_SECRET_111", fmt_med.html_text)
+        self.assertLessEqual(utf16_len(fmt_med.html_text), TELEGRAM_TEXT_UTF16_LIMIT)
+
+        long_err = ("long diagnostic stack " * 250) + "token=LONG_SECRET_222 FINAL_TAIL_TOKEN_888"
+        fmt_long = format_evaluation_reply(release_id="rel-err-long", evaluation=None, error_redacted=long_err)
+        self.assertTrue(fmt_long.attach_txt)
+        self.assertLessEqual(utf16_len(fmt_long.html_text), TELEGRAM_TEXT_UTF16_LIMIT)
+        self.assertIsNotNone(fmt_long.txt_content)
+        assert fmt_long.txt_content is not None
+        self.assertIn("FINAL_TAIL_TOKEN_888", fmt_long.txt_content)
+        self.assertIn("Safety-Bound Truncated: no", fmt_long.txt_content)
+        self.assertNotIn("LONG_SECRET_222", fmt_long.txt_content)
+
+        oversized_err = (
+            ("upstream diagnostic trace line " * ((MAX_TELEGRAM_ERROR_REPORT_CHARS // 30) + 200))
+            + " api_key=HUGE_SECRET_333"
+        )
+        fmt_huge = format_evaluation_reply(release_id="rel-err-huge", evaluation=None, error_redacted=oversized_err)
+        self.assertTrue(fmt_huge.attach_txt)
+        self.assertIn("truncated at safety bound", fmt_huge.html_text.lower())
+        assert fmt_huge.txt_content is not None
+        self.assertIn("Safety-Bound Truncated: yes", fmt_huge.txt_content)
+        self.assertIn("[truncated:", fmt_huge.txt_content)
+        self.assertNotIn("HUGE_SECRET_333", fmt_huge.txt_content)
+
+        # 3. §6c: Omitted Telegram topic on topic chat vs known non-topic chat
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 3a) Topic chat configured (telegram_add_grab_topic_id=20), Telegram omits message_thread_id!
+            cfg_topic = self._make_config(tmpdir)
+            tg_topic = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            app_topic = create_actions_app(
+                cfg_topic,
+                telegram_client=tg_topic,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=ShadowStubIntakePushClient(),
+            )
+            headers = {"X-Internal-Token": cfg_topic.internal_api_secret}
+
+            async with app_topic.router.lifespan_context(app_topic):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app_topic), base_url="http://test"
+                ) as client:
+                    # Photo send omits ack_thread_id -> DB MUST store ack_thread_id=None (NOT 20!)
+                    tg_topic.photo_outcome_queue.append(
+                        TelegramSendResult(
+                            outcome="ok",
+                            ack_chat_id=cfg_topic.telegram_chat_id,
+                            ack_message_id=701,
+                            ack_thread_id=None,
+                        )
+                    )
+                    r_p = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-omitted-photo-topic",
+                            poster_path="/poster.jpg",
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_p.status_code, 200)
+                    self.assertIsNone(r_p.json()["ack_thread_id"])
+                    del_p = app_topic.state.db.get_delivery("rel-omitted-photo-topic")
+                    assert del_p is not None
+                    self.assertEqual(del_p["target_thread_id"], 20)
+                    self.assertIsNone(del_p["ack_thread_id"])
+
+                    # Dependent evaluation reply MUST refuse (409) because topic was omitted!
+                    sent_before = len(tg_topic.sent_messages)
+                    r_eval_p = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-omitted-photo-topic",
+                            "card_revision": 1,
+                            "ack_chat_id": cfg_topic.telegram_chat_id,
+                            "ack_message_id": 701,
+                            "evaluation": None,
+                            "error_redacted": long_err,
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval_p.status_code, 409)
+                    self.assertEqual(len(tg_topic.sent_messages), sent_before)
+
+                    # Text send omits ack_thread_id -> DB MUST also store ack_thread_id=None (NOT 20!)
+                    tg_topic.message_outcome_queue.append(
+                        TelegramSendResult(
+                            outcome="ok",
+                            ack_chat_id=cfg_topic.telegram_chat_id,
+                            ack_message_id=702,
+                            ack_thread_id=None,
+                        )
+                    )
+                    r_t = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-omitted-text-topic",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_t.status_code, 200)
+                    self.assertIsNone(r_t.json()["ack_thread_id"])
+                    del_t = app_topic.state.db.get_delivery("rel-omitted-text-topic")
+                    assert del_t is not None
+                    self.assertEqual(del_t["target_thread_id"], 20)
+                    self.assertIsNone(del_t["ack_thread_id"])
+
+                    r_eval_t = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-omitted-text-topic",
+                            "card_revision": 1,
+                            "ack_chat_id": cfg_topic.telegram_chat_id,
+                            "ack_message_id": 702,
+                            "evaluation": None,
+                            "error_redacted": "err",
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval_t.status_code, 409)
+
+            # 3b) Known non-topic chat (all topic IDs None) -> ack_thread_id=None is valid & eval reply + .txt succeed!
+            with tempfile.TemporaryDirectory() as tmpdir_nt:
+                base_nt = self._make_config(tmpdir_nt)
+                cfg_nontopic = ActionsConfig(
+                    host=base_nt.host,
+                    port=base_nt.port,
+                    public_base_url=base_nt.public_base_url,
+                    internal_api_secret=base_nt.internal_api_secret,
+                    radarr_url=base_nt.radarr_url,
+                    radarr_api_key=base_nt.radarr_api_key,
+                    telegram_bot_token=base_nt.telegram_bot_token,
+                    telegram_chat_id=base_nt.telegram_chat_id,
+                    telegram_topic_id=None,
+                    telegram_add_grab_topic_id=None,
+                    telegram_grab_anyway_topic_id=None,
+                    action_ttl_seconds=base_nt.action_ttl_seconds,
+                    standalone_skip_enabled=base_nt.standalone_skip_enabled,
+                    alternative_grab_config_path=None,
+                    actions_db_path=base_nt.actions_db_path,
+                    intake_api_url=base_nt.intake_api_url,
+                    triage_api_url=base_nt.triage_api_url,
+                    shadow_replay_enabled=False,
+                )
+                tg_nt = ControllableTelegramStub()
+                app_nt = create_actions_app(
+                    cfg_nontopic,
+                    telegram_client=tg_nt,
+                    radarr_client=ControllableRadarrStub(),
+                    triage_feedback_client=ControllableFeedbackStub(),
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with app_nt.router.lifespan_context(app_nt):
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app_nt), base_url="http://test"
+                    ) as client_nt:
+                        r_nt = await client_nt.post(
+                            "/internal/deliver/card",
+                            json=_verified_card_payload(
+                                release_id="rel-nontopic-1",
+                                poster_path=None,
+                            ),
+                            headers=headers,
+                        )
+                        self.assertEqual(r_nt.status_code, 200)
+                        ack_nt = r_nt.json()
+                        self.assertIsNone(ack_nt["ack_thread_id"])
+
+                        # Long sanitized error reply succeeds in non-topic chat AND attaches .txt!
+                        r_eval_nt = await client_nt.post(
+                            "/internal/deliver/evaluation",
+                            json={
+                                "release_id": "rel-nontopic-1",
+                                "card_revision": 1,
+                                "ack_chat_id": ack_nt["ack_chat_id"],
+                                "ack_message_id": ack_nt["ack_message_id"],
+                                "evaluation": None,
+                                "error_redacted": long_err,
+                            },
+                            headers=headers,
+                        )
+                        self.assertEqual(r_eval_nt.status_code, 200)
+                        self.assertEqual(r_eval_nt.json()["status"], "sent")
+                        self.assertEqual(len(tg_nt.sent_documents), 1)
+                        self.assertIn(b"FINAL_TAIL_TOKEN_888", tg_nt.sent_documents[0]["content_bytes"])
+                        self.assertNotIn(b"LONG_SECRET_222", tg_nt.sent_documents[0]["content_bytes"])
+                        self.assertIsNone(tg_nt.sent_documents[0]["thread_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

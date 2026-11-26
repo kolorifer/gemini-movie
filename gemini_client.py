@@ -95,10 +95,11 @@ def build_system_instruction(
                 id_part = f" [tmdb:{row['tmdb_id']}]"
             else:
                 id_part = ""
+            clean_title = sanitize_tracker_text(row.get("title"), max_chars=200) or "Unknown"
             clean_note = sanitize_tracker_text(row.get("note"), max_chars=200)
             note_part = f" — {clean_note}" if clean_note else ""
             lines.append(
-                f"- {row['decision']}: {row['title']}{id_part}{note_part}"
+                f"- {row['decision']}: {clean_title}{id_part}{note_part}"
             )
 
     return "\n".join(lines)
@@ -110,9 +111,12 @@ def build_user_prompt(
     torrent_context: Optional[str] = None,
     release_quality_context: Optional[str] = None,
 ) -> str:
-    parts = [f"Release string / query: {request.raw_text}"]
+    clean_raw = sanitize_tracker_text(request.raw_text, max_chars=512)
+    parts = [f"Release string / query: {clean_raw}"]
     if request.hint_title:
-        parts.append(f"Hint title: {request.hint_title}")
+        clean_hint = sanitize_tracker_text(request.hint_title, max_chars=240)
+        if clean_hint:
+            parts.append(f"Hint title: {clean_hint}")
     if request.hint_year is not None:
         parts.append(f"Hint year: {request.hint_year}")
     if request.extra_context:
@@ -120,7 +124,9 @@ def build_user_prompt(
         if clean_extra:
             parts.append(f"Extra context: {clean_extra}")
     if release_quality_context:
-        parts.append(release_quality_context)
+        clean_rq = sanitize_tracker_text(release_quality_context, max_chars=400)
+        if clean_rq:
+            parts.append(clean_rq)
     if torrent_context:
         parts.append("")
         parts.append(torrent_context)

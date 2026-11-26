@@ -54,7 +54,10 @@ def require_internal_token(
 ) -> None:
     expected = INTERNAL_API_SECRET.strip()
     if not expected:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail="Service misconfigured: INTERNAL_API_SECRET is required",
+        )
     if not x_internal_token or not hmac.compare_digest(
         x_internal_token.encode("utf-8"),
         expected.encode("utf-8"),
@@ -66,8 +69,8 @@ def require_internal_token(
 async def lifespan(_: FastAPI):
     await asyncio.to_thread(db.init_db)
     if not INTERNAL_API_SECRET.strip():
-        logger.warning(
-            "INTERNAL_API_SECRET is not set; loopback endpoints are unauthenticated"
+        logger.error(
+            "INTERNAL_API_SECRET is not set; protected endpoints will fail closed with HTTP 503 until configured"
         )
     yield
 

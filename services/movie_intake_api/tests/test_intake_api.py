@@ -4313,6 +4313,194 @@ Language : German
             self.assertTrue(rt.has_malformed_rejections)
             self.assertEqual(classify_rejection_reasons(rt), ("needs_identity_and_radarr_check", None))
 
+    def test_issue_13_5a_6a_6b_privacy_boundaries_worker_log_and_bounded_evaluator_errors(self) -> None:
+        """Issue #13 §5a, §6a, §6b: SQLite snapshot & outbound sanitization, safe worker error logs, card evidence, bounded errors."""
+        import logging
+
+        from services.movie_intake_api.clients import MAX_EVALUATOR_ERROR_CHARS, TriageApiClient
+        from services.movie_intake_api.security import SecretRedactingLogFilter
+        from services.movie_intake_api.worker import build_triage_evaluate_request
+
+        # 1. §5a: Free-form webhook fields with harmless secret markers stay in 0600 raw archive ONLY,
+        # NEVER in SQLite (intake.db / -wal) or outbound /evaluate requests!
+        secret_markers = [
+            "MK_NAME_PASS",
+            "MK_TITLE_KEY",
+            "MK_CAT_TOK",
+            "MK_GRP_COOK",
+            "MK_HDR_URL",
+            "MK_REJ_AIZA",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=765432,
+                title="The Secret Agent",
+                original_title="The Secret Agent",
+                year=2025,
+                imdb_id="tt7654321",
+                runtime_minutes=120,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {765432: movie}, {"tt7654321": [765432]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt7654321",
+                    file_runtime_minutes=120,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="The Secret Agent",
+                        year=2025,
+                        imdb_id="tt7654321",
+                        tmdb_id=765432,
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+
+            payload = _make_autobrr_movie_webhook(
+                external_id="765432",
+                release_name="The.Secret.Agent.2025.2160p.UHD.BluRay.REMUX.HEVC-GRP passkey=MK_NAME_PASS",
+                title="The Secret Agent api_key=MK_TITLE_KEY",
+                year=2025,
+                category="Movies :: 4K token=MK_CAT_TOK",
+                meta_imdb="tt7654321",
+                rejections=["Unknown Movie AIzaSyMK_REJ_AIZA_123456789012345"],
+            )
+            payload["data"]["release"]["group"] = "GRP cookie=MK_GRP_COOK"
+            payload["data"]["release"]["hdr"] = ["HDR10 https://tracker.invalid/MK_HDR_URL"]
+            raw_bytes = json.dumps(payload).encode("utf-8")
+
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                r = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_bytes,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["status"], "accepted")
+
+                # Raw private archive retains exact original bytes
+                archives = list(cfg.webhook_archive_dir.rglob("*.json"))
+                self.assertEqual(len(archives), 1)
+                self.assertEqual(archives[0].read_bytes(), raw_bytes)
+
+                # SQLite database + WAL contain ZERO secret markers!
+                db_blob = cfg.intake_db_path.read_bytes()
+                wal_path = Path(f"{cfg.intake_db_path}-wal")
+                if wal_path.exists():
+                    db_blob += wal_path.read_bytes()
+                for marker in secret_markers:
+                    self.assertNotIn(marker.encode("utf-8"), db_blob, f"Marker {marker} leaked to SQLite!")
+
+                # Process worker & check outbound /evaluate payload AND §6a card evidence fields
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(len(triage.calls), 1)
+                eval_serialized = json.dumps(triage.calls[0])
+                for marker in secret_markers:
+                    self.assertNotIn(marker, eval_serialized, f"Marker {marker} leaked to /evaluate payload!")
+                # Title "The Secret Agent" itself was NOT mangled
+                self.assertIn("The Secret Agent", eval_serialized)
+
+                self.assertEqual(len(actions.card_calls), 1)
+                card = actions.card_calls[0]
+                self.assertEqual(card["external_id"], "765432")
+                self.assertTrue(card.get("checks_passed"))
+                self.assertIn("tt7654321", str(card.get("accepted_evidence") or ""))
+                self.assertIn("765432", str(card.get("accepted_evidence") or ""))
+
+        # 2. §5a: Worker loop exception logging MUST NOT emit raw unsanitized exception traceback!
+        class _CaptureHandler(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.formatted_records: list[str] = []
+                self.raw_exc_infos: list[Any] = []
+                self.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.raw_exc_infos.append(record.exc_info)
+                self.formatted_records.append(self.format(record))
+
+        worker_logger = logging.getLogger("services.movie_intake_api.worker")
+        cap = _CaptureHandler()
+        redactor = SecretRedactingLogFilter()
+        cap.addFilter(redactor)
+        worker_logger.addHandler(cap)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg_w = _make_config(Path(tmp))
+                db_w = IntakeDB(cfg_w.intake_db_path)
+                db_w.init_db()
+                app_w = create_app(cfg_w, db=db_w, start_worker=False)
+                worker = app_w.state.worker
+
+                async def _boom() -> bool:
+                    worker._stop.set()
+                    raise RuntimeError(
+                        "Failed https://tracker.invalid/dl?passkey=EXC_URL_SECRET_999 token=EXC_RAW_MARKER_888"
+                    )
+
+                worker.process_next_queued = _boom  # type: ignore[method-assign]
+                asyncio.run(worker._run_loop())
+        finally:
+            worker_logger.removeHandler(cap)
+
+        self.assertGreaterEqual(len(cap.formatted_records), 1)
+        joined_logs = "\n".join(cap.formatted_records)
+        self.assertNotIn("EXC_URL_SECRET_999", joined_logs)
+        self.assertNotIn("EXC_RAW_MARKER_888", joined_logs)
+        self.assertIn("RuntimeError", joined_logs)
+        self.assertTrue(all(ei is None for ei in cap.raw_exc_infos))
+
+        # 3. §6b: TriageApiClient retains full bounded sanitized evaluator error (not clipped at 240 chars)
+        # and adds explicit truncation label if safety bound is exceeded
+        tail_body = ("diagnostic context " * 80) + "api_key=ERR_SECRET_777 END_DIAGNOSTIC_MARKER_42"
+        huge_body = ("overflow error block " * 1200) + "passkey=HUGE_SECRET_666"
+        resp_mode = {"body": tail_body}
+
+        def _triage_err_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text=resp_mode["body"])
+
+        async def _run_err_checks() -> tuple[TriageEvalResult, TriageEvalResult]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_triage_err_handler)) as hc:
+                tc = TriageApiClient(base_url="http://127.0.0.1:40716", internal_token="tok", http_client=hc)
+                res_medium = await tc.evaluate({"raw_text": "x"})
+                resp_mode["body"] = huge_body
+                res_huge = await tc.evaluate({"raw_text": "x"})
+                return res_medium, res_huge
+
+        res_med, res_huge = asyncio.run(_run_err_checks())
+        self.assertFalse(res_med.ok)
+        assert res_med.error_redacted is not None
+        self.assertIn("END_DIAGNOSTIC_MARKER_42", res_med.error_redacted)
+        self.assertNotIn("ERR_SECRET_777", res_med.error_redacted)
+        self.assertNotIn("[truncated:", res_med.error_redacted)
+
+        self.assertFalse(res_huge.ok)
+        assert res_huge.error_redacted is not None
+        self.assertLessEqual(len(res_huge.error_redacted), MAX_EVALUATOR_ERROR_CHARS)
+        self.assertIn("[truncated:", res_huge.error_redacted)
+        self.assertNotIn("HUGE_SECRET_666", res_huge.error_redacted)
+
 
 if __name__ == "__main__":
     unittest.main()

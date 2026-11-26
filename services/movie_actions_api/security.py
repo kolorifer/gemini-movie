@@ -17,11 +17,13 @@ _SECRET_URL_RE = re.compile(
     r"|/action/[^/\s?\"']+"
     r"|bot\d{5,15}:[A-Za-z0-9_-]{20,}"
     r"|\b\d{5,15}:[A-Za-z0-9_-]{25,}\b"
-    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|authorization|cookie|bearer|x-internal-token|x-api-key)\b\s*[:=]?\s*\S+"
-    r"|\bkey\s*=\s*\S+"
+    r"|AIza[A-Za-z0-9_-]{20,}"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]*)?"
-    r"|\b[A-Fa-f0-9]{40,}\b"
-    r"|[A-Za-z0-9_]{48,}",
+    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|passwd|authorization|cookie|set-cookie|x-internal-token|x-api-key|key)\s*[:=]\s*[^\s\"'&;,]+"
+    r"|\b(?:passkey|authkey|api[_-]?key|apikey|x-internal-token|x-api-key)\s+[^\s\"'&;,]+"
+    r"|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}"
+    r"|\b[A-Fa-f0-9]{32,}\b"
+    r"|\b[A-Za-z0-9_]{48,}\b",
     re.IGNORECASE,
 )
 
@@ -69,15 +71,24 @@ def redact_secrets(raw: Optional[str], *, max_chars: Optional[int] = 900) -> str
 
 
 class SecretRedactingLogFilter(logging.Filter):
-    """Logging filter scrubbing secret-bearing paths, URLs, bot tokens, and API keys."""
+    """Logging filter scrubbing secret-bearing paths, URLs, bot tokens, API keys, and active exceptions."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             rendered = record.getMessage()
             record.msg = redact_secrets(rendered, max_chars=2000)
             record.args = ()
+            if record.exc_info:
+                exc_type, exc_val, _tb = record.exc_info
+                exc_name = exc_type.__name__ if exc_type is not None else "Exception"
+                exc_msg = redact_secrets(str(exc_val), max_chars=400) if exc_val is not None else ""
+                record.exc_info = None
+                record.exc_text = f"{exc_name}: {exc_msg}" if exc_msg else exc_name
+            elif record.exc_text:
+                record.exc_text = redact_secrets(record.exc_text, max_chars=2000)
         except Exception:
-            pass
+            record.exc_info = None
+            record.exc_text = None
         return True
 
 
