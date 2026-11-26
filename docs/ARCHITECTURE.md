@@ -461,7 +461,7 @@ Existing operator variable names from `~/.config/movie-intel/environment` are pr
   - `INTAKE_API_URL=http://127.0.0.1:<PORT_INTAKE>`, `TRIAGE_API_URL=http://127.0.0.1:40716`
   - `INTERNAL_API_SECRET`
 
-*(Note: legacy `MOVIE_INTEL_ACTION_STORE` `~/.local/state/movie-intel/actions.json` is superseded by `actions.db` for new actions; if cutover requires honoring unexpired legacy links during a brief transition window, a read-only fallback parser can be evaluated at cutover time without writing back to `actions.json`.)*
+*(Op1 Disposition — Previously Issued Legacy JSON Buttons: `movie-actions-api` owns `actions.db` exclusively and does not read or write legacy `MOVIE_INTEL_ACTION_STORE` `~/.local/state/movie-intel/actions.json`. For the already-completed initial cutover, legacy JSON tokens outside `actions.db` intentionally return HTTP `404` rather than bridging legacy mutable JSON state without SQLite write-ahead locks. For any future cutover or rollback/migration window, operators MUST first run a read-only inventory of unexpired legacy tokens (or announce explicit expiry prior to switching Nginx) and, if honoring unexpired tokens is required, deploy a bounded, time-limited read-only import/transition into `actions.db` that preserves exact original confirmation semantics, `Watched – Good` (`watch`) / `Watched – Bad` (`skip`) rating semantics, and single-write idempotency without writing back to `actions.json`.)*
 
 ### 7.3 User Nginx Proxy Rules
 

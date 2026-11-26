@@ -598,7 +598,7 @@ def _extract_action_info(
     data_dict: dict[str, Any],
     *,
     top_event: str = "",
-) -> tuple[bool, bool, list[str], Optional[str], str]:
+) -> tuple[bool, bool, list[str], Optional[str], str, bool]:
     top_action = raw_payload.get("action")
     top_action_dict = top_action if isinstance(top_action, dict) else {}
     data_action = data_dict.get("action")
@@ -639,14 +639,24 @@ def _extract_action_info(
 
     raw_rejections = result_dict.get("rejections")
     rejections: list[str] = []
-    if isinstance(raw_rejections, list):
+    has_malformed_rejections = False
+    if raw_rejections is None:
+        pass
+    elif isinstance(raw_rejections, list):
         for item in raw_rejections:
             if isinstance(item, str) and item.strip():
                 rejections.append(redact_secrets(item.strip(), max_chars=240))
-    elif isinstance(raw_rejections, str) and raw_rejections.strip():
-        rejections.append(redact_secrets(raw_rejections.strip(), max_chars=240))
+            else:
+                has_malformed_rejections = True
+    elif isinstance(raw_rejections, str):
+        if raw_rejections.strip():
+            rejections.append(redact_secrets(raw_rejections.strip(), max_chars=240))
+        else:
+            has_malformed_rejections = True
+    else:
+        has_malformed_rejections = True
 
-    return rejected, action_is_radarr, rejections, raw_type, result_status
+    return rejected, action_is_radarr, rejections, raw_type, result_status, has_malformed_rejections
 
 
 @dataclass(frozen=True)
@@ -672,6 +682,7 @@ class ClassifiedWebhook:
     action_rejected: bool = False
     action_is_radarr: bool = False
     rejections: list[str] = field(default_factory=list)
+    has_malformed_rejections: bool = False
     has_download_url: bool = False
     has_canonical_tl_download_ref: bool = False
     has_season_or_episode: bool = False
@@ -700,6 +711,7 @@ class ClassifiedWebhook:
             "action_rejected": self.action_rejected,
             "action_is_radarr": self.action_is_radarr,
             "rejections": list(self.rejections),
+            "has_malformed_rejections": self.has_malformed_rejections,
             "has_download_url": self.has_download_url,
             "has_canonical_tl_download_ref": self.has_canonical_tl_download_ref,
             "has_season_or_episode": self.has_season_or_episode,
@@ -737,6 +749,7 @@ class ClassifiedWebhook:
             action_rejected=bool(snap.get("action_rejected")),
             action_is_radarr=bool(snap.get("action_is_radarr", False)),
             rejections=list(snap.get("rejections") or []),
+            has_malformed_rejections=bool(snap.get("has_malformed_rejections", False)),
             has_download_url=bool(snap.get("has_download_url")),
             has_canonical_tl_download_ref=bool(snap.get("has_canonical_tl_download_ref")),
             has_season_or_episode=bool(snap.get("has_season_or_episode")),
@@ -752,16 +765,17 @@ def classify_rejection_reasons(classified: ClassifiedWebhook) -> tuple[str, Opti
       - ("legacy_alt_grab_eligible", primary_class): Radarr rejection on a TorrentLeech movie
         release with valid title/year, no season/episode, release name <= 512 chars, numeric
         external_id, canonical HTTPS TL download URL bound to external_id, and 1-8 rejection
-        reasons EVERY ONE of which matches one of the 4 strict legacy forms.
+        reasons EVERY ONE of which matches one of the 4 strict legacy forms (with zero malformed
+        or unreadable rejection items).
         (Worker must still verify movie-actions-api reports alternative_grab_configured=True!)
       - ("quality_rejected_suppress", matched_class): exclusively routine quality rejection
         that does not satisfy legacy Alternative Grab eligibility -> suppress early.
-      - ("needs_identity_and_radarr_check", None): empty, existing-movie, or unknown/mixed
-        non-quality rejection -> must continue to identity verification + live Radarr check.
+      - ("needs_identity_and_radarr_check", None): empty, malformed/unreadable, existing-movie,
+        or unknown/mixed non-quality rejection -> must continue to identity verification + live Radarr check.
     """
     if not classified.action_rejected:
         return "not_rejected", None
-    if not classified.rejections:
+    if classified.has_malformed_rejections or not classified.rejections:
         return "needs_identity_and_radarr_check", None
 
     legacy_ok, legacy_classes = validate_legacy_alt_grab_rejections(classified.rejections)
@@ -847,9 +861,14 @@ def classify_webhook_payload(
             diagnostic_note="missing_release_name",
         )
 
-    action_rejected, action_is_radarr, rejections, action_type_raw, _result_status = _extract_action_info(
-        raw_payload, data, top_event=top_event
-    )
+    (
+        action_rejected,
+        action_is_radarr,
+        rejections,
+        action_type_raw,
+        _result_status,
+        has_malformed_rejections,
+    ) = _extract_action_info(raw_payload, data, top_event=top_event)
     if not action_rejected:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
@@ -857,6 +876,7 @@ def classify_webhook_payload(
             action_rejected=False,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
+            has_malformed_rejections=has_malformed_rejections,
         )
     if not action_is_radarr:
         return ClassifiedWebhook(
@@ -865,6 +885,7 @@ def classify_webhook_payload(
             action_rejected=action_rejected,
             action_is_radarr=False,
             rejections=rejections,
+            has_malformed_rejections=has_malformed_rejections,
         )
 
     filter_name, filter_id, filter_valid = _extract_filter_info(raw_payload, data)
@@ -876,6 +897,7 @@ def classify_webhook_payload(
             action_rejected=action_rejected,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
+            has_malformed_rejections=has_malformed_rejections,
         )
     if allowed_filter_ids and (filter_id is None or filter_id not in allowed_filter_ids):
         return ClassifiedWebhook(
@@ -884,6 +906,7 @@ def classify_webhook_payload(
             action_rejected=action_rejected,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
+            has_malformed_rejections=has_malformed_rejections,
         )
 
     indexer_raw = _extract_indexer_name(raw_payload, data, release)
@@ -949,6 +972,7 @@ def classify_webhook_payload(
             action_rejected=action_rejected,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
+            has_malformed_rejections=has_malformed_rejections,
         )
 
     hint_title = _clean_str(release.get("title"))
@@ -1016,6 +1040,7 @@ def classify_webhook_payload(
         "action_rejected": action_rejected,
         "action_is_radarr": action_is_radarr,
         "rejections": rejections,
+        "has_malformed_rejections": has_malformed_rejections,
         "has_canonical_tl_download_ref": has_canonical_tl_download_ref,
         "has_season_or_episode": has_season_or_episode,
     }
@@ -1044,6 +1069,7 @@ def classify_webhook_payload(
         action_rejected=action_rejected,
         action_is_radarr=action_is_radarr,
         rejections=rejections,
+        has_malformed_rejections=has_malformed_rejections,
         has_download_url=has_download_url,
         has_canonical_tl_download_ref=has_canonical_tl_download_ref,
         has_season_or_episode=has_season_or_episode,

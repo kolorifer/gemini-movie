@@ -162,14 +162,15 @@ class IntakeDB:
                 );
 
                 CREATE TABLE IF NOT EXISTS occurrences (
-                    occurrence_id        TEXT PRIMARY KEY,
-                    received_at          TEXT NOT NULL,
-                    archive_relpath      TEXT NOT NULL UNIQUE,
-                    archive_sha256       TEXT NOT NULL,
-                    payload_bytes        INTEGER NOT NULL,
-                    classification       TEXT NOT NULL,
-                    diagnostic_note      TEXT,
-                    release_id           TEXT REFERENCES releases(release_id)
+                    occurrence_id            TEXT PRIMARY KEY,
+                    received_at              TEXT NOT NULL,
+                    archive_relpath          TEXT NOT NULL UNIQUE,
+                    archive_sha256           TEXT NOT NULL,
+                    payload_bytes            INTEGER NOT NULL,
+                    classification           TEXT NOT NULL,
+                    diagnostic_note          TEXT,
+                    release_id               TEXT REFERENCES releases(release_id),
+                    incoming_evidence_digest TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS tl_cooldown (
@@ -206,6 +207,35 @@ class IntakeDB:
                           AND last_evaluated_digest = full_evidence_digest
                         """
                     )
+                existing_occ_cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(occurrences)").fetchall()
+                }
+                if "incoming_evidence_digest" not in existing_occ_cols:
+                    conn.execute("ALTER TABLE occurrences ADD COLUMN incoming_evidence_digest TEXT;")
+                    conn.execute(
+                        """
+                        UPDATE occurrences
+                        SET incoming_evidence_digest = (
+                            SELECT r.incoming_evidence_digest
+                            FROM releases r
+                            WHERE r.release_id = occurrences.release_id
+                        )
+                        WHERE release_id IS NOT NULL
+                          AND incoming_evidence_digest IS NULL
+                          AND occurrence_id = (
+                              SELECT r.latest_occurrence_id
+                              FROM releases r
+                              WHERE r.release_id = occurrences.release_id
+                          )
+                        """
+                    )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_occurrences_release_digest
+                        ON occurrences(release_id, incoming_evidence_digest);
+                    """
+                )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -325,6 +355,20 @@ class IntakeDB:
                     else str(existing["source_occurrence_id"])
                 )
 
+                seen_prior_digest = (
+                    cur_digest != classified.incoming_evidence_digest
+                    and conn.execute(
+                        """
+                        SELECT 1 FROM occurrences
+                        WHERE release_id = ?
+                          AND incoming_evidence_digest = ?
+                        LIMIT 1
+                        """,
+                        (release_id, classified.incoming_evidence_digest),
+                    ).fetchone()
+                    is not None
+                )
+
                 if cur_digest == classified.incoming_evidence_digest:
                     # Exact duplicate (concurrent burst or late duplicate): attach occurrence
                     # without re-queuing, while preserving/upgrading source_occurrence_id if
@@ -338,6 +382,19 @@ class IntakeDB:
                         WHERE release_id = ?
                         """,
                         (occurrence_id, source_occ, received_at_iso, release_id),
+                    )
+                    result_status = "coalesced_duplicate"
+                elif seen_prior_digest:
+                    # Issue #13 §4a: Replayed older superseded evidence (old A -> corrected B -> repeated A).
+                    # Archive the replay occurrence, preserve newer correction B intact (never roll back
+                    # incoming_evidence_digest, incoming_snapshot_json, or source_occurrence_id).
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (received_at_iso, release_id),
                     )
                     result_status = "coalesced_duplicate"
                 elif cur_state == "ambiguous_delivery":
@@ -443,8 +500,9 @@ class IntakeDB:
                 """
                 INSERT INTO occurrences (
                     occurrence_id, received_at, archive_relpath, archive_sha256,
-                    payload_bytes, classification, diagnostic_note, release_id
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                    payload_bytes, classification, diagnostic_note, release_id,
+                    incoming_evidence_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     occurrence_id,
@@ -454,6 +512,7 @@ class IntakeDB:
                     receipt.payload_bytes,
                     classified.classification,
                     release_id,
+                    classified.incoming_evidence_digest,
                 ),
             )
             conn.execute("COMMIT")

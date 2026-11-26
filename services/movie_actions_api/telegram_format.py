@@ -137,6 +137,15 @@ def build_card_html(
         rej_class = redact_secrets(str(card_payload.get("bound_rejection_class") or ""), max_chars=80)
         if rej_class:
             lines.append(("<b>Quality Policy:</b> ", rej_class, ""))
+    elif delivery_kind == "retired":
+        header = (
+            f"{verified_title} ({verified_year})"
+            if verified_title and verified_year
+            else (verified_title or "Release Proposal")
+        )
+        if card_revision > 1:
+            header = f"{header} [Updated rev {card_revision}]"
+        lines.append(("⛔ <b>Proposal Retired (No Longer Eligible): ", header, "</b>"))
     else:
         header = "Evidence Review (Manual Check Required)"
         if card_revision > 1:
@@ -185,8 +194,19 @@ def build_card_html(
             obs_parts.append(f"tl_imdb={redact_secrets(str(card_payload['observed_tl_imdb']), max_chars=24)}")
         if obs_parts:
             lines.append(("<b>Observed IDs:</b> ", ", ".join(obs_parts), ""))
-    else:
+    elif delivery_kind == "retired":
+        if conflict_reason:
+            lines.append(("<b>Status:</b> ", conflict_reason, ""))
         link_bits: list[str] = []
+        if isinstance(verified_imdb, str) and _IMDB_ID_RE.fullmatch(verified_imdb.strip()):
+            clean_imdb = verified_imdb.strip().lower()
+            link_bits.append(f'<a href="https://www.imdb.com/title/{clean_imdb}/">IMDb ({clean_imdb})</a>')
+        if isinstance(verified_tmdb, int) and not isinstance(verified_tmdb, bool) and verified_tmdb > 0:
+            link_bits.append(f'<a href="https://www.themoviedb.org/movie/{verified_tmdb}">TMDB ({verified_tmdb})</a>')
+        if link_bits:
+            lines.append((" | ".join(link_bits), "", ""))
+    else:
+        link_bits = []
         if isinstance(verified_imdb, str) and _IMDB_ID_RE.fullmatch(verified_imdb.strip()):
             clean_imdb = verified_imdb.strip().lower()
             link_bits.append(f'<a href="https://www.imdb.com/title/{clean_imdb}/">IMDb ({clean_imdb})</a>')
@@ -204,8 +224,8 @@ def build_inline_keyboard(
     public_base_url: str,
     action_tokens: dict[str, str],
 ) -> dict[str, Any]:
-    """Build Telegram InlineKeyboardMarkup for verified cards; empty keyboard for evidence_review."""
-    if delivery_kind == "evidence_review" or not action_tokens:
+    """Build Telegram InlineKeyboardMarkup for verified cards; empty keyboard for evidence_review/retired."""
+    if delivery_kind in ("evidence_review", "retired") or not action_tokens:
         return {"inline_keyboard": []}
 
     base = public_base_url.rstrip("/")

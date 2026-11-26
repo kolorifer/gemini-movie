@@ -107,6 +107,8 @@ class ActionGroupSnapshot:
     group_actions: tuple[dict[str, Any], ...]
     group_attempts: tuple[dict[str, Any], ...]
     promoted_stale_attempts: int = 0
+    delivery: Optional[dict[str, Any]] = None
+    release_actions: tuple[dict[str, Any], ...] = ()
 
 
 class ActionsDB:
@@ -662,8 +664,8 @@ class ActionsDB:
                     ).fetchone()
                     if locked_row is not None:
                         # Never overwrite or reopen a release whose Radarr write is in-flight/completed.
-                        # If a conflict downgrade arrived anyway, still supersede any unclicked active tokens.
-                        if delivery_kind == "evidence_review":
+                        # If a conflict downgrade or retirement arrived anyway, still supersede any unclicked active tokens.
+                        if delivery_kind in ("evidence_review", "retired"):
                             conn.execute(
                                 """
                                 UPDATE actions
@@ -1302,6 +1304,7 @@ class ActionsDB:
                 return ActionGroupSnapshot(action=None, group_actions=(), group_attempts=())
             action = dict(row)
             group = str(action["completion_group"])
+            release_id = str(action["release_id"])
             g_actions = conn.execute(
                 "SELECT * FROM actions WHERE completion_group = ? ORDER BY created_at ASC, action_id ASC",
                 (group,),
@@ -1314,10 +1317,20 @@ class ActionsDB:
                 """,
                 (group,),
             ).fetchall()
+            del_row = conn.execute(
+                "SELECT * FROM deliveries WHERE release_id = ?",
+                (release_id,),
+            ).fetchone()
+            rel_actions = conn.execute(
+                "SELECT * FROM actions WHERE release_id = ? ORDER BY created_at ASC, action_id ASC",
+                (release_id,),
+            ).fetchall()
             return ActionGroupSnapshot(
                 action=action,
                 group_actions=tuple(dict(r) for r in g_actions),
                 group_attempts=tuple(dict(r) for r in g_attempts),
+                delivery=dict(del_row) if del_row is not None else None,
+                release_actions=tuple(dict(r) for r in rel_actions),
             )
         finally:
             conn.close()
@@ -1329,7 +1342,7 @@ class ActionsDB:
         current_process_instance_id: str,
         now_iso: Optional[str] = None,
     ) -> ActionGroupSnapshot:
-        """Atomically promote any expired/orphaned attempts in completion_group and return snapshot."""
+        """Atomically promote any expired/orphaned attempts on release/group and return snapshot."""
         ts = now_iso or utc_now_iso()
         conn = self._connect()
         try:
@@ -1342,11 +1355,12 @@ class ActionsDB:
                 conn.execute("COMMIT;")
                 return ActionGroupSnapshot(action=None, group_actions=(), group_attempts=())
             group = str(row["completion_group"])
+            release_id = str(row["release_id"])
             promoted = self._promote_stale_attempts_locked(
                 conn,
                 current_process_instance_id=current_process_instance_id,
                 now_iso=ts,
-                completion_group=group,
+                release_id=release_id,
             )
             action = dict(
                 conn.execute(
@@ -1366,13 +1380,48 @@ class ActionsDB:
                 """,
                 (group,),
             ).fetchall()
+            del_row = conn.execute(
+                "SELECT * FROM deliveries WHERE release_id = ?",
+                (release_id,),
+            ).fetchone()
+            rel_actions = conn.execute(
+                "SELECT * FROM actions WHERE release_id = ? ORDER BY created_at ASC, action_id ASC",
+                (release_id,),
+            ).fetchall()
             conn.execute("COMMIT;")
             return ActionGroupSnapshot(
                 action=action,
                 group_actions=tuple(dict(r) for r in g_actions),
                 group_attempts=tuple(dict(r) for r in g_attempts),
                 promoted_stale_attempts=promoted,
+                delivery=dict(del_row) if del_row is not None else None,
+                release_actions=tuple(dict(r) for r in rel_actions),
             )
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
+    def mark_action_superseded(self, *, action_id: str, detail: Optional[str] = None) -> bool:
+        """Mark an active action superseded when its card revision is stale or retired."""
+        ts = utc_now_iso()
+        clean_err = redact_secrets(detail, max_chars=240) if detail else None
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                """
+                UPDATE actions
+                SET status = 'superseded',
+                    last_error_redacted = COALESCE(?, last_error_redacted),
+                    updated_at = ?
+                WHERE action_id = ? AND status = 'active'
+                """,
+                (clean_err, ts, action_id),
+            )
+            conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1406,11 +1455,20 @@ class ActionsDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            action_row = conn.execute(
+                "SELECT * FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if action_row is None:
+                conn.execute("COMMIT;")
+                return False, None, "not_found"
+
+            release_id = str(action_row["release_id"])
             self._promote_stale_attempts_locked(
                 conn,
                 current_process_instance_id=process_instance_id,
                 now_iso=ts,
-                completion_group=completion_group,
+                release_id=release_id,
             )
 
             action_row = conn.execute(
@@ -1425,6 +1483,46 @@ class ActionsDB:
             if act_status not in allowed_action_statuses:
                 conn.execute("COMMIT;")
                 return False, None, f"status:{act_status}"
+
+            # Issue #13 §2b: For fresh initiation (`active`), atomically re-verify the release's
+            # latest delivery revision/kind and ensure no sibling Watched action blocks a Grab.
+            if act_status == "active":
+                del_row = conn.execute(
+                    "SELECT card_revision, delivery_kind, status FROM deliveries WHERE release_id = ?",
+                    (release_id,),
+                ).fetchone()
+                if del_row is not None:
+                    latest_rev = int(del_row["card_revision"] or 0)
+                    latest_kind = str(del_row["delivery_kind"] or "")
+                    if latest_rev > int(action_row["card_revision"] or 0):
+                        conn.execute(
+                            "UPDATE actions SET status = 'superseded', updated_at = ? WHERE action_id = ? AND status = 'active'",
+                            (ts, action_id),
+                        )
+                        conn.execute("COMMIT;")
+                        return False, None, "stale_card_revision"
+                    if latest_kind in ("retired", "evidence_review"):
+                        conn.execute(
+                            "UPDATE actions SET status = 'superseded', updated_at = ? WHERE action_id = ? AND status = 'active'",
+                            (ts, action_id),
+                        )
+                        conn.execute("COMMIT;")
+                        return False, None, f"delivery_{latest_kind}"
+
+                if phase in ("radarr_add_movie", "radarr_release_push", "qbit_alt_preflight", "qbit_alternative_grab"):
+                    watched_sib = conn.execute(
+                        """
+                        SELECT action_id, status FROM actions
+                        WHERE release_id = ?
+                          AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated')
+                          AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    if watched_sib is not None:
+                        conn.execute("COMMIT;")
+                        return False, None, f"sibling_watched:{watched_sib['status']}"
 
             # Check if another attempt is currently active in this completion_group
             active_att = conn.execute(

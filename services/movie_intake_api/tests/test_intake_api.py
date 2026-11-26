@@ -3982,6 +3982,337 @@ Language : German
         agree_eval["identification"]["director"] = "David Kowalski"
         self.assertIsNone(_eval_contradicts_movie(agree_eval, verified_film))
 
+    def test_issue_13_2a_late_quality_rejection_and_radarr_suppression_retire_delivered_card(self) -> None:
+        """Issue #13 §2a: Later quality rejection or Radarr suppression edits delivered card to retired."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=770011,
+                title="Harbor Dusk",
+                original_title="Harbor Dusk",
+                year=2025,
+                imdb_id="tt7700110",
+                runtime_minutes=118,
+                poster_path="/harbor_dusk.jpg",
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {770011: movie}, {"tt7700110": [770011]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt7700110",
+                    file_runtime_minutes=118,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Harbor Dusk",
+                        year=2025,
+                        imdb_id="tt7700110",
+                        tmdb_id=770011,
+                    ),
+                )
+            )
+            radarr_state = {"status": "absent"}
+            actions = StubActionsClient(
+                radarr_handler=lambda *_: RadarrStatusResponse(status=radarr_state["status"])
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            rel_name = "Harbor.Dusk.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+            base_payload = _make_autobrr_movie_webhook(
+                external_id="770011",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                meta_imdb="tt7700110",
+                rejections=["Unknown Movie"],
+            )
+            late_quality_payload = _make_autobrr_movie_webhook(
+                external_id="770011",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                meta_imdb="tt7700110",
+                rejections=["Quality is not wanted in profile"],
+            )
+
+            with TestClient(app) as client:
+                # 1. Initial proposal delivered with actionable_grab rev 1 + 1 eval reply
+                r1 = client.post(f"/webhook/{cfg.webhook_secret}", json=base_payload)
+                self.assertEqual(r1.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[0]["card_revision"], 1)
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+
+                # 2. Later "Quality is not wanted in profile" MUST retire card (rev 2) with preserve_eval_reply=True
+                r2 = client.post(f"/webhook/{cfg.webhook_secret}", json=late_quality_payload)
+                self.assertEqual(r2.status_code, 200)
+                self.assertEqual(r2.json()["status"], "updated_correction")
+                asyncio.run(app.state.worker.process_next_queued())
+
+                self.assertEqual(len(actions.card_calls), 2)
+                retired_card = actions.card_calls[1]
+                self.assertEqual(retired_card["delivery_kind"], "retired")
+                self.assertEqual(retired_card["card_revision"], 2)
+                self.assertTrue(retired_card.get("preserve_eval_reply"))
+                self.assertIn("Quality is not wanted in profile", str(retired_card.get("radarr_note") or ""))
+                # Existing eval reply is preserved; zero duplicate eval replies sent
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+
+                rel_row = db.get_release(r1.json()["release_id"])
+                assert rel_row is not None
+                self.assertEqual(rel_row["state"], "suppressed")
+                self.assertEqual(rel_row["suppression_reason"], "quality_rejected")
+                self.assertEqual(rel_row["card_revision"], 2)
+
+                # 3. Second release: Radarr transitions to watched_unmonitored before later correction arrives -> retires card
+                rel2_name = "Harbor.Dusk.2025.1080p.BluRay.REMUX.AVC-GROUP2"
+                p2_initial = _make_autobrr_movie_webhook(
+                    external_id="770012",
+                    release_name=rel2_name,
+                    title="Harbor Dusk",
+                    year=2025,
+                    meta_imdb="tt7700110",
+                    category="Movies :: Bluray",
+                    resolution="1080p",
+                    source="BluRay",
+                    rejections=["Unknown Movie"],
+                )
+                r3 = client.post(f"/webhook/{cfg.webhook_secret}", json=p2_initial)
+                self.assertEqual(r3.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "actionable_grab")
+
+                radarr_state["status"] = "watched_unmonitored"
+                p2_followup = _make_autobrr_movie_webhook(
+                    external_id="770012",
+                    release_name=rel2_name,
+                    title="Harbor Dusk",
+                    year=2025,
+                    meta_imdb="tt7700110",
+                    category="Movies :: Bluray",
+                    resolution="1080p",
+                    source="BluRay",
+                    freeleech=True,
+                    rejections=["Unknown Movie"],
+                )
+                r4 = client.post(f"/webhook/{cfg.webhook_secret}", json=p2_followup)
+                self.assertEqual(r4.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "retired")
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+                self.assertTrue(actions.card_calls[-1].get("preserve_eval_reply"))
+                rel2_row = db.get_release(r3.json()["release_id"])
+                assert rel2_row is not None
+                self.assertEqual(rel2_row["state"], "suppressed")
+                self.assertEqual(rel2_row["suppression_reason"], "watched_unmonitored")
+
+    def test_issue_13_4a_replay_of_superseded_evidence_preserves_newer_correction(self) -> None:
+        """Issue #13 §4a: old A -> corrected B -> repeated A archives all 3 and keeps B (queued, posted, restarted)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie_b = TmdbMovieRecord(
+                tmdb_id=880022,
+                title="Winter Signal",
+                original_title="Winter Signal",
+                year=2025,
+                imdb_id="tt8800220",
+                runtime_minutes=110,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {880022: movie_b}, {"tt8800220": [880022]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt8800220",
+                    file_runtime_minutes=110,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Winter Signal",
+                        year=2025,
+                        imdb_id="tt8800220",
+                        tmdb_id=880022,
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+
+            rel_name = "Winter.Signal.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+            payload_a = _make_autobrr_movie_webhook(
+                external_id="880022",
+                release_name=rel_name,
+                title="Winter Signal",
+                year=2025,
+                meta_imdb="tt1111111",  # old wrong IMDb A
+                rejections=["Unknown Movie"],
+            )
+            payload_b = _make_autobrr_movie_webhook(
+                external_id="880022",
+                release_name=rel_name,
+                title="Winter Signal",
+                year=2025,
+                meta_imdb="tt8800220",  # corrected IMDb B
+                rejections=["Unknown Movie"],
+            )
+
+            app1 = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app1) as client:
+                # 1) While queued: old A -> corrected B -> repeated A
+                r_a1 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a1.status_code, 200)
+                self.assertEqual(r_a1.json()["status"], "accepted")
+                release_id = r_a1.json()["release_id"]
+
+                r_b = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_b)
+                self.assertEqual(r_b.status_code, 200)
+                self.assertEqual(r_b.json()["status"], "updated_correction")
+                self.assertEqual(r_b.json()["release_id"], release_id)
+
+                r_a2 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a2.status_code, 200)
+                self.assertEqual(r_a2.json()["status"], "coalesced_duplicate")
+
+                # All 3 raw archives exist AND queued release still holds corrected B (tt8800220)
+                archives_after_queued = list(cfg.webhook_archive_dir.rglob("*.json"))
+                self.assertEqual(len(archives_after_queued), 3)
+                rel_q = db.get_release(release_id)
+                assert rel_q is not None
+                snap_q = json.loads(str(rel_q["incoming_snapshot_json"]))
+                self.assertEqual(snap_q["meta_imdb"], "tt8800220")
+                self.assertEqual(rel_q["state"], "queued")
+
+                # 2) Worker posts verified card for B, then repeated A arrives again
+                asyncio.run(app1.state.worker.process_next_queued())
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[0]["verified_imdb_id"], "tt8800220")
+
+                r_a3 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a3.status_code, 200)
+                self.assertEqual(r_a3.json()["status"], "coalesced_duplicate")
+                processed_after_a3 = asyncio.run(app1.state.worker.process_next_queued())
+                self.assertFalse(processed_after_a3)
+                self.assertEqual(len(actions.card_calls), 1)
+                rel_done = db.get_release(release_id)
+                assert rel_done is not None
+                self.assertEqual(rel_done["state"], "completed")
+                self.assertEqual(json.loads(str(rel_done["incoming_snapshot_json"]))["meta_imdb"], "tt8800220")
+
+            # 3) After restart (fresh IntakeDB & app instance on same SQLite DB): repeated A still ignored!
+            db_restarted = IntakeDB(cfg.intake_db_path)
+            db_restarted.init_db()
+            app2 = create_app(
+                cfg,
+                db=db_restarted,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app2) as client2:
+                r_a4 = client2.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a4.status_code, 200)
+                self.assertEqual(r_a4.json()["status"], "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), 5)
+                rel_post_restart = db_restarted.get_release(release_id)
+                assert rel_post_restart is not None
+                self.assertEqual(rel_post_restart["state"], "completed")
+                self.assertEqual(
+                    json.loads(str(rel_post_restart["incoming_snapshot_json"]))["meta_imdb"],
+                    "tt8800220",
+                )
+
+    def test_issue_13_4b_malformed_rejections_and_missing_action_type_disable_alternative_grab(self) -> None:
+        """Issue #13 §4b: Missing action type or unreadable/mixed rejection list must disable Alternative Grab."""
+        from services.movie_intake_api.classifier import ClassifiedWebhook
+
+        rel_name = "Harbor.Dusk.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+        valid_dl = "https://www.torrentleech.org/rss/download/770099/deadbeef0123456789/Harbor.Dusk.2025.torrent"
+
+        # 1) Missing action.type -> never treated as Radarr
+        missing_action_payload = _make_autobrr_movie_webhook(
+            external_id="770099",
+            release_name=rel_name,
+            title="Harbor Dusk",
+            year=2025,
+            download_url=valid_dl,
+            rejections=["Existing file meets cutoff: Remux-2160p"],
+        )
+        missing_action_payload["data"].pop("action", None)
+        cw_missing = classify_webhook_payload(missing_action_payload)
+        self.assertEqual(cw_missing.classification, "non_movie_archive_only")
+        self.assertFalse(cw_missing.action_is_radarr)
+
+        # 2) Mixed rejection lists containing unreadable / non-string / blank items MUST set
+        # has_malformed_rejections=True and disable BOTH legacy_alt_grab_eligible AND quality_rejected_suppress!
+        malformed_cases: list[Any] = [
+            ["Existing file meets cutoff: Remux-2160p", 12345],
+            ["Existing file meets cutoff: Remux-2160p", None],
+            ["Existing file meets cutoff: Remux-2160p", {"nested": "bad"}],
+            ["Existing file meets cutoff: Remux-2160p", "   "],
+            {"unexpected": "dict"},
+            "",
+        ]
+        for bad_rej in malformed_cases:
+            payload = _make_autobrr_movie_webhook(
+                external_id="770099",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                download_url=valid_dl,
+                rejections=["Existing file meets cutoff: Remux-2160p"],
+            )
+            payload["data"]["result"]["rejections"] = bad_rej
+            cw = classify_webhook_payload(payload)
+            self.assertEqual(cw.classification, "movie_candidate")
+            self.assertTrue(cw.has_malformed_rejections, f"Expected malformed flag for {bad_rej!r}")
+            self.assertEqual(
+                classify_rejection_reasons(cw),
+                ("needs_identity_and_radarr_check", None),
+                f"Malformed rejection list {bad_rej!r} must disable Alternative Grab & quality suppress",
+            )
+            # Round-trip through sanitized snapshot preserves has_malformed_rejections
+            rt = ClassifiedWebhook.from_sanitized_snapshot(cw.to_sanitized_snapshot(), cw.incoming_evidence_digest)
+            self.assertTrue(rt.has_malformed_rejections)
+            self.assertEqual(classify_rejection_reasons(rt), ("needs_identity_and_radarr_check", None))
+
 
 if __name__ == "__main__":
     unittest.main()

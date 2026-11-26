@@ -350,7 +350,7 @@ class ActionsService:
         card_payload: dict[str, Any],
     ) -> tuple[list[NewActionRecord], dict[str, str]]:
         delivery_kind = str(card_payload.get("delivery_kind") or "").strip()
-        if delivery_kind not in ("actionable_grab", "alternative_grab", "evidence_review"):
+        if delivery_kind not in ("actionable_grab", "alternative_grab", "evidence_review", "retired"):
             raise DeliveryValidationError(f"Unsupported delivery_kind: {delivery_kind!r}")
 
         release_id = str(card_payload.get("release_id") or "").strip()
@@ -367,7 +367,7 @@ class ActionsService:
         ):
             raise DeliveryValidationError("Missing or invalid release_id / source_occurrence_id / card_revision")
 
-        if delivery_kind == "evidence_review":
+        if delivery_kind in ("evidence_review", "retired"):
             return [], {}
 
         # Defense-in-depth gate: NEVER mint ordinary or alternative buttons without verified identity
@@ -415,7 +415,9 @@ class ActionsService:
             bound_existing_movie_id = card_payload.get("bound_existing_movie_id")
             bound_existing_file_id = card_payload.get("bound_existing_file_id")
             raw_reasons = card_payload.get("rejection_reasons")
-            reasons_list = [str(r).strip() for r in raw_reasons] if isinstance(raw_reasons, list) else []
+            # Issue #13 §4b: Never stringify non-string/unreadable rejection items;
+            # pass the raw list directly to strict legacy validation.
+            raw_reasons_list: list[Any] = raw_reasons if isinstance(raw_reasons, list) else []
             indexer_str = str(card_payload.get("indexer") or "").strip()
             external_id_str = str(card_payload.get("external_id") or "").strip()
 
@@ -425,10 +427,11 @@ class ActionsService:
                 exact_release_name=exact_release_name,
                 title=verified_title,
                 year=clean_year,
-                rejections=reasons_list,
+                rejections=raw_reasons_list,
             )
             if not src_ok:
                 raise DeliveryValidationError(f"Refused: alternative_grab source/rejection check failed ({src_reason})")
+            reasons_list = [r.strip() for r in raw_reasons_list]
             bound_rejection_class = matched_classes[0]
 
             mf_snap = card_payload.get("bound_movie_file_snapshot")
@@ -580,7 +583,7 @@ class ActionsService:
             action_tokens=raw_tokens,
         )
 
-        # Path 1: Edit an existing acknowledged card on a higher verified revision / conflict downgrade
+        # Path 1: Edit an existing acknowledged card on a higher verified revision / conflict downgrade / retirement
         if plan.mode == "edit":
             assert plan.ack_chat_id is not None and plan.ack_message_id is not None
             if plan.used_poster:
@@ -630,7 +633,7 @@ class ActionsService:
                     restore_delivery_kind=plan.previous_delivery_kind,
                     superseded_action_ids=plan.superseded_action_ids,
                     newly_minted_action_ids=plan.newly_minted_action_ids,
-                    keep_prior_superseded=(delivery_kind == "evidence_review"),
+                    keep_prior_superseded=(delivery_kind in ("evidence_review", "retired")),
                 )
                 return {"status": "failed", "detail": res.error_redacted or "telegram_edit_failed"}
 
@@ -1110,6 +1113,72 @@ class ActionsService:
             )
         return True, movie, meta, 200, "Eligible for Alternative Grab"
 
+    def _check_fresh_action_delivery_and_sibling_guards(
+        self,
+        snap: ActionGroupSnapshot,
+        *,
+        is_post: bool = False,
+    ) -> Optional[HtmlResponseData]:
+        """
+        Issue #13 §2b: Before permitting a fresh (`active`) action initiation:
+          1. Reject if the release's latest delivery card_revision is newer than this action's
+             card_revision, or if the latest delivery was retired / downgraded to evidence_review.
+          2. For `add_grab` / `alternative_grab`, reject if a sibling `watched_*` action on this
+             release has already been attempted/completed/ambiguous.
+        """
+        action = snap.action
+        if action is None or str(action["status"]) != "active":
+            return None
+
+        delivery = snap.delivery
+        if delivery is not None:
+            latest_rev = int(delivery.get("card_revision") or 0)
+            latest_kind = str(delivery.get("delivery_kind") or "")
+            act_rev = int(action.get("card_revision") or 0)
+            if latest_rev > act_rev or latest_kind in ("retired", "evidence_review"):
+                reason_msg = (
+                    "This proposal was retired and is no longer eligible for action."
+                    if latest_kind == "retired"
+                    else "This card revision was superseded by a newer revision."
+                )
+                return HtmlResponseData(
+                    status_code=410,
+                    html=render_simple_status_page(
+                        title="Action Superseded",
+                        badge="superseded",
+                        message=reason_msg,
+                        tone="warn",
+                    ),
+                )
+
+        action_type = str(action["action_type"])
+        if action_type in ("add_grab", "alternative_grab"):
+            watched_sib = next(
+                (
+                    a
+                    for a in snap.release_actions
+                    if str(a.get("action_type") or "") in ("watched_good", "watched_bad", "watched_legacy_unrated")
+                    and str(a.get("status") or "")
+                    in ("attempting", "ambiguous_radarr", "completed_radarr", "completed_all")
+                ),
+                None,
+            )
+            if watched_sib is not None:
+                return HtmlResponseData(
+                    status_code=409,
+                    html=render_simple_status_page(
+                        title="Grab Blocked (Already Marked Watched)",
+                        badge="409",
+                        message=(
+                            "This movie was already marked Watched on this card "
+                            f"({watched_sib.get('action_type')}: {watched_sib.get('status')}). "
+                            "No Radarr or download write was performed."
+                        ),
+                        tone="warn",
+                    ),
+                )
+        return None
+
     async def render_action_get(self, raw_token: str) -> HtmlResponseData:
         """Strictly read-only confirmation / status view for GET /action/{token}."""
         snap = await asyncio.to_thread(self.db.get_action_group_readonly, hash_token(raw_token))
@@ -1211,6 +1280,10 @@ class ActionsService:
                     details=[("Release", str(action["bound_release_name"]))],
                 ),
             )
+
+        guard_resp = self._check_fresh_action_delivery_and_sibling_guards(snap, is_post=False)
+        if guard_resp is not None:
+            return guard_resp
 
         # Check expiry for active links (except already-initiated skip with failed feedback)
         if self._is_expired(action):
@@ -1329,8 +1402,14 @@ class ActionsService:
                 f"Exists in Radarr (ID {existing.get('id')}, monitored={bool(existing.get('monitored'))}, "
                 f"hasFile={bool(existing.get('hasFile'))}, watched={has_watched})"
             )
-            if action_type == "add_grab" and has_watched and not bool(existing.get("monitored")):
-                warning_note = "Note: This movie is currently tagged 'watched' and unmonitored in Radarr."
+            if action_type == "add_grab":
+                block_resp = self._check_add_grab_existing_movie_eligibility(
+                    action=action,
+                    existing=existing,
+                    tags=tags_res.data,
+                )
+                if block_resp is not None:
+                    return block_resp
             needs_add_options = False
         else:
             radarr_summary = "Not currently in Radarr (will be added with searchForMovie=false)."
@@ -1454,6 +1533,17 @@ class ActionsService:
                     tone="err",
                 ),
             )
+
+        # 4b. Issue #13 §2b: Fresh initiation guard — latest revision, retired status, sibling watched
+        guard_resp = self._check_fresh_action_delivery_and_sibling_guards(snap, is_post=True)
+        if guard_resp is not None:
+            if guard_resp.status_code == 410:
+                await asyncio.to_thread(
+                    self.db.mark_action_superseded,
+                    action_id=str(action["action_id"]),
+                    detail="stale_or_retired_delivery_revision",
+                )
+            return guard_resp
 
         # 5. Expiry check for fresh initiation (active status)
         if self._is_expired(action):
@@ -1746,6 +1836,10 @@ class ActionsService:
             )
 
         existing = movies[0] if movies else None
+        if existing is not None:
+            id_err = self._check_radarr_existing_movie_identity(action=action, existing=existing)
+            if id_err is not None:
+                return id_err
         needs_feedback = _feedback_spec_for_action(str(action["action_type"])) is not None
 
         # On reconciliation: if desired state ALREADY satisfied (watched tag + unmonitored), seal cleanly!
@@ -2235,6 +2329,108 @@ class ActionsService:
             ),
         )
 
+    def _check_radarr_existing_movie_identity(
+        self,
+        *,
+        action: dict[str, Any],
+        existing: dict[str, Any],
+    ) -> Optional[HtmlResponseData]:
+        """
+        Issue #13 §2b: Verify both TMDB and IMDb IDs where available on an existing Radarr row
+        before any Radarr write so identity drift blocks mutations.
+        """
+        bound_tmdb = action.get("bound_tmdb_id")
+        live_tmdb = existing.get("tmdbId")
+        if (
+            isinstance(bound_tmdb, int)
+            and not isinstance(bound_tmdb, bool)
+            and isinstance(live_tmdb, int)
+            and not isinstance(live_tmdb, bool)
+            and live_tmdb != bound_tmdb
+        ):
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Radarr Identity Drift Detected",
+                    badge="409",
+                    message=(
+                        f"Radarr movie TMDB ID ({live_tmdb}) no longer matches the verified binding ({bound_tmdb}). "
+                        "Refusing Radarr write."
+                    ),
+                    tone="err",
+                ),
+            )
+
+        bound_imdb = str(action.get("bound_imdb_id") or "").strip().lower() or None
+        live_imdb = str(existing.get("imdbId") or "").strip().lower() or None
+        if bound_imdb and live_imdb and live_imdb != bound_imdb:
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Radarr Identity Drift Detected",
+                    badge="409",
+                    message=(
+                        f"Radarr movie IMDb ID ({live_imdb}) no longer matches the verified binding ({bound_imdb}). "
+                        "Refusing Radarr write."
+                    ),
+                    tone="err",
+                ),
+            )
+        return None
+
+    def _check_add_grab_existing_movie_eligibility(
+        self,
+        *,
+        action: dict[str, Any],
+        existing: dict[str, Any],
+        tags: list[dict[str, Any]],
+    ) -> Optional[HtmlResponseData]:
+        """
+        Issue #13 §2b: Final eligibility checks for ordinary Add & Grab against live Radarr state:
+          1. Bound TMDB + IMDb IDs match (no identity drift).
+          2. Movie does NOT already own a file (`hasFile == False` and no existing `movieFile`).
+          3. Movie is NOT tagged `watched` and unmonitored.
+        A monitored movie with no file (and matching IDs, not watched+unmonitored) remains eligible.
+        """
+        id_err = self._check_radarr_existing_movie_identity(action=action, existing=existing)
+        if id_err is not None:
+            return id_err
+
+        has_file = bool(existing.get("hasFile")) or (
+            isinstance(existing.get("movieFile"), dict) and existing["movieFile"].get("id") is not None
+        )
+        if has_file:
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Movie Already Owned in Radarr",
+                    badge="409",
+                    message=(
+                        f"Radarr movie ID {existing.get('id')} already has a file on disk. "
+                        "Ordinary Add & Grab is refused; zero Radarr writes were performed."
+                    ),
+                    tone="warn",
+                ),
+            )
+
+        watched_tag_id = _find_watched_tag_id(tags)
+        m_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
+        has_watched = watched_tag_id is not None and watched_tag_id in m_tags
+        if has_watched and not bool(existing.get("monitored")):
+            return HtmlResponseData(
+                status_code=409,
+                html=render_simple_status_page(
+                    title="Movie Already Watched & Unmonitored",
+                    badge="409",
+                    message=(
+                        f"Radarr movie ID {existing.get('id')} is tagged 'watched' and unmonitored. "
+                        "Add & Grab is refused; zero Radarr writes were performed."
+                    ),
+                    tone="warn",
+                ),
+            )
+        return None
+
     async def _execute_add_grab(
         self,
         action: dict[str, Any],
@@ -2252,9 +2448,12 @@ class ActionsService:
                 ),
             )
 
-        # Pre-write check 1: lookup live movie in Radarr
-        movies_res = await self.radarr.get_movies_by_tmdb(tmdb_id)
-        if not movies_res.ok:
+        # Pre-write check 1: lookup live movie & tags in Radarr
+        movies_res, tags_res = await asyncio.gather(
+            self.radarr.get_movies_by_tmdb(tmdb_id),
+            self.radarr.get_tags(),
+        )
+        if not movies_res.ok or not tags_res.ok:
             return HtmlResponseData(
                 status_code=503,
                 html=render_simple_status_page(
@@ -2276,6 +2475,14 @@ class ActionsService:
                 ),
             )
         existing = movies[0] if movies else None
+        if existing is not None:
+            elig_err = self._check_add_grab_existing_movie_eligibility(
+                action=action,
+                existing=existing,
+                tags=tags_res.data,
+            )
+            if elig_err is not None:
+                return elig_err
 
         # Pre-write check 2: validate live root folder & quality profile if movie absent
         selected_root: Optional[str] = None
@@ -2379,9 +2586,29 @@ class ActionsService:
                 radarr_movie_id = int(add_res.data["id"])
                 phase1_outcome = f"movie_added:{radarr_movie_id}"
             elif add_res.outcome == "already_exists":
-                reread = await self.radarr.get_movies_by_tmdb(tmdb_id)
-                if reread.ok and len(reread.data) == 1 and isinstance(reread.data[0], dict):
-                    radarr_movie_id = int(reread.data[0]["id"])
+                reread, reread_tags = await asyncio.gather(
+                    self.radarr.get_movies_by_tmdb(tmdb_id),
+                    self.radarr.get_tags(),
+                )
+                if reread.ok and reread_tags.ok and len(reread.data) == 1 and isinstance(reread.data[0], dict):
+                    reread_movie = reread.data[0]
+                    elig_err = self._check_add_grab_existing_movie_eligibility(
+                        action=action,
+                        existing=reread_movie,
+                        tags=reread_tags.data,
+                    )
+                    if elig_err is not None:
+                        await asyncio.to_thread(
+                            self.db.finish_write_attempt,
+                            attempt_id=att1_id,
+                            action_id=str(action["action_id"]),
+                            attempt_status="failed_definitive",
+                            action_status="ambiguous_radarr" if is_phase1_retry else "active",
+                            outcome_summary="already_exists_ineligible",
+                            last_error_redacted="Existing Radarr movie failed post-add eligibility checks",
+                        )
+                        return elig_err
+                    radarr_movie_id = int(reread_movie["id"])
                     phase1_outcome = f"movie_reused_after_400:{radarr_movie_id}"
                 else:
                     await asyncio.to_thread(
@@ -2797,7 +3024,7 @@ class ActionsService:
                     message=f"Configured category '{cfg.category}' does not exist in qBittorrent; Alternative Grab refused.",
                 )
 
-            # Confirm qBittorrent autorun hooks are disabled
+            # Confirm qBittorrent autorun hooks are positively disabled (Issue #13 §4b)
             prefs_res = await self.qbit_client.get_preferences(qbit_http)
             if not prefs_res.ok or not isinstance(prefs_res.data, dict):
                 return await _release_preflight(
@@ -2807,14 +3034,18 @@ class ActionsService:
                     message=f"Could not read qBittorrent preferences ({prefs_res.error_redacted}). Zero writes made.",
                     tone="warn",
                 )
-            if bool(prefs_res.data.get("autorun_enabled")) or bool(
-                prefs_res.data.get("autorun_on_torrent_added_enabled")
-            ):
+            autorun_enabled = prefs_res.data.get("autorun_enabled")
+            autorun_on_add = prefs_res.data.get("autorun_on_torrent_added_enabled")
+            if autorun_enabled is not False or autorun_on_add is not False:
                 return await _release_preflight(
                     http_code=409,
                     title="Alternative Grab Refused",
                     badge="refused",
-                    message="qBittorrent autorun hooks are enabled; Alternative Grab refused.",
+                    message=(
+                        "qBittorrent preferences did not positively confirm both "
+                        "'autorun_enabled=false' and 'autorun_on_torrent_added_enabled=false'; "
+                        "Alternative Grab refused."
+                    ),
                 )
 
             # 7. Write durable 0600 receipt keyed to external_id BEFORE opening qbit_alternative_grab attempt
@@ -3208,13 +3439,23 @@ class ActionsService:
         candidate_timestamp: Optional[str],
         attempt_started_at: Optional[str],
     ) -> bool:
-        if candidate_timestamp and attempt_started_at:
-            cand_dt = parse_iso_utc(candidate_timestamp)
-            start_dt = parse_iso_utc(attempt_started_at)
-            if cand_dt is not None and start_dt is not None:
-                if cand_dt < (start_dt - timedelta(seconds=60)):
-                    return False
-        return True
+        """
+        Issue #13 §4c: Require BOTH attempt_started_at and candidate_timestamp to be present
+        and parseable ISO-8601 UTC timestamps; absent or unreadable timestamps MUST fail
+        reconciliation so stale/uncorrelated records cannot emit 'Grabbed via Telegram'.
+        """
+        if (
+            not isinstance(candidate_timestamp, str)
+            or not candidate_timestamp.strip()
+            or not isinstance(attempt_started_at, str)
+            or not attempt_started_at.strip()
+        ):
+            return False
+        cand_dt = parse_iso_utc(candidate_timestamp)
+        start_dt = parse_iso_utc(attempt_started_at)
+        if cand_dt is None or start_dt is None:
+            return False
+        return cand_dt >= (start_dt - timedelta(seconds=60))
 
     def _matches_announced_release(
         self,
