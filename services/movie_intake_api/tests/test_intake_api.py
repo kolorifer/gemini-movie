@@ -62,27 +62,35 @@ def _make_autobrr_movie_webhook(
     meta_tmdb: Optional[int] = None,
     size: int = 68_500_000_000,
     freeleech: Optional[bool] = False,
-    action_rejected: bool = False,
+    action_rejected: bool = True,
     action_type: Optional[str] = "RADARR",
     rejections: Optional[list[str]] = None,
     download_url: Optional[str] = None,
-    event: str = "PUSH_APPROVED",
+    event: str = "action.rejected",
+    filter_name: Optional[str] = "Movies Remux",
+    filter_id: Optional[int] = 7,
+    resolution: Optional[str] = None,
+    source: Optional[str] = None,
+    media_processing: Optional[str] = "REMUX",
 ) -> dict[str, Any]:
     effective_dl_url = (
         download_url
         if download_url is not None
         else f"https://www.torrentleech.org/rss/download/{external_id}/SUPER_SECRET_PASSKEY_VALUE/{release_name}.torrent"
     )
+    inferred_res = "2160p" if "2160p" in release_name else "1080p"
+    effective_res = inferred_res if resolution is None else resolution
+    effective_src = ("UHD BluRay" if effective_res == "2160p" else "BluRay") if source is None else source
     rel: dict[str, Any] = {
         "name": release_name,
         "type": release_type,
         "category": category,
         "external_id": external_id,
         "size": size,
-        "resolution": "2160p" if "2160p" in release_name else "1080p",
-        "source": "UHD.BluRay",
+        "resolution": effective_res,
+        "source": effective_src,
         "hdr": ["DV", "HDR10"] if "DV" in release_name else [],
-        "media_processing": "REMUX",
+        "media_processing": media_processing,
         "group": "CiNEPHiLES" if "CiNEPHiLES" in release_name else "FraMeSToR",
         "download_url": effective_dl_url,
         "protocol": "torrent",
@@ -103,14 +111,32 @@ def _make_autobrr_movie_webhook(
     if action_type is not None:
         action_obj["type"] = action_type
 
+    effective_rejections = (
+        list(rejections)
+        if rejections is not None
+        else (["Unknown Movie"] if action_rejected else [])
+    )
+    result_obj: dict[str, Any] = {"rejections": effective_rejections}
+    if action_rejected:
+        result_obj["status"] = "PUSH_REJECTED"
+
+    data_obj: dict[str, Any] = {
+        "indexer": indexer,
+        "action": action_obj,
+        "result": result_obj,
+        "release": rel,
+    }
+    if filter_name is not None or filter_id is not None:
+        filter_obj: dict[str, Any] = {}
+        if filter_name is not None:
+            filter_obj["name"] = filter_name
+        if filter_id is not None:
+            filter_obj["id"] = filter_id
+        data_obj["filter"] = filter_obj
+
     return {
         "event": event,
-        "action": action_obj,
-        "data": {
-            "indexer": indexer,
-            "result": {"rejections": rejections or []},
-            "release": rel,
-        },
+        "data": data_obj,
     }
 
 
@@ -1267,12 +1293,12 @@ Language : German
                 self.assertEqual(db.get_release(r_unmon.json()["release_id"])["suppression_reason"], "already_owned")  # type: ignore[index]
                 self.assertEqual(len(actions.card_calls), cards_before_unmon)
 
-                # Routine disallowed quality rejection -> suppressed early (0 TL calls, 0 cards)
+                # Routine disallowed quality rejection on eligible BD REMUX -> suppressed early (0 TL calls, 0 cards)
                 tl_before = len(tl.calls)
                 r_qrej = client.post(
                     "/webhook/test-webhook-secret",
                     json=_make_autobrr_movie_webhook(
-                        release_name="Library.Film.2024.1080p.WEB-DL-GRP",
+                        release_name="Library.Film.2024.1080p.BluRay.REMUX-GRP",
                         external_id="4005",
                         title="Library Film",
                         year=2024,
@@ -3223,7 +3249,7 @@ Language : German
             ),
             # Release name > 512 chars
             _make_autobrr_movie_webhook(
-                release_name="Example.Film.2024." + ("A" * 510) + ".2160p.REMUX-GRP",
+                release_name="Example.Film.2024." + ("A" * 510) + ".2160p.UHD.BluRay.REMUX-GRP",
                 external_id="77010",
                 action_rejected=True,
                 rejections=["Existing file meets cutoff: Remux-1080p"],
@@ -3314,17 +3340,17 @@ Language : German
 
     def test_live_autobrr_release_new_then_action_rejected_shapes_and_eval_reuse(self) -> None:
         """
-        OPS-REPORT #6 regressions:
-          1) Live autobrr emits event='action.rejected' with nested data.action.type='RADARR'
-             and data.result.status='PUSH_REJECTED' (no top-level 'action' object).
-          2) release.new -> action.rejected ('Unknown Movie...') produces 1 card (rev 1) + 1 eval
-             both when Occ 2 arrives mid-flight and when Occ 2 arrives after completion.
-          3) release.new (owned -> suppressed) -> action.rejected (4-form quality cutoff)
-             upgrades cleanly to 1 Alternative Grab card + 1 eval.
-          4) Radarr action change (actionable_grab -> alternative_grab) with unchanged movie
-             evidence edits card to rev 2 with preserve_eval_reply=True and reuses the single eval reply.
-          5) Unresolved path (evidence_review) release.new -> action.rejected also avoids a 2nd eval.
-          6) Pre-migration intake.db cleanly adds last_card_digest / last_eval_reply_digest.
+        Live autobrr shapes & eval reuse regressions (OPS-REPORT #6 + Issue #13 §1):
+          1) Global `release.new` archives unchanged as `non_movie_archive_only` (0 TL/eval/cards).
+          2) Qualifying `action.rejected` (`data.action.type='RADARR'`, `data.filter.name='Movies Remux'`,
+             `data.result.status='PUSH_REJECTED'`) admits eligible 1080p/2160p BD REMUX releases;
+             mid-flight follow-up `action.rejected` produces 1 card (rev 1) + 1 eval (complete no-op on pass 2).
+          3) `release.new` (archived only) -> `action.rejected` (4-form quality cutoff on owned file)
+             produces 1 Alternative Grab card + 1 eval and archives both original payloads.
+          4) Radarr action change (`actionable_grab` -> `alternative_grab`) with unchanged movie
+             evidence edits card to rev 2 with `preserve_eval_reply=True` and reuses the single eval reply.
+          5) Unresolved path (`evidence_review`) follow-up `action.rejected` also avoids a 2nd eval.
+          6) Pre-migration intake.db cleanly adds `last_card_digest` / `last_eval_reply_digest`.
         """
         import sqlite3
 
@@ -3370,6 +3396,7 @@ Language : German
             *,
             rejections: list[str],
             action_type: str = "RADARR",
+            filter_name: str = "Movies Remux",
             evt_id: str = "evt-rej-1",
         ) -> dict[str, Any]:
             return {
@@ -3379,7 +3406,7 @@ Language : German
                 "data": {
                     "indexer": "TorrentLeech",
                     "action": {"name": "Radarr 4K", "type": action_type},
-                    "filter": {"id": 7, "name": "Movies 4K"},
+                    "filter": {"id": 7, "name": filter_name},
                     "release": dict(rel_obj),
                     "result": {
                         "status": "PUSH_REJECTED",
@@ -3393,11 +3420,11 @@ Language : German
             name=elio_name, external_id="241889121", title="Elio", year=2025, meta_imdb="tt4919268"
         )
 
-        # 1) Live autobrr rejection classification without top-level `action` object
+        # 1) Global `release.new` ends at archiving; qualifying Radarr `action.rejected` enters movie lane
         cw_new = classify_webhook_payload(_live_release_new(elio_rel))
+        self.assertEqual(cw_new.classification, "non_movie_archive_only")
         self.assertFalse(cw_new.action_rejected)
-        self.assertTrue(cw_new.action_is_radarr)
-        self.assertEqual(classify_rejection_reasons(cw_new), ("not_rejected", None))
+        self.assertFalse(cw_new.action_is_radarr)
 
         cw_unknown = classify_webhook_payload(
             _live_action_rejected(
@@ -3405,6 +3432,7 @@ Language : German
                 rejections=["Unknown Movie. Unable to match to existing movie in Library using release title."],
             )
         )
+        self.assertEqual(cw_unknown.classification, "movie_candidate")
         self.assertTrue(cw_unknown.action_rejected)
         self.assertTrue(cw_unknown.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_unknown), ("needs_identity_and_radarr_check", None))
@@ -3412,6 +3440,7 @@ Language : German
         cw_cutoff = classify_webhook_payload(
             _live_action_rejected(elio_rel, rejections=["Existing file meets cutoff: Remux-2160p"])
         )
+        self.assertEqual(cw_cutoff.classification, "movie_candidate")
         self.assertTrue(cw_cutoff.action_rejected)
         self.assertTrue(cw_cutoff.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_cutoff), ("legacy_alt_grab_eligible", "cutoff_met"))
@@ -3423,6 +3452,7 @@ Language : German
                 rejections=["Existing file meets cutoff: Remux-2160p"],
             )
         )
+        self.assertEqual(cw_non_radarr.classification, "non_movie_archive_only")
         self.assertTrue(cw_non_radarr.action_rejected)
         self.assertFalse(cw_non_radarr.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_non_radarr), ("quality_rejected_suppress", "cutoff_met"))
@@ -3430,6 +3460,7 @@ Language : German
         cw_unwanted = classify_webhook_payload(
             _live_action_rejected(elio_rel, rejections=["Quality is not wanted in profile"])
         )
+        self.assertEqual(cw_unwanted.classification, "movie_candidate")
         self.assertTrue(cw_unwanted.action_rejected)
         self.assertEqual(classify_rejection_reasons(cw_unwanted), ("quality_rejected_suppress", "quality_unwanted"))
 
@@ -3536,13 +3567,26 @@ Language : German
             )
 
             with TestClient(app) as client:
-                # 2) Exact Elio live regression: Occ 2 arrives MID-FLIGHT while Pass 1 is evaluating,
-                #    then a 3rd identical action.rejected / post-completion follow-up arrives.
-                r1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(elio_rel))
+                # 2) Global `release.new` archives cleanly (0 work), then qualifying `action.rejected` starts Pass 1,
+                #    and a mid-flight follow-up `action.rejected` with revised rejection text triggers Pass 2 no-op.
+                r0_new = client.post("/webhook/test-webhook-secret", json=_live_release_new(elio_rel))
+                self.assertEqual(r0_new.status_code, 200)
+                self.assertEqual(r0_new.json()["status"], "archived_non_movie")
+                self.assertIsNone(r0_new.json()["release_id"])
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(tl.calls), 0)
+                self.assertEqual(len(triage.calls), 0)
+                self.assertEqual(len(actions.card_calls), 0)
+
+                r1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(elio_rel, rejections=["Unknown Movie"], evt_id="evt-e1"),
+                )
                 self.assertEqual(r1.status_code, 200)
                 rel_elio = r1.json()["release_id"]
+                self.assertIsNotNone(rel_elio)
 
-                # Simulate Occ 2 (action.rejected "Unknown Movie...") arriving while Pass 1 is in /evaluate!
+                # Simulate Occ 2 (updated action.rejected wording) arriving while Pass 1 is in /evaluate!
                 def _post_midflight_reject() -> None:
                     r_mid = client.post(
                         "/webhook/test-webhook-secret",
@@ -3551,6 +3595,7 @@ Language : German
                             rejections=[
                                 "Unknown Movie. Unable to match to existing movie in Library using release title."
                             ],
+                            evt_id="evt-e2",
                         ),
                     )
                     self.assertEqual(r_mid.status_code, 200)
@@ -3581,7 +3626,7 @@ Language : German
                 self.assertEqual(len([e for e in actions.eval_reply_calls if e["release_id"] == rel_elio]), 1)
                 self.assertEqual(len(triage.calls), 1)
 
-                # 3) Live release.new (owned -> suppressed) -> action.rejected (4-form cutoff) -> 1 alt-grab card + 1 eval
+                # 3) Live `release.new` (archived only) -> `action.rejected` (4-form quality cutoff on owned file) -> 1 alt-grab card + 1 eval
                 radarr_state["status"] = RadarrStatusResponse(
                     status="owned_file",
                     movie_id=501,
@@ -3595,14 +3640,9 @@ Language : German
                     name=elio_name, external_id="241889122", title="Elio", year=2025, meta_imdb="tt4919268"
                 )
                 r_alt1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(alt_rel, evt_id="evt-a1"))
-                rel_alt = r_alt1.json()["release_id"]
-                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
-                sup_row = db.get_release(rel_alt)
-                assert sup_row is not None
-                self.assertEqual(sup_row["state"], "suppressed")
-                self.assertEqual(sup_row["suppression_reason"], "already_owned")
-                self.assertEqual(sup_row["card_revision"], 0)
-                self.assertEqual(len([c for c in actions.card_calls if c["release_id"] == rel_alt]), 0)
+                self.assertEqual(r_alt1.json()["status"], "archived_non_movie")
+                self.assertIsNone(r_alt1.json()["release_id"])
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
 
                 r_alt2 = client.post(
                     "/webhook/test-webhook-secret",
@@ -3612,7 +3652,8 @@ Language : German
                         evt_id="evt-a2",
                     ),
                 )
-                self.assertEqual(r_alt2.json()["status"], "updated_correction")
+                self.assertEqual(r_alt2.json()["status"], "accepted")
+                rel_alt = r_alt2.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 alt_done = db.get_release(rel_alt)
                 assert alt_done is not None
@@ -3633,7 +3674,10 @@ Language : German
                 trans_rel = _live_release_obj(
                     name=elio_name, external_id="241889123", title="Elio", year=2025, meta_imdb="tt4919268"
                 )
-                r_tr1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(trans_rel, evt_id="evt-t1"))
+                r_tr1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(trans_rel, rejections=["Unknown Movie"], evt_id="evt-t1"),
+                )
                 rel_trans = r_tr1.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 self.assertEqual(len(triage.calls), triage_before_case4 + 1)
@@ -3675,7 +3719,7 @@ Language : German
                 self.assertEqual(len(triage.calls), triage_before_case4 + 1)
                 self.assertEqual(len(trans_replies), 1)
 
-                # 5) Unresolved path (evidence_review) release.new -> action.rejected ("Unknown Movie...") -> 1 card + 1 eval
+                # 5) Unresolved path (evidence_review) follow-up action.rejected -> 1 card + 1 eval
                 triage_before_case5 = len(triage.calls)
                 unres_rel = _live_release_obj(
                     name="Mystery.Unidentified.2025.2160p.UHD.BluRay.REMUX-TRiToN",
@@ -3684,7 +3728,10 @@ Language : German
                     year=2025,
                     meta_imdb=None,
                 )
-                r_u1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(unres_rel, evt_id="evt-u1"))
+                r_u1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(unres_rel, rejections=["Unknown Movie"], evt_id="evt-u1"),
+                )
                 rel_unres = r_u1.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 self.assertEqual(len(triage.calls), triage_before_case5 + 1)

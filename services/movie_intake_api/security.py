@@ -131,6 +131,16 @@ def read_owner_private_regular_file(path: Path, *, max_bytes: int) -> bytes:
         os.close(fd)
 
 
+def fsync_directory(path: Path) -> None:
+    """Sync directory metadata so newly created entries and renames survive host crashes."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def atomic_write_private_file(target: Path, data: bytes) -> None:
     """Atomically persist data to a 0600 file inside an owner-private 0700 directory."""
     ensure_private_dir(target.parent)
@@ -169,6 +179,7 @@ def atomic_write_private_file(target: Path, data: bytes) -> None:
         fd = None
         os.replace(str(tmp_path), str(target))
         os.chmod(str(target), 0o600)
+        fsync_directory(target.parent)
     except Exception:
         if fd is not None:
             try:

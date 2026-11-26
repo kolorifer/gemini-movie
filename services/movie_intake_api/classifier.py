@@ -331,8 +331,266 @@ def _extract_indexer_name(raw_payload: dict[str, Any], data_dict: dict[str, Any]
     return ""
 
 
-_REJECTED_EVENTS = frozenset({"action.rejected", "push_rejected", "push.rejected"})
+DEFAULT_ALLOWED_FILTER_NAMES: tuple[str, ...] = ("Movies Remux",)
+_QUALIFYING_ACTION_EVENTS = frozenset({"action.rejected", "push_rejected", "push.rejected"})
+_REJECTED_EVENTS = _QUALIFYING_ACTION_EVENTS
 _REJECTED_RESULT_STATUSES = frozenset({"PUSH_REJECTED", "REJECTED"})
+
+_ELIGIBLE_REMUX_RESOLUTIONS = frozenset({"1080p", "2160p"})
+_DISALLOWED_NAME_RESOLUTIONS = frozenset({"4320p", "1080i", "720p", "576p", "540p", "480p", "360p"})
+_ELIGIBLE_META_DISC_SOURCES = frozenset(
+    {"bluray", "uhdbluray", "ultrahdbluray", "bd", "uhdbd", "bdremux", "uhdbdremux"}
+)
+_ELIGIBLE_META_REMUX_PROCESSING = frozenset({"remux", "bdremux", "uhdremux", "uhdbdremux"})
+_NAME_DISC_SOURCE_TOKENS = frozenset(
+    {"bluray", "blu-ray", "uhdbluray", "ultrahdbluray", "bdremux", "bd-remux", "uhdbdremux"}
+)
+_NAME_REMUX_TOKENS = frozenset({"remux", "bdremux", "bd-remux", "uhdremux", "uhdbdremux"})
+_NAME_NON_DISC_SOURCE_TOKENS = frozenset(
+    {
+        "web-dl",
+        "webdl",
+        "web-rip",
+        "webrip",
+        "web",
+        "hdtv",
+        "pdtv",
+        "sdtv",
+        "dvd",
+        "dvdrip",
+        "bdrip",
+        "brrip",
+        "hdrip",
+        "cam",
+        "hdcam",
+        "ts",
+        "hdts",
+        "telesync",
+        "telecine",
+        "dvdscr",
+        "tvrip",
+        "vhsrip",
+        "vodrip",
+    }
+)
+_NAME_NON_REMUX_PROCESSING_TOKENS = frozenset(
+    {
+        "x264",
+        "x265",
+        "xvid",
+        "divx",
+        "encode",
+        "reencode",
+        "transcode",
+        "bd25",
+        "bd50",
+        "bd66",
+        "bd100",
+        "bdmv",
+        "iso",
+        "untouched",
+    }
+)
+_QUALITY_TECH_START_TOKENS = frozenset(
+    {
+        "4320p",
+        "2160p",
+        "1080p",
+        "1080i",
+        "720p",
+        "576p",
+        "540p",
+        "480p",
+        "360p",
+        "4k",
+        "uhd",
+        "bluray",
+        "blu-ray",
+        "uhdbluray",
+        "ultrahdbluray",
+        "bdrip",
+        "brrip",
+        "bdremux",
+        "bd-remux",
+        "uhdbdremux",
+        "remux",
+        "web-dl",
+        "webdl",
+        "web-rip",
+        "webrip",
+        "hdtv",
+        "dvdrip",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "hevc",
+        "avc",
+        "av1",
+    }
+)
+_HYPHEN_TECH_PREV_TOKENS = frozenset({"web", "blu", "bd", "uhd", "vc", "mpeg", "dts", "h", "dd", "ddp", "hdr"})
+_HYPHEN_TECH_SUFFIX_TOKENS = frozenset(
+    {"dl", "rip", "ray", "remux", "hd", "ma", "es", "x", "1", "2", "264", "265", "10", "plus", "atmos", "truehd", "hevc", "avc"}
+)
+
+
+def _normalize_filter_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+
+def _strip_trailing_release_group(name: str) -> str:
+    cleaned = re.sub(r"\.(?:mkv|mp4|m2ts|iso|torrent)$", "", (name or "").strip(), flags=re.IGNORECASE)
+    m = re.search(r"([A-Za-z0-9]+)-([A-Za-z0-9]{1,24})$", cleaned)
+    if not m:
+        return cleaned
+    prev_part = m.group(1).lower()
+    suffix_part = m.group(2).lower()
+    if prev_part in _HYPHEN_TECH_PREV_TOKENS or suffix_part in _HYPHEN_TECH_SUFFIX_TOKENS:
+        return cleaned
+    return cleaned[: m.start(2) - 1]
+
+
+def _extract_release_tech_tokens(exact_name: str) -> list[str]:
+    stripped = _strip_trailing_release_group(exact_name)
+    tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", stripped) if t]
+    if not tokens:
+        return []
+
+    first_tech_idx = len(tokens)
+    for idx in range(1, len(tokens)):
+        if tokens[idx].lower() in _QUALITY_TECH_START_TOKENS:
+            first_tech_idx = idx
+            break
+
+    year_idx: Optional[int] = None
+    for idx in range(first_tech_idx - 1, 0, -1):
+        if _YEAR_TOKEN_RE.fullmatch(tokens[idx]):
+            year_idx = idx
+            break
+
+    if year_idx is not None:
+        return [t.lower() for t in tokens[year_idx + 1 :]]
+    if first_tech_idx < len(tokens):
+        return [t.lower() for t in tokens[first_tech_idx:]]
+    return []
+
+
+def _evaluate_remux_quality_eligibility(
+    *,
+    exact_name: str,
+    resolution: Optional[str],
+    source: Optional[str],
+    media_processing: Optional[str],
+) -> tuple[bool, Optional[str]]:
+    """
+    Require compatible 1080p or 2160p, Blu-ray/UHD Blu-ray disc source, and REMUX processing
+    across BOTH the release name and structured metadata. Missing or contradictory evidence
+    is ineligible.
+    """
+    tech_tokens = _extract_release_tech_tokens(exact_name)
+    if not tech_tokens:
+        return False, "missing_name_quality"
+
+    token_set = set(tech_tokens)
+    adjacent_pairs = {(tech_tokens[i], tech_tokens[i + 1]) for i in range(len(tech_tokens) - 1)}
+
+    if token_set & _DISALLOWED_NAME_RESOLUTIONS:
+        return False, "disallowed_name_resolution"
+    name_resolutions = token_set & _ELIGIBLE_REMUX_RESOLUTIONS
+    if not name_resolutions:
+        return False, "missing_name_resolution"
+    if len(name_resolutions) > 1:
+        return False, "conflicting_name_resolutions"
+    name_res = next(iter(name_resolutions))
+
+    if (token_set & _NAME_NON_DISC_SOURCE_TOKENS) or (("web", "dl") in adjacent_pairs) or (("web", "rip") in adjacent_pairs):
+        return False, "non_disc_name_source"
+    has_name_disc_source = bool(
+        (token_set & _NAME_DISC_SOURCE_TOKENS)
+        or (("blu", "ray") in adjacent_pairs)
+        or (("bd", "remux") in adjacent_pairs)
+    )
+    if not has_name_disc_source:
+        return False, "missing_name_bluray_source"
+
+    if (
+        (token_set & _NAME_NON_REMUX_PROCESSING_TOKENS)
+        or (("complete", "bluray") in adjacent_pairs)
+        or (("complete", "blu-ray") in adjacent_pairs)
+        or (("full", "bluray") in adjacent_pairs)
+        or (("full", "blu-ray") in adjacent_pairs)
+    ):
+        return False, "non_remux_name_processing"
+    has_name_remux = bool((token_set & _NAME_REMUX_TOKENS) or (("bd", "remux") in adjacent_pairs))
+    if not has_name_remux:
+        return False, "missing_name_remux_processing"
+
+    meta_res = (resolution or "").strip().lower()
+    if not meta_res:
+        return False, "missing_metadata_resolution"
+    if meta_res not in _ELIGIBLE_REMUX_RESOLUTIONS:
+        return False, f"ineligible_metadata_resolution:{meta_res}"
+    if meta_res != name_res:
+        return False, f"resolution_mismatch:{name_res}_vs_{meta_res}"
+
+    meta_src = re.sub(r"[\s._-]+", "", (source or "").strip().lower())
+    if not meta_src:
+        return False, "missing_metadata_source"
+    if meta_src not in _ELIGIBLE_META_DISC_SOURCES:
+        return False, f"ineligible_metadata_source:{meta_src}"
+
+    meta_proc = re.sub(r"[\s._-]+", "", (media_processing or "").strip().lower())
+    if not meta_proc:
+        return False, "missing_metadata_processing"
+    if meta_proc not in _ELIGIBLE_META_REMUX_PROCESSING:
+        return False, f"ineligible_metadata_processing:{meta_proc}"
+
+    if name_res == "1080p" and ("uhd" in meta_src or "uhd" in token_set):
+        return False, "uhd_source_incompatible_with_1080p_remux"
+
+    return True, None
+
+
+def _extract_filter_info(
+    raw_payload: dict[str, Any],
+    data_dict: dict[str, Any],
+) -> tuple[Optional[str], Optional[int], bool]:
+    """
+    Extract autobrr filter metadata from `data.filter` (or top-level `filter`).
+    Returns `(filter_name, filter_id, is_valid_structure)`.
+    """
+    data_filter = data_dict.get("filter")
+    top_filter = raw_payload.get("filter")
+
+    def _parse_one(obj: Any) -> tuple[Optional[str], Optional[int], bool]:
+        if isinstance(obj, dict):
+            name = _clean_str(obj.get("name"))
+            raw_id = obj.get("id")
+            fid = _clean_int(raw_id, min_val=1) if raw_id is not None else None
+            if raw_id is not None and fid is None:
+                return name, None, False
+            return name, fid, bool(name)
+        if isinstance(obj, str):
+            name = _clean_str(obj)
+            return name, None, bool(name)
+        return None, None, False
+
+    if data_filter is not None and top_filter is not None:
+        dn, did, dok = _parse_one(data_filter)
+        tn, tid, tok = _parse_one(top_filter)
+        if not dok or not tok:
+            return dn or tn, did or tid, False
+        if _normalize_filter_name(dn or "") != _normalize_filter_name(tn or ""):
+            return dn, did, False
+        if did is not None and tid is not None and did != tid:
+            return dn, did, False
+        return dn, did if did is not None else tid, True
+
+    chosen = data_filter if data_filter is not None else top_filter
+    if chosen is None:
+        return None, None, False
+    return _parse_one(chosen)
 
 
 def _extract_action_info(
@@ -340,7 +598,7 @@ def _extract_action_info(
     data_dict: dict[str, Any],
     *,
     top_event: str = "",
-) -> tuple[bool, bool, list[str]]:
+) -> tuple[bool, bool, list[str], Optional[str], str]:
     top_action = raw_payload.get("action")
     top_action_dict = top_action if isinstance(top_action, dict) else {}
     data_action = data_dict.get("action")
@@ -351,17 +609,28 @@ def _extract_action_info(
         result = raw_payload.get("result")
     result_dict = result if isinstance(result, dict) else {}
 
-    raw_type = _clean_str(top_action_dict.get("type")) or _clean_str(data_action_dict.get("type"))
-    action_is_radarr = raw_type is None or raw_type.lower() == "radarr"
+    top_type = _clean_str(top_action_dict.get("type"))
+    data_type = _clean_str(data_action_dict.get("type"))
+    if top_type and data_type and top_type.lower() != data_type.lower():
+        raw_type: Optional[str] = f"conflict:{data_type}/{top_type}"
+        action_is_radarr = False
+    else:
+        raw_type = data_type or top_type
+        action_is_radarr = raw_type is not None and raw_type.lower() == "radarr"
 
-    action_rejected_flag = _clean_bool(top_action_dict.get("rejected"))
+    action_rejected_flag = _clean_bool(data_action_dict.get("rejected"))
     if action_rejected_flag is None:
-        action_rejected_flag = _clean_bool(data_action_dict.get("rejected"))
+        action_rejected_flag = _clean_bool(top_action_dict.get("rejected"))
     result_rejected_flag = _clean_bool(result_dict.get("rejected"))
     result_status = (_clean_str(result_dict.get("status")) or "").upper()
     event_norm = top_event.strip().lower()
 
-    rejected = bool(
+    explicitly_not_rejected = bool(
+        action_rejected_flag is False
+        or result_rejected_flag is False
+        or (result_status and result_status not in _REJECTED_RESULT_STATUSES)
+    )
+    rejected = (not explicitly_not_rejected) and bool(
         action_rejected_flag is True
         or result_rejected_flag is True
         or event_norm in _REJECTED_EVENTS
@@ -377,7 +646,7 @@ def _extract_action_info(
     elif isinstance(raw_rejections, str) and raw_rejections.strip():
         rejections.append(redact_secrets(raw_rejections.strip(), max_chars=240))
 
-    return rejected, action_is_radarr, rejections
+    return rejected, action_is_radarr, rejections, raw_type, result_status
 
 
 @dataclass(frozen=True)
@@ -401,7 +670,7 @@ class ClassifiedWebhook:
     size_gb: Optional[float] = None
     freeleech: Optional[bool] = None
     action_rejected: bool = False
-    action_is_radarr: bool = True
+    action_is_radarr: bool = False
     rejections: list[str] = field(default_factory=list)
     has_download_url: bool = False
     has_canonical_tl_download_ref: bool = False
@@ -466,7 +735,7 @@ class ClassifiedWebhook:
             size_gb=snap.get("size_gb"),
             freeleech=snap.get("freeleech"),
             action_rejected=bool(snap.get("action_rejected")),
-            action_is_radarr=bool(snap.get("action_is_radarr", True)),
+            action_is_radarr=bool(snap.get("action_is_radarr", False)),
             rejections=list(snap.get("rejections") or []),
             has_download_url=bool(snap.get("has_download_url")),
             has_canonical_tl_download_ref=bool(snap.get("has_canonical_tl_download_ref")),
@@ -528,19 +797,33 @@ def classify_rejection_reasons(classified: ClassifiedWebhook) -> tuple[str, Opti
     return "quality_rejected_suppress", matched_classes[0]
 
 
-def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
+def classify_webhook_payload(
+    raw_payload: dict[str, Any],
+    *,
+    allowed_filter_names: tuple[str, ...] = DEFAULT_ALLOWED_FILTER_NAMES,
+    allowed_filter_ids: tuple[int, ...] = (),
+) -> ClassifiedWebhook:
     """
-    Classify an already-archived JSON webhook delivery per docs/LEGACY_HANDOVER.md:
-      - Inspect event type, action.rejected, data.result.rejections, data.release, data.indexer.
-      - Announce, IRC, feed, and housekeeping events -> non_movie_archive_only.
+    Classify an already-archived JSON webhook delivery per docs/LEGACY_HANDOVER.md & Issue #13 §1:
+      - Announce, IRC, feed, housekeeping, and global `release.new` events -> non_movie_archive_only.
+      - Require a qualifying Radarr action rejection event tied to an allowed autobrr filter
+        (default: `Movies Remux`).
       - Movie category + conflicting release type -> movie_category_type_conflict (diagnostic only).
-      - Valid movie lane event -> movie_candidate with exact release_key correlation fields.
+      - Require compatible 1080p or 2160p, Blu-ray/UHD Blu-ray disc source, and REMUX evidence
+        across both release name and structured metadata. Missing or contradictory quality evidence
+        -> non_movie_archive_only.
+      - Qualifying movie lane event -> movie_candidate with exact release_key correlation fields.
     """
     top_event = (_clean_str(raw_payload.get("event")) or _clean_str(raw_payload.get("type")) or "").lower()
     if top_event in _NON_MOVIE_EVENT_TYPES:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
             diagnostic_note=f"non_acquisition_event:{top_event}",
+        )
+    if top_event not in _QUALIFYING_ACTION_EVENTS:
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note=f"non_qualifying_event:{top_event or 'missing'}",
         )
 
     data = raw_payload.get("data")
@@ -562,6 +845,45 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
             diagnostic_note="missing_release_name",
+        )
+
+    action_rejected, action_is_radarr, rejections, action_type_raw, _result_status = _extract_action_info(
+        raw_payload, data, top_event=top_event
+    )
+    if not action_rejected:
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note="non_rejected_action",
+            action_rejected=False,
+            action_is_radarr=action_is_radarr,
+            rejections=rejections,
+        )
+    if not action_is_radarr:
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note=f"non_radarr_action:{redact_secrets(action_type_raw or 'missing', max_chars=40)}",
+            action_rejected=action_rejected,
+            action_is_radarr=False,
+            rejections=rejections,
+        )
+
+    filter_name, filter_id, filter_valid = _extract_filter_info(raw_payload, data)
+    allowed_names_norm = {_normalize_filter_name(n) for n in allowed_filter_names if n and n.strip()}
+    if not filter_valid or not filter_name or _normalize_filter_name(filter_name) not in allowed_names_norm:
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note=f"filter_mismatch:{redact_secrets(filter_name or 'missing', max_chars=80)}",
+            action_rejected=action_rejected,
+            action_is_radarr=action_is_radarr,
+            rejections=rejections,
+        )
+    if allowed_filter_ids and (filter_id is None or filter_id not in allowed_filter_ids):
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note=f"filter_id_mismatch:{filter_id if filter_id is not None else 'missing'}",
+            action_rejected=action_rejected,
+            action_is_radarr=action_is_radarr,
+            rejections=rejections,
         )
 
     indexer_raw = _extract_indexer_name(raw_payload, data, release)
@@ -610,9 +932,25 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
             diagnostic_note=f"unclassified_non_movie:cat={redact_secrets(category or 'none', max_chars=40)},type={release_type or 'none'}",
         )
 
-    action_rejected, action_is_radarr, rejections = _extract_action_info(
-        raw_payload, data, top_event=top_event
+    resolution = _clean_str(release.get("resolution"))
+    source = _clean_str(release.get("source"))
+    media_processing = _clean_str(release.get("media_processing"))
+
+    quality_ok, quality_reason = _evaluate_remux_quality_eligibility(
+        exact_name=exact_name,
+        resolution=resolution,
+        source=source,
+        media_processing=media_processing,
     )
+    if not quality_ok:
+        return ClassifiedWebhook(
+            classification="non_movie_archive_only",
+            diagnostic_note=f"ineligible_quality:{quality_reason}",
+            action_rejected=action_rejected,
+            action_is_radarr=action_is_radarr,
+            rejections=rejections,
+        )
+
     hint_title = _clean_str(release.get("title"))
     hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
     parsed_title, parsed_year = _extract_title_year_from_release_name(exact_name)
@@ -630,10 +968,7 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
 
     meta_imdb = _clean_imdb(release.get("meta_imdb") or release.get("imdb_id"))
     meta_tmdb = _clean_int(release.get("meta_tmdb") or release.get("tmdb_id"), min_val=1)
-    resolution = _clean_str(release.get("resolution"))
-    source = _clean_str(release.get("source"))
     dynamic_range = _clean_str_list(release.get("hdr") or release.get("dynamic_range"))
-    media_processing = _clean_str(release.get("media_processing") or release.get("container"))
     group = _clean_str(release.get("group"))
     size_gb = _parse_size_gb(release)
 
