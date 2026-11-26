@@ -85,6 +85,7 @@ class CardDeliveryPlan:
     previous_delivery_kind: str = ""
     superseded_action_ids: tuple[str, ...] = ()
     newly_minted_action_ids: tuple[str, ...] = ()
+    eval_reply_status: str = "pending"
     detail: Optional[str] = None
 
 
@@ -645,6 +646,7 @@ class ActionsDB:
                             used_poster=used_poster,
                             previous_card_revision=prev_rev,
                             previous_delivery_kind=prev_kind,
+                            eval_reply_status=str(row["eval_reply_status"] or "pending"),
                         )
 
                     # Higher card_revision edit: check if any Radarr-mutating action already started/completed
@@ -679,6 +681,7 @@ class ActionsDB:
                             used_poster=used_poster,
                             previous_card_revision=prev_rev,
                             previous_delivery_kind=prev_kind,
+                            eval_reply_status=str(row["eval_reply_status"] or "pending"),
                             detail=f"radarr_action_{locked_row['status']}",
                         )
 
@@ -812,47 +815,87 @@ class ActionsDB:
         ack_thread_id: Optional[int],
         used_poster: bool,
         is_edit: bool,
-    ) -> None:
+        preserve_eval_reply: bool = False,
+    ) -> bool:
         now_iso = utc_now_iso()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            preserved = False
             if is_edit:
-                conn.execute(
-                    """
-                    UPDATE deliveries
-                    SET card_revision = ?,
-                        delivery_kind = ?,
-                        status = 'delivered',
-                        process_instance_id = NULL,
-                        lease_expires_at = NULL,
-                        ack_chat_id = ?,
-                        ack_message_id = ?,
-                        ack_thread_id = ?,
-                        used_poster = ?,
-                        eval_reply_status = 'pending',
-                        eval_reply_card_revision = ?,
-                        eval_reply_attempt_id = NULL,
-                        eval_reply_process_instance_id = NULL,
-                        eval_reply_lease_expires_at = NULL,
-                        eval_reply_message_id = NULL,
-                        eval_doc_message_id = NULL,
-                        last_error_redacted = NULL,
-                        updated_at = ?
-                    WHERE release_id = ?
-                    """,
-                    (
-                        card_revision,
-                        delivery_kind,
-                        ack_chat_id,
-                        ack_message_id,
-                        ack_thread_id,
-                        1 if used_poster else 0,
-                        card_revision,
-                        now_iso,
-                        release_id,
-                    ),
-                )
+                if preserve_eval_reply:
+                    cur = conn.execute(
+                        "SELECT eval_reply_status FROM deliveries WHERE release_id = ?",
+                        (release_id,),
+                    ).fetchone()
+                    if cur is not None and str(cur["eval_reply_status"]) in ("sent", "ambiguous_reply"):
+                        preserved = True
+                if preserved:
+                    conn.execute(
+                        """
+                        UPDATE deliveries
+                        SET card_revision = ?,
+                            delivery_kind = ?,
+                            status = 'delivered',
+                            process_instance_id = NULL,
+                            lease_expires_at = NULL,
+                            ack_chat_id = ?,
+                            ack_message_id = ?,
+                            ack_thread_id = ?,
+                            used_poster = ?,
+                            eval_reply_card_revision = ?,
+                            last_error_redacted = NULL,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (
+                            card_revision,
+                            delivery_kind,
+                            ack_chat_id,
+                            ack_message_id,
+                            ack_thread_id,
+                            1 if used_poster else 0,
+                            card_revision,
+                            now_iso,
+                            release_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE deliveries
+                        SET card_revision = ?,
+                            delivery_kind = ?,
+                            status = 'delivered',
+                            process_instance_id = NULL,
+                            lease_expires_at = NULL,
+                            ack_chat_id = ?,
+                            ack_message_id = ?,
+                            ack_thread_id = ?,
+                            used_poster = ?,
+                            eval_reply_status = 'pending',
+                            eval_reply_card_revision = ?,
+                            eval_reply_attempt_id = NULL,
+                            eval_reply_process_instance_id = NULL,
+                            eval_reply_lease_expires_at = NULL,
+                            eval_reply_message_id = NULL,
+                            eval_doc_message_id = NULL,
+                            last_error_redacted = NULL,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (
+                            card_revision,
+                            delivery_kind,
+                            ack_chat_id,
+                            ack_message_id,
+                            ack_thread_id,
+                            1 if used_poster else 0,
+                            card_revision,
+                            now_iso,
+                            release_id,
+                        ),
+                    )
             else:
                 conn.execute(
                     """
@@ -882,6 +925,7 @@ class ActionsDB:
                     ),
                 )
             conn.execute("COMMIT;")
+            return preserved
         except Exception:
             conn.execute("ROLLBACK;")
             raise

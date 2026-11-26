@@ -41,6 +41,7 @@ class DeliveryCardResponse:
     ack_chat_id: Optional[str] = None
     ack_message_id: Optional[int] = None
     ack_thread_id: Optional[int] = None
+    eval_reply_preserved: bool = False
     detail: Optional[str] = None
 
 
@@ -293,6 +294,7 @@ class ActionsApiClient:
                         ack_chat_id=chat_id,
                         ack_message_id=msg_id,
                         ack_thread_id=thread_id,
+                        eval_reply_preserved=bool(data.get("eval_reply_preserved") is True),
                     )
                 # Unknown, empty, or explicit ambiguous_delivery status: never prove non-delivery
                 return DeliveryCardResponse(
@@ -397,6 +399,7 @@ class ShadowStubActionsClient(ActionsApiClient):
         self.eval_reply_calls: list[dict[str, Any]] = []
         self._next_msg_id = 1000
         self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+        self._eval_sent_releases: set[str] = set()
 
     async def get_capabilities(self) -> Optional[bool]:
         self.capability_calls += 1
@@ -420,7 +423,19 @@ class ShadowStubActionsClient(ActionsApiClient):
         self.card_calls.append(dict(card_payload))
         rel_id = str(card_payload["release_id"])
         if rel_id in self._delivered_by_release:
-            return self._delivered_by_release[rel_id]
+            prev = self._delivered_by_release[rel_id]
+            preserved = bool(
+                card_payload.get("preserve_eval_reply") is True and rel_id in self._eval_sent_releases
+            )
+            if not preserved:
+                self._eval_sent_releases.discard(rel_id)
+            return DeliveryCardResponse(
+                status=prev.status,
+                ack_chat_id=prev.ack_chat_id,
+                ack_message_id=prev.ack_message_id,
+                ack_thread_id=prev.ack_thread_id,
+                eval_reply_preserved=preserved,
+            )
         self._next_msg_id += 1
         resp = DeliveryCardResponse(
             status="delivered",
@@ -433,4 +448,7 @@ class ShadowStubActionsClient(ActionsApiClient):
 
     async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> DeliveryEvalResponse:
         self.eval_reply_calls.append(dict(eval_reply_payload))
+        rel_id = str(eval_reply_payload.get("release_id") or "")
+        if rel_id:
+            self._eval_sent_releases.add(rel_id)
         return DeliveryEvalResponse(status="sent", detail="shadow_stub")
