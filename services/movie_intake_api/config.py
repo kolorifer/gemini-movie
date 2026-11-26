@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
-
-from .security import read_owner_private_regular_file
 
 MAX_WEBHOOK_BODY_BYTES = 1_000_000
 MAX_TL_BODY_BYTES = 1_000_000
 MAX_TL_COOKIE_BYTES = 16_384
-MAX_POLICY_CONFIG_BYTES = 65_536
 
 ALLOWED_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-QUALITY_ONLY_REJECTION_CLASSES = frozenset(
-    {"cutoff_met", "not_upgrade", "quality_unwanted", "custom_format_score", "size_limit"}
-)
 
 
 def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -46,38 +39,6 @@ def _validate_absolute_path_override(env_name: str, raw: Optional[str], default:
 
 
 @dataclass(frozen=True)
-class AlternativeGrabPolicy:
-    enabled: bool = False
-    allowed_rejection_classes: frozenset[str] = field(default_factory=frozenset)
-
-    @classmethod
-    def load_from_file(cls, path: Optional[Path]) -> "AlternativeGrabPolicy":
-        if path is None:
-            return cls(enabled=False, allowed_rejection_classes=frozenset())
-        raw_bytes = read_owner_private_regular_file(path, max_bytes=MAX_POLICY_CONFIG_BYTES)
-        parsed = json.loads(raw_bytes.decode("utf-8"))
-        if not isinstance(parsed, dict):
-            raise ValueError("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG must contain a JSON object")
-        enabled = bool(parsed.get("enabled", True))
-        raw_classes = parsed.get("allowed_rejection_classes") or []
-        if not isinstance(raw_classes, list):
-            raise ValueError("allowed_rejection_classes must be a list of strings")
-        normalized = {
-            str(item).strip().lower()
-            for item in raw_classes
-            if isinstance(item, str) and item.strip()
-        }
-        # Hard invariant: Alternative Grab is strictly a quality-only exception;
-        # never permit identity or unknown rejection classes regardless of file content.
-        invalid = normalized - QUALITY_ONLY_REJECTION_CLASSES
-        if invalid:
-            raise ValueError(
-                f"Alternative Grab config contains non-quality rejection classes: {sorted(invalid)}"
-            )
-        return cls(enabled=enabled and bool(normalized), allowed_rejection_classes=frozenset(normalized))
-
-
-@dataclass(frozen=True)
 class IntakeConfig:
     host: str
     port: int
@@ -89,7 +50,6 @@ class IntakeConfig:
     tmdb_cache_path: Path
     webhook_archive_dir: Path
     intake_db_path: Path
-    alternative_grab_config_path: Optional[Path]
     triage_api_url: str
     actions_api_url: str
     shadow_replay_enabled: bool = False
@@ -126,7 +86,7 @@ class IntakeConfig:
         tmdb_cache_path = _validate_absolute_path_override(
             "TMDB_CACHE_PATH",
             source.get("TMDB_CACHE_PATH"),
-            default_state / "tmdb-cache.json",
+            default_state / "intake-tmdb-cache.json",
         )
         webhook_archive_dir = _validate_absolute_path_override(
             "WEBHOOK_ARCHIVE_DIR",
@@ -138,15 +98,6 @@ class IntakeConfig:
             source.get("INTAKE_DB_PATH"),
             default_state / "intake.db",
         )
-
-        alt_raw = (source.get("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG") or "").strip()
-        alt_path: Optional[Path] = None
-        if alt_raw:
-            alt_path = _validate_absolute_path_override(
-                "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG",
-                alt_raw,
-                default_config / "alternative-grab.json",
-            )
 
         triage_url = (source.get("TRIAGE_API_URL") or "http://127.0.0.1:40716").strip().rstrip("/")
         actions_url = (source.get("ACTIONS_API_URL") or "http://127.0.0.1:40721").strip().rstrip("/")
@@ -162,7 +113,6 @@ class IntakeConfig:
             tmdb_cache_path=tmdb_cache_path,
             webhook_archive_dir=webhook_archive_dir,
             intake_db_path=intake_db_path,
-            alternative_grab_config_path=alt_path,
             triage_api_url=triage_url,
             actions_api_url=actions_url,
             shadow_replay_enabled=_parse_bool(source.get("SHADOW_REPLAY_ENABLED"), default=False),

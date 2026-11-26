@@ -16,7 +16,7 @@ from .clients import (
     RadarrStatusResponse,
     TriageApiClient,
 )
-from .config import AlternativeGrabPolicy, IntakeConfig
+from .config import IntakeConfig
 from .db import IntakeDB, utc_now, utc_now_iso
 from .security import redact_secrets
 from .tmdb_verifier import IdentityGateResult, TmdbIndependentClient, TmdbMovieRecord, run_independent_identity_gate
@@ -140,7 +140,6 @@ class IntakeWorker:
         tmdb_client: TmdbIndependentClient,
         triage_client: TriageApiClient,
         actions_client: ActionsApiClient,
-        alt_grab_policy: Optional[AlternativeGrabPolicy] = None,
         worker_id: Optional[str] = None,
     ) -> None:
         self.config = config
@@ -149,7 +148,6 @@ class IntakeWorker:
         self.tmdb_client = tmdb_client
         self.triage_client = triage_client
         self.actions_client = actions_client
-        self.alt_grab_policy = alt_grab_policy or AlternativeGrabPolicy()
         self.worker_id = worker_id or f"worker-{uuid.uuid4()}"
 
         self._wakeup = asyncio.Event()
@@ -220,7 +218,7 @@ class IntakeWorker:
         alt_grab_rejection_class: Optional[str],
     ) -> tuple[str, Optional[str], Optional[str]]:
         """
-        Apply Pre-Delivery Suppression Matrix (§5.3).
+        Apply Pre-Delivery Suppression Matrix (§5.3 + legacy Grab Anyway rules).
         Returns (mode, suppression_reason, radarr_note) where mode is one of:
           suppress | actionable_grab | alternative_grab | evidence_review
         """
@@ -230,6 +228,9 @@ class IntakeWorker:
             if (
                 alt_grab_eligible
                 and alt_grab_rejection_class
+                and radarr.alternative_grab_configured
+                and radarr.monitored is True
+                and isinstance(radarr.movie_file_snapshot, dict)
                 and radarr.movie_id is not None
                 and radarr.file_id is not None
             ):
@@ -259,6 +260,7 @@ class IntakeWorker:
         radarr: Optional[RadarrStatusResponse],
         radarr_note: Optional[str],
         alt_rejection_class: Optional[str],
+        preferred_topic_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         movie = gate.verified_movie
         # Defense in depth: only supply verified IDs for actionable/alternative cards when gate passed
@@ -270,6 +272,7 @@ class IntakeWorker:
             "identity_gate_status": gate.status,
             "exact_release_name": classified.exact_release_name,
             "indexer": classified.indexer_raw or classified.indexer_norm,
+            "external_id": classified.external_id_norm,
             "category": classified.category,
             "size_gb": classified.size_gb,
             "freeleech": classified.freeleech if classified.freeleech is not None else tl_result.freeleech_badge,
@@ -283,6 +286,8 @@ class IntakeWorker:
             "file_runtime_minutes": tl_result.file_runtime_minutes,
             "audio_languages": list(tl_result.audio_languages),
         }
+        if preferred_topic_kind:
+            payload["preferred_topic_kind"] = preferred_topic_kind
         if gate.status == "verified" and movie is not None:
             payload["verified_tmdb_id"] = movie.tmdb_id
             payload["verified_imdb_id"] = movie.imdb_id
@@ -293,6 +298,9 @@ class IntakeWorker:
             payload["bound_existing_movie_id"] = radarr.movie_id
             payload["bound_existing_file_id"] = radarr.file_id
             payload["bound_rejection_class"] = alt_rejection_class
+            payload["rejection_reasons"] = list(classified.rejections)
+            if isinstance(radarr.movie_file_snapshot, dict):
+                payload["bound_movie_file_snapshot"] = dict(radarr.movie_file_snapshot)
         return payload
 
     async def _deliver_card_and_eval_reply(
@@ -514,12 +522,8 @@ class IntakeWorker:
         snap = json.loads(str(row["incoming_snapshot_json"]))
         classified = ClassifiedWebhook.from_sanitized_snapshot(snap, expected_digest)
 
-        # Step 1: Routine quality rejection early check (§5.1 Step 3)
-        rej_mode, rej_class = classify_rejection_reasons(
-            classified.action_rejected,
-            classified.rejections,
-            self.alt_grab_policy,
-        )
+        # Step 1: Routine quality rejection early check (§5.1 Step 3 + legacy Grab Anyway capability check)
+        rej_mode, rej_class = classify_rejection_reasons(classified)
         if rej_mode == "quality_rejected_suppress":
             await asyncio.to_thread(
                 self.db.finalize_release,
@@ -532,7 +536,45 @@ class IntakeWorker:
             )
             return
 
-        alt_grab_eligible = rej_mode == "alternative_grab_candidate"
+        alt_grab_eligible = False
+        preferred_topic_kind: Optional[str] = None
+        if rej_mode == "legacy_alt_grab_eligible":
+            alt_cap = await self.actions_client.get_capabilities()
+            if alt_cap is False:
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="suppressed",
+                    expected_incoming_digest=expected_digest,
+                    suppression_reason="quality_rejected",
+                    eval_reply_status="skipped",
+                )
+                return
+            if alt_cap is None:
+                if retry_count < 4:
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="queued",
+                        expected_incoming_digest=expected_digest,
+                        next_attempt_at=self._retry_next_attempt_iso(),
+                        increment_retry=True,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.db.finalize_release,
+                        release_id,
+                        worker_id=self.worker_id,
+                        state="suppressed",
+                        expected_incoming_digest=expected_digest,
+                        suppression_reason="quality_rejected",
+                        eval_reply_status="skipped",
+                    )
+                return
+            alt_grab_eligible = True
+            preferred_topic_kind = "alternative_grab"
 
         # Step 2: TorrentLeech listing enrichment (serialized single worker)
         # Keep TL verification mandatory whenever TL metadata is enabled for a TorrentLeech
@@ -701,6 +743,7 @@ class IntakeWorker:
                     radarr=radarr,
                     radarr_note=radarr_note,
                     alt_rejection_class=rej_class,
+                    preferred_topic_kind=preferred_topic_kind,
                 )
                 await asyncio.to_thread(
                     self.db.renew_lease,
@@ -830,6 +873,7 @@ class IntakeWorker:
                     radarr=radarr,
                     radarr_note="Superseded to evidence review due to evaluator identity conflict",
                     alt_rejection_class=None,
+                    preferred_topic_kind=preferred_topic_kind,
                 )
                 pending_reply_for_sup: dict[str, Any] = {
                     "release_id": release_id,
@@ -1140,6 +1184,7 @@ class IntakeWorker:
             radarr=radarr,
             radarr_note=radarr_note,
             alt_rejection_class=rej_class if delivery_kind == "alternative_grab" else None,
+            preferred_topic_kind=preferred_topic_kind,
         )
         verified_movie: Optional[TmdbMovieRecord] = (
             final_gate.verified_movie if final_gate.status == "verified" else None

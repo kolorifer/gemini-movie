@@ -15,7 +15,9 @@ from .security import PrivateFileError, ensure_private_dir, redact_secrets
 ACTION_TYPES = frozenset(
     {"add_grab", "alternative_grab", "watched_good", "watched_bad", "watched_legacy_unrated", "skip"}
 )
-RADARR_PHASES = frozenset({"radarr_add_movie", "radarr_release_push", "radarr_watched"})
+RADARR_PHASES = frozenset(
+    {"radarr_add_movie", "radarr_release_push", "radarr_watched", "qbit_alt_preflight", "qbit_alternative_grab"}
+)
 
 
 def utc_now() -> datetime:
@@ -68,6 +70,7 @@ class NewActionRecord:
     bound_existing_file_quality: Optional[str]
     bound_rejection_class: Optional[str]
     expires_at: str
+    bound_snapshot_json: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +199,7 @@ class ActionsDB:
                     bound_existing_file_id      INTEGER,
                     bound_existing_file_quality TEXT,
                     bound_rejection_class       TEXT,
+                    bound_snapshot_json         TEXT,
                     selected_root_folder        TEXT,
                     selected_quality_profile_id INTEGER,
                     status                      TEXT NOT NULL,
@@ -210,6 +214,12 @@ class ActionsDB:
                 );
                 """
             )
+            existing_act_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(actions)").fetchall()
+            }
+            if "bound_snapshot_json" not in existing_act_cols:
+                conn.execute("ALTER TABLE actions ADD COLUMN bound_snapshot_json TEXT;")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS write_attempts (
@@ -513,9 +523,9 @@ class ActionsDB:
                     action_id, token_sha256, release_id, card_revision, source_occurrence_id,
                     action_type, completion_group, bound_tmdb_id, bound_imdb_id, bound_title,
                     bound_year, bound_release_name, bound_existing_movie_id, bound_existing_file_id,
-                    bound_existing_file_quality, bound_rejection_class,
+                    bound_existing_file_quality, bound_rejection_class, bound_snapshot_json,
                     status, feedback_status, expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'not_applicable', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'not_applicable', ?, ?, ?)
                 """,
                 (
                     item.action_id,
@@ -534,6 +544,7 @@ class ActionsDB:
                     item.bound_existing_file_id,
                     item.bound_existing_file_quality,
                     item.bound_rejection_class,
+                    item.bound_snapshot_json,
                     item.expires_at,
                     now_iso,
                     now_iso,
@@ -1430,6 +1441,21 @@ class ActionsDB:
                     conn.execute("COMMIT;")
                     return False, None, f"prior_release_push:{prior_push['status']}"
 
+            if phase in ("qbit_alternative_grab", "qbit_alt_preflight"):
+                prior_qbit = conn.execute(
+                    """
+                    SELECT attempt_id, status FROM write_attempts
+                    WHERE completion_group = ?
+                      AND phase = 'qbit_alternative_grab'
+                      AND status IN ('attempting', 'ambiguous', 'succeeded')
+                    LIMIT 1
+                    """,
+                    (completion_group,),
+                ).fetchone()
+                if prior_qbit is not None:
+                    conn.execute("COMMIT;")
+                    return False, None, f"prior_qbit_add:{prior_qbit['status']}"
+
             # Update parent action state atomically with write_attempts insert
             if phase in RADARR_PHASES:
                 conn.execute(
@@ -1858,13 +1884,180 @@ class ActionsDB:
         finally:
             conn.close()
 
+    def complete_alt_preflight_and_begin_qbit_add(
+        self,
+        *,
+        preflight_attempt_id: str,
+        action_id: str,
+        completion_group: str,
+        radarr_movie_id: int,
+        preflight_outcome: str,
+        process_instance_id: str,
+        qbit_lease_expires_at: str,
+        qbit_request_fingerprint: str,
+    ) -> Optional[str]:
+        """
+        Atomically close qbit_alt_preflight (succeeded) and open qbit_alternative_grab (attempting)
+        in one BEGIN IMMEDIATE transaction, guaranteeing zero dangling lock gap and zero duplicate adds.
+        """
+        now_iso = utc_now_iso()
+        add_attempt_id = generate_uuid7()
+        clean_outcome = redact_secrets(preflight_outcome, max_chars=300)
+        clean_fp = redact_secrets(qbit_request_fingerprint, max_chars=800)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            p1_row = conn.execute(
+                """
+                SELECT status FROM write_attempts
+                WHERE attempt_id = ? AND action_id = ? AND phase = 'qbit_alt_preflight'
+                """,
+                (preflight_attempt_id, action_id),
+            ).fetchone()
+            if p1_row is None or str(p1_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            prior_qbit = conn.execute(
+                """
+                SELECT attempt_id FROM write_attempts
+                WHERE completion_group = ?
+                  AND phase = 'qbit_alternative_grab'
+                  AND status IN ('attempting', 'ambiguous', 'succeeded')
+                LIMIT 1
+                """,
+                (completion_group,),
+            ).fetchone()
+            if prior_qbit is not None:
+                conn.execute("COMMIT;")
+                return None
+
+            conn.execute(
+                """
+                UPDATE write_attempts
+                SET status = 'succeeded',
+                    outcome_summary = ?,
+                    finished_at = ?
+                WHERE attempt_id = ?
+                """,
+                (clean_outcome, now_iso, preflight_attempt_id),
+            )
+            conn.execute(
+                """
+                UPDATE actions
+                SET status = 'attempting',
+                    radarr_movie_id = ?,
+                    last_error_redacted = NULL,
+                    updated_at = ?
+                WHERE action_id = ?
+                """,
+                (radarr_movie_id, now_iso, action_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO write_attempts (
+                    attempt_id, action_id, completion_group, phase, status,
+                    process_instance_id, lease_expires_at, request_fingerprint,
+                    started_at
+                ) VALUES (?, ?, ?, 'qbit_alternative_grab', 'attempting', ?, ?, ?, ?)
+                """,
+                (
+                    add_attempt_id,
+                    action_id,
+                    completion_group,
+                    process_instance_id,
+                    qbit_lease_expires_at,
+                    clean_fp,
+                    now_iso,
+                ),
+            )
+            conn.execute("COMMIT;")
+            return add_attempt_id
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
+    def reset_interrupted_alt_preflight(
+        self,
+        *,
+        attempt_id: str,
+        action_id: str,
+        completion_group: str,
+    ) -> bool:
+        """
+        Atomically reset an orphaned/ambiguous `qbit_alt_preflight` attempt back to `active`
+        ONLY when zero `qbit_alternative_grab` attempts exist in `completion_group` and the
+        action is still `ambiguous_radarr`.
+        """
+        now_iso = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            act_row = conn.execute(
+                "SELECT status FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if act_row is None or str(act_row["status"]) != "ambiguous_radarr":
+                conn.execute("COMMIT;")
+                return False
+            prior_qbit = conn.execute(
+                """
+                SELECT attempt_id FROM write_attempts
+                WHERE completion_group = ?
+                  AND phase = 'qbit_alternative_grab'
+                  AND status IN ('attempting', 'ambiguous', 'succeeded')
+                LIMIT 1
+                """,
+                (completion_group,),
+            ).fetchone()
+            if prior_qbit is not None:
+                conn.execute("COMMIT;")
+                return False
+            cur_att = conn.execute(
+                """
+                UPDATE write_attempts
+                SET status = 'failed_definitive',
+                    outcome_summary = 'preflight_interrupted_reset',
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE attempt_id = ?
+                  AND action_id = ?
+                  AND phase = 'qbit_alt_preflight'
+                  AND status = 'ambiguous'
+                """,
+                (now_iso, attempt_id, action_id),
+            )
+            if cur_att.rowcount != 1:
+                conn.execute("COMMIT;")
+                return False
+            cur_act = conn.execute(
+                """
+                UPDATE actions
+                SET status = 'active',
+                    last_reconciled_at = ?,
+                    last_error_redacted = 'Prior read-only preflight was interrupted before submission.',
+                    updated_at = ?
+                WHERE action_id = ?
+                  AND status = 'ambiguous_radarr'
+                """,
+                (now_iso, now_iso, action_id),
+            )
+            conn.execute("COMMIT;")
+            return cur_act.rowcount == 1
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
     def mark_action_expired(
         self,
         *,
         action_id: str,
         detail: str = "expired",
     ) -> bool:
-        """Mark action expired ONLY if still active/ambiguous_radarr and no release push may have landed."""
+        """Mark action expired ONLY if still active/ambiguous_radarr and no release push or qBit add may have landed."""
         now_iso = utc_now_iso()
         clean = redact_secrets(detail, max_chars=300)
         conn = self._connect()
@@ -1882,7 +2075,7 @@ class ActionsDB:
                   AND NOT EXISTS (
                       SELECT 1 FROM write_attempts wa
                       WHERE wa.completion_group = actions.completion_group
-                        AND wa.phase = 'radarr_release_push'
+                        AND wa.phase IN ('radarr_release_push', 'qbit_alternative_grab')
                         AND wa.status IN ('attempting', 'ambiguous', 'succeeded')
                   )
                 """,

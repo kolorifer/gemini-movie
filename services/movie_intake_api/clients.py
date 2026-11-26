@@ -15,6 +15,9 @@ class RadarrStatusResponse:
     movie_id: Optional[int] = None
     file_id: Optional[int] = None
     existing_quality: Optional[str] = None
+    monitored: Optional[bool] = None
+    movie_file_snapshot: Optional[dict[str, Any]] = None
+    alternative_grab_configured: bool = False
     detail: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -23,6 +26,11 @@ class RadarrStatusResponse:
             "movie_id": self.movie_id,
             "file_id": self.file_id,
             "existing_quality": self.existing_quality,
+            "monitored": self.monitored,
+            "movie_file_snapshot": dict(self.movie_file_snapshot)
+            if isinstance(self.movie_file_snapshot, dict)
+            else None,
+            "alternative_grab_configured": self.alternative_grab_configured,
             "detail": self.detail,
         }
 
@@ -128,6 +136,37 @@ class ActionsApiClient:
             headers["X-Internal-Token"] = self.internal_token
         return headers
 
+    async def get_capabilities(self) -> Optional[bool]:
+        """
+        Query movie-actions-api GET /internal/capabilities for `alternative_grab_configured`.
+        Returns True/False on valid HTTP 200 JSON, or None on transient/unreachable failure.
+        """
+        owns_client = self._external_client is None
+        client = (
+            self._external_client
+            if self._external_client is not None
+            else httpx.AsyncClient(follow_redirects=False, timeout=self.timeout_seconds)
+        )
+        try:
+            resp = await client.get(
+                f"{self.base_url}/internal/capabilities",
+                headers=self._headers(),
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not isinstance(data, dict):
+                return None
+            val = data.get("alternative_grab_configured")
+            if isinstance(val, bool):
+                return val
+            return None
+        except Exception:
+            return None
+        finally:
+            if owns_client:
+                await client.aclose()
+
     async def get_radarr_status(
         self,
         *,
@@ -173,11 +212,19 @@ class ActionsApiClient:
                 "lookup_failed",
             ):
                 return RadarrStatusResponse(status="lookup_failed", detail="unknown_radarr_status")
+            raw_mon = data.get("monitored")
+            monitored = raw_mon if isinstance(raw_mon, bool) else None
+            raw_snap = data.get("movie_file_snapshot")
+            mf_snap = dict(raw_snap) if isinstance(raw_snap, dict) else None
+            alt_cfg = bool(data.get("alternative_grab_configured"))
             return RadarrStatusResponse(
                 status=status,
                 movie_id=data.get("movie_id"),
                 file_id=data.get("file_id"),
                 existing_quality=data.get("existing_quality"),
+                monitored=monitored,
+                movie_file_snapshot=mf_snap,
+                alternative_grab_configured=alt_cfg,
                 detail=redact_secrets(str(data.get("detail") or ""), max_chars=200) or None,
             )
         except Exception as exc:
@@ -341,13 +388,19 @@ class ShadowStubActionsClient(ActionsApiClient):
 
     is_shadow_stub: bool = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, alternative_grab_configured: bool = False) -> None:
         super().__init__(base_url="http://shadow.invalid", internal_token="")
+        self.alternative_grab_configured = alternative_grab_configured
+        self.capability_calls: int = 0
         self.radarr_calls: list[dict[str, Any]] = []
         self.card_calls: list[dict[str, Any]] = []
         self.eval_reply_calls: list[dict[str, Any]] = []
         self._next_msg_id = 1000
         self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+
+    async def get_capabilities(self) -> Optional[bool]:
+        self.capability_calls += 1
+        return self.alternative_grab_configured
 
     async def get_radarr_status(
         self,
@@ -357,7 +410,11 @@ class ShadowStubActionsClient(ActionsApiClient):
         release_title: Optional[str] = None,
     ) -> RadarrStatusResponse:
         self.radarr_calls.append({"tmdb_id": tmdb_id, "imdb_id": imdb_id, "release_title": release_title})
-        return RadarrStatusResponse(status="absent", detail="shadow_stub")
+        return RadarrStatusResponse(
+            status="absent",
+            alternative_grab_configured=self.alternative_grab_configured,
+            detail="shadow_stub",
+        )
 
     async def deliver_card(self, card_payload: dict[str, Any]) -> DeliveryCardResponse:
         self.card_calls.append(dict(card_payload))

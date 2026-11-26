@@ -31,7 +31,6 @@ INTAKE_ALLOWED_KEYS: tuple[str, ...] = (
     "TMDB_CACHE_PATH",
     "WEBHOOK_ARCHIVE_DIR",
     "INTAKE_DB_PATH",
-    "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG",
     "TRIAGE_API_URL",
     "ACTIONS_API_URL",
     "SHADOW_REPLAY_ENABLED",
@@ -59,7 +58,7 @@ ACTIONS_ALLOWED_KEYS: tuple[str, ...] = (
 )
 
 INTAKE_FORBIDDEN_KEYS: frozenset[str] = frozenset(
-    {"GEMINI_API_KEY", "RADARR_API_KEY", "TELEGRAM_BOT_TOKEN"}
+    {"GEMINI_API_KEY", "RADARR_API_KEY", "TELEGRAM_BOT_TOKEN", "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG"}
 )
 ACTIONS_FORBIDDEN_KEYS: frozenset[str] = frozenset(
     {"GEMINI_API_KEY", "MOVIE_INTEL_WEBHOOK_SECRET", "MOVIE_INTEL_TL_COOKIE_FILE", "TMDB_API_TOKEN"}
@@ -268,10 +267,9 @@ def build_sliced_envs(
             "MOVIE_INTEL_TL_METADATA_ENABLED": "false",
             "MOVIE_INTEL_TL_COOKIE_FILE": str(state_root / "shadow-unused-cookies.json"),
             "TMDB_API_TOKEN": "",
-            "TMDB_CACHE_PATH": str(state_root / "tmdb-cache.json"),
+            "TMDB_CACHE_PATH": str(state_root / "intake-tmdb-cache.json"),
             "WEBHOOK_ARCHIVE_DIR": str(state_root / "webhook-archive"),
             "INTAKE_DB_PATH": str(state_root / "intake.db"),
-            "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG": "",
             "TRIAGE_API_URL": "http://shadow-triage.invalid",
             "ACTIONS_API_URL": f"http://127.0.0.1:{port_actions}",
             "SHADOW_REPLAY_ENABLED": "true",
@@ -302,7 +300,17 @@ def build_sliced_envs(
 
     state_root = home_dir / ".local" / "state" / "movie-intel"
     config_root = home_dir / ".config" / "movie-intel"
-    tmdb_cache = _pick("TMDB_CACHE_PATH", existing_intake_env, str(state_root / "tmdb-cache.json"))
+
+    def _pick_no_legacy(key: str, existing: Mapping[str, str], default: str = "") -> str:
+        for src in (override_env, existing):
+            v = src.get(key)
+            if v is not None and str(v).strip() != "":
+                return _validate_env_value(key, str(v).strip())
+        return _validate_env_value(key, default)
+
+    # Always use a distinct intake-owned TMDB cache path by default (never inherit legacy
+    # movie-intel's tmdb-cache.json so side-by-side operation cannot overwrite legacy cache).
+    tmdb_cache = _pick_no_legacy("TMDB_CACHE_PATH", existing_intake_env, str(state_root / "intake-tmdb-cache.json"))
     archive_dir = _pick("WEBHOOK_ARCHIVE_DIR", existing_intake_env, str(state_root / "webhook-archive"))
     intake_db = _pick("INTAKE_DB_PATH", existing_intake_env, str(state_root / "intake.db"))
     actions_db = _pick("ACTIONS_DB_PATH", existing_actions_env, str(state_root / "actions.db"))
@@ -312,9 +320,8 @@ def build_sliced_envs(
         existing_intake_env,
         str(config_root / "torrentleech-cookies-pr42.json"),
     )
-    alt_cfg = _pick("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", existing_intake_env, "")
-    if not alt_cfg:
-        alt_cfg = _pick("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", existing_actions_env, "")
+    # Alternative Grab config contains download-client credentials: actions-only!
+    alt_cfg = _pick("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", existing_actions_env, "")
 
     intake_env: dict[str, str] = {
         "MOVIE_INTEL_HOST": "127.0.0.1",
@@ -327,7 +334,6 @@ def build_sliced_envs(
         "TMDB_CACHE_PATH": tmdb_cache,
         "WEBHOOK_ARCHIVE_DIR": archive_dir,
         "INTAKE_DB_PATH": intake_db,
-        "MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG": alt_cfg,
         "TRIAGE_API_URL": f"http://127.0.0.1:{port_triage}",
         "ACTIONS_API_URL": f"http://127.0.0.1:{port_actions}",
         "SHADOW_REPLAY_ENABLED": "false",

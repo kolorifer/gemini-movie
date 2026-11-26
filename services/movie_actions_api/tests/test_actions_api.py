@@ -15,6 +15,21 @@ import httpx
 
 import db as triage_db_mod
 import main as triage_main
+from services.movie_actions_api.alternative_grab import (
+    QBittorrentClient,
+    QbitAddResult,
+    ShadowStubQbitClient,
+    ShadowStubTorrentFetcher,
+    TorrentFetcher,
+    TorrentMetainfoError,
+    _build_synthetic_v1_torrent,
+    build_movie_file_snapshot,
+    compare_movie_file_snapshots,
+    is_canonical_tl_download_url,
+    parse_v1_torrent_info_hash,
+    read_alt_grab_receipt,
+    validate_radarr_qbit_route,
+)
 from services.movie_actions_api.app import create_app as create_actions_app
 from services.movie_actions_api.clients import (
     FeedbackPostResult,
@@ -31,7 +46,7 @@ from services.movie_actions_api.clients import (
     TelegramSendResult,
     TriageFeedbackClient,
 )
-from services.movie_actions_api.config import ActionsConfig, AlternativeGrabPolicy
+from services.movie_actions_api.config import ActionsConfig, AlternativeGrabConfig
 from services.movie_actions_api.db import ActionsDB, NewActionRecord, generate_uuid7, utc_now, utc_now_iso
 from services.movie_actions_api.security import PrivateFileError, hash_token, redact_secrets
 from services.movie_actions_api.telegram_format import (
@@ -59,6 +74,7 @@ def _verified_card_payload(
     title: str = "Festival Gem",
     year: int = 2025,
     release_name: str = "Festival.Gem.2025.2160p.UHD.BluRay.REMUX.DV.HDR10-CiNEPHiLES",
+    external_id: str = "9001001",
     poster_path: Optional[str] = "/poster_ok.jpg",
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -70,6 +86,7 @@ def _verified_card_payload(
         "identity_gate_status": "verified" if delivery_kind != "evidence_review" else "evidence_review",
         "exact_release_name": release_name,
         "indexer": "TorrentLeech",
+        "external_id": external_id,
         "category": "Movies :: 4K",
         "size_gb": 58.4,
         "freeleech": True,
@@ -238,8 +255,25 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             shadow_replay_enabled=shadow_replay,
         )
 
-    def _write_policy_file(self, tmpdir: str, payload: dict[str, Any], *, mode: int = 0o600) -> Path:
-        p = Path(tmpdir) / "alt-grab.json"
+    def _write_alt_grab_config(
+        self,
+        tmpdir: str,
+        overrides: Optional[dict[str, Any]] = None,
+        *,
+        filename: str = "alt-grab.json",
+        mode: int = 0o600,
+    ) -> Path:
+        base = Path(tmpdir)
+        payload: dict[str, Any] = {
+            "url": "https://qbit.seedbox.invalid/qbittorrent",
+            "username": "qbit_secret_user",
+            "password": "qbit_secret_password_999",
+            "category": "movies",
+            "state": str(base / "alt-grab-state"),
+        }
+        if overrides:
+            payload.update(overrides)
+        p = base / filename
         p.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(p, mode)
         return p
@@ -257,37 +291,71 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             # Non-HTTPS non-loopback public base URL rejected
             with self.assertRaises(ValueError):
                 ActionsConfig.from_env({"MOVIE_INTEL_PUBLIC_BASE_URL": "http://public.example.com"})
-            # Alternative Grab rejects non-quality rejection classes
-            bad_policy = self._write_policy_file(
-                tmpdir, {"enabled": True, "allowed_rejection_classes": ["identity_conflict"]}
+            # Alternative Grab live 5-key HTTPS config validation
+            valid_cfg_path = self._write_alt_grab_config(tmpdir, filename="valid-alt.json")
+            alt_cfg = AlternativeGrabConfig.load_from_file(valid_cfg_path)
+            assert alt_cfg is not None
+            self.assertEqual(alt_cfg.url, "https://qbit.seedbox.invalid/qbittorrent")
+            self.assertEqual(alt_cfg.category, "movies")
+            # Credentials hidden from repr()
+            self.assertNotIn("qbit_secret_password_999", repr(alt_cfg))
+            self.assertNotIn("qbit_secret_user", repr(alt_cfg))
+
+            # Non-HTTPS qBittorrent URL rejected
+            http_cfg = self._write_alt_grab_config(
+                tmpdir, {"url": "http://qbit.seedbox.invalid/qbittorrent"}, filename="http-alt.json"
             )
             with self.assertRaises(ValueError):
-                AlternativeGrabPolicy.load_from_file(bad_policy)
-            # World-readable policy file rejected
-            world_policy = self._write_policy_file(
-                tmpdir, {"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}, mode=0o644
+                AlternativeGrabConfig.load_from_file(http_cfg)
+            # Relative state path rejected
+            rel_state_cfg = self._write_alt_grab_config(
+                tmpdir, {"state": "relative/state"}, filename="rel-alt.json"
             )
+            with self.assertRaises(ValueError):
+                AlternativeGrabConfig.load_from_file(rel_state_cfg)
+            # World-readable config rejected
+            world_cfg = self._write_alt_grab_config(tmpdir, filename="world-alt.json", mode=0o644)
             with self.assertRaises(PrivateFileError):
-                AlternativeGrabPolicy.load_from_file(world_policy)
+                AlternativeGrabConfig.load_from_file(world_cfg)
+            # Symlinked config rejected
+            sym_cfg = Path(tmpdir) / "sym-alt.json"
+            sym_cfg.symlink_to(valid_cfg_path)
+            with self.assertRaises(PrivateFileError):
+                AlternativeGrabConfig.load_from_file(sym_cfg)
 
             # Shadow mode refuses default production state directory
             prod_shadow_cfg = ActionsConfig.from_env({"SHADOW_REPLAY_ENABLED": "true"})
             with self.assertRaises(ValueError):
                 create_actions_app(prod_shadow_cfg)
 
-            # Shadow mode refuses non-stub clients
+            # Shadow mode refuses non-stub clients (Radarr, TorrentFetcher, QBittorrentClient)
             iso_shadow_cfg = self._make_config(tmpdir, shadow_replay=True)
             with self.assertRaises(ValueError):
                 create_actions_app(
                     iso_shadow_cfg,
                     radarr_client=RadarrClient(base_url="http://127.0.0.1:7878", api_key="k"),
                 )
+            with self.assertRaises(ValueError):
+                create_actions_app(
+                    iso_shadow_cfg,
+                    torrent_fetcher=TorrentFetcher(),
+                )
+            with self.assertRaises(ValueError):
+                create_actions_app(
+                    iso_shadow_cfg,
+                    alt_grab_config=alt_cfg,
+                    qbit_client=QBittorrentClient(
+                        base_url="https://qbit.seedbox.invalid", username="u", password="p"
+                    ),
+                )
 
             # Shadow mode auto-wires zero-mutation stubs cleanly
-            shadow_app = create_actions_app(iso_shadow_cfg)
+            shadow_app = create_actions_app(iso_shadow_cfg, alt_grab_config=alt_cfg)
             self.assertTrue(shadow_app.state.radarr_client.is_shadow_stub)
             self.assertTrue(shadow_app.state.telegram_client.is_shadow_stub)
             self.assertTrue(shadow_app.state.intake_push_client.is_shadow_stub)
+            self.assertTrue(shadow_app.state.torrent_fetcher.is_shadow_stub)
+            self.assertTrue(shadow_app.state.qbit_client.is_shadow_stub)
             self.assertTrue(shadow_app.state.triage_feedback_client.is_shadow_stub)
 
             # Symlinked DB rejected
@@ -471,10 +539,8 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Critically acclaimed masterpiece", formatted.txt_content or "")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            policy_path = self._write_policy_file(
-                tmpdir, {"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}
-            )
-            cfg = self._make_config(tmpdir, alt_policy_path=policy_path)
+            alt_cfg_path = self._write_alt_grab_config(tmpdir)
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
             tg = ControllableTelegramStub()
             app = create_actions_app(
                 cfg,
@@ -482,12 +548,21 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 telegram_client=tg,
                 intake_push_client=ShadowStubIntakePushClient(),
                 triage_feedback_client=ControllableFeedbackStub(),
+                torrent_fetcher=ShadowStubTorrentFetcher(),
+                qbit_client=ShadowStubQbitClient(category="movies"),
             )
             headers = {"X-Internal-Token": cfg.internal_api_secret}
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app), base_url="http://test"
                 ) as client:
+                    # Verify GET /internal/capabilities auth + boolean response
+                    r_cap_unauth = await client.get("/internal/capabilities")
+                    self.assertEqual(r_cap_unauth.status_code, 401)
+                    r_cap = await client.get("/internal/capabilities", headers=headers)
+                    self.assertEqual(r_cap.status_code, 200)
+                    self.assertEqual(r_cap.json(), {"alternative_grab_configured": True})
+
                     # 1. Actionable Grab -> TELEGRAM_ADD_GRAB_TOPIC_ID (20)
                     r1 = await client.post(
                         "/internal/deliver/card",
@@ -510,6 +585,18 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                                 "bound_existing_movie_id": 11,
                                 "bound_existing_file_id": 22,
                                 "bound_rejection_class": "cutoff_met",
+                                "rejection_reasons": ["Existing file meets cutoff: Remux-1080p"],
+                                "bound_movie_file_snapshot": {
+                                    "movie_id": 11,
+                                    "file_id": 22,
+                                    "monitored": True,
+                                    "quality_profile_id": 1,
+                                    "relative_path": "Festival.Gem.2025.Remux-1080p.mkv",
+                                    "edition": "",
+                                    "release_group": "FraMeSToR",
+                                    "size": 31_000_000_000,
+                                    "quality": "Remux-1080p",
+                                },
                             },
                         ),
                         headers=headers,
@@ -878,10 +965,8 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
     async def test_mandatory_case_5d_watched_shared_lock_readback_feedback_isolation_skip_and_alt_grab(self) -> None:
         """Mandatory Shadow Case 5d + Watched legacy unrated + Standalone Skip + Alternative Grab revalidation."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            policy_path = self._write_policy_file(
-                tmpdir, {"enabled": True, "allowed_rejection_classes": ["cutoff_met"]}
-            )
-            cfg = self._make_config(tmpdir, alt_policy_path=policy_path)
+            alt_cfg_path = self._write_alt_grab_config(tmpdir)
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
             tg = ControllableTelegramStub()
             radarr = ControllableRadarrStub()
             # Existing movie with an existing tag (id=42) and file -> watched MUST preserve tag 42 and file!
@@ -891,17 +976,28 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 "imdbId": "tt7001010",
                 "title": "Watched Film",
                 "monitored": True,
+                "qualityProfileId": 1,
                 "hasFile": True,
-                "movieFile": {"id": 888, "quality": {"quality": {"name": "Bluray-1080p"}}},
+                "movieFile": {
+                    "id": 888,
+                    "relativePath": "Watched.Film.2025.Bluray-1080p.mkv",
+                    "edition": "",
+                    "releaseGroup": "FraMeSToR",
+                    "size": 25_000_000_000,
+                    "quality": {"quality": {"name": "Bluray-1080p"}},
+                },
                 "tags": [42],
             }
             fb = ControllableFeedbackStub()
+            qbit = ShadowStubQbitClient(category="movies")
             app = create_actions_app(
                 cfg,
                 radarr_client=radarr,
                 telegram_client=tg,
                 intake_push_client=ShadowStubIntakePushClient(),
                 triage_feedback_client=fb,
+                torrent_fetcher=ShadowStubTorrentFetcher(),
+                qbit_client=qbit,
             )
             headers = {"X-Internal-Token": cfg.internal_api_secret}
             async with app.router.lifespan_context(app):
@@ -920,6 +1016,8 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                                 "bound_existing_movie_id": 50,
                                 "bound_existing_file_id": 888,
                                 "bound_rejection_class": "cutoff_met",
+                                "rejection_reasons": ["Existing file meets cutoff: Bluray-1080p"],
+                                "bound_movie_file_snapshot": build_movie_file_snapshot(radarr.movies[50]),
                             },
                         ),
                         headers=headers,
@@ -1359,10 +1457,9 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     tl_metadata_enabled=True,
                     tl_cookie_file=base / "cookies.json",
                     tmdb_api_token="unused",
-                    tmdb_cache_path=base / "intake" / "tmdb-cache.json",
+                    tmdb_cache_path=base / "intake" / "intake-tmdb-cache.json",
                     webhook_archive_dir=base / "intake" / "webhook-archive",
                     intake_db_path=base / "intake" / "intake.db",
-                    alternative_grab_config_path=None,
                     triage_api_url="http://triage.local",
                     actions_api_url="http://actions.local",
                     shadow_replay_enabled=False,
@@ -2030,6 +2127,484 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(r_conflict.status_code, 200)
                         self.assertEqual(r_conflict.json()["status"], "ambiguous")
+
+    async def test_qbit_alternative_grab_full_lifecycle_invariants_and_reconciliation(self) -> None:
+        """
+        Comprehensive verification of legacy qBittorrent Alternative Grab ("Grab Anyway"):
+          - Canonical TL HTTPS download URL binding, v1 bencode SHA-1, 4MB cap, no-redirect fetch
+          - Real QBittorrentClient multipart bytes-only POST /api/v2/torrents/add (no urls, no pause/start override)
+          - Radarr single-enabled HTTPS qBittorrent route validation
+          - Pre-fetch AND post-fetch 9-field snapshot drift refusal
+          - already_present (leaves category untouched), missing category, autorun-enabled refusal
+          - Happy path: queued, 0600 receipt, 0 Radarr writes, 0 /feedback writes, zero credential leaks
+          - Lost ack -> uncertain -> read-only reconciliation requiring exact category (0 duplicate adds)
+          - Prior durable receipt prevents duplicate add across fresh tokens
+          - Rejected evidence_review with preferred_topic_kind routes to Grab Anyway topic with 0 buttons
+        """
+        # 1) Canonical TL download URL validation
+        self.assertTrue(
+            is_canonical_tl_download_url(
+                "https://www.torrentleech.org/rss/download/123456/SECRET_KEY/Movie.2024.torrent",
+                "123456",
+            )
+        )
+        self.assertTrue(
+            is_canonical_tl_download_url(
+                "https://torrentleech.org/download/123456/Movie.2024.torrent",
+                "123456",
+            )
+        )
+        for bad_url in (
+            "http://www.torrentleech.org/rss/download/123456/KEY/Movie.torrent",
+            "https://evil.example/rss/download/123456/KEY/Movie.torrent",
+            "https://www.torrentleech.org/rss/download/999999/KEY/Movie.torrent",
+            "https://www.torrentleech.org/rss/download/123456/KEY/Movie.torrent?foo=1",
+            "https://www.torrentleech.org/rss/download/123456/../999/Movie.torrent",
+        ):
+            self.assertFalse(is_canonical_tl_download_url(bad_url, "123456"), msg=f"Should reject {bad_url}")
+
+        # 2) Strict v1 bencode validation
+        valid_torrent = _build_synthetic_v1_torrent(b"Festival.Gem.2025.2160p.REMUX.mkv")
+        valid_hash = parse_v1_torrent_info_hash(valid_torrent)
+        self.assertEqual(len(valid_hash), 40)
+        with self.assertRaises(TorrentMetainfoError):
+            parse_v1_torrent_info_hash(b"not-bencode")
+        with self.assertRaises(TorrentMetainfoError):
+            parse_v1_torrent_info_hash(valid_torrent + b"trailing")
+        with self.assertRaises(TorrentMetainfoError):
+            # v2-only info dict missing v1 `pieces`
+            parse_v1_torrent_info_hash(b"d4:infod12:meta versioni2e4:name4:test12:piece lengthi16384eee")
+        with self.assertRaises(TorrentMetainfoError):
+            # Unsorted keys
+            parse_v1_torrent_info_hash(b"d1:bi1e1:ai2ee")
+
+        # 3) Real TorrentFetcher transport checks: redirect refused, >4MB refused, valid v1 accepted
+        fetch_mode = {"mode": "redirect"}
+
+        def _tl_dl_handler(request: httpx.Request) -> httpx.Response:
+            if fetch_mode["mode"] == "redirect":
+                return httpx.Response(302, headers={"Location": "https://other.invalid/file.torrent"})
+            if fetch_mode["mode"] == "too_large":
+                return httpx.Response(200, content=b"x" * 4_000_005)
+            return httpx.Response(200, content=valid_torrent)
+
+        tl_url = "https://www.torrentleech.org/rss/download/555111/PASSKEY_MUST_NOT_LEAK/Movie.torrent"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_tl_dl_handler), follow_redirects=False) as tf_http:
+            fetcher = TorrentFetcher(http_client=tf_http)
+            r_redir = await fetcher.fetch_bound_torrent(download_url=tl_url, external_id="555111")
+            self.assertFalse(r_redir.ok)
+            self.assertIn("redirect_refused", r_redir.error_redacted or "")
+            self.assertNotIn("PASSKEY_MUST_NOT_LEAK", r_redir.error_redacted or "")
+
+            fetch_mode["mode"] = "too_large"
+            r_big = await fetcher.fetch_bound_torrent(download_url=tl_url, external_id="555111")
+            self.assertFalse(r_big.ok)
+            self.assertIn("4mb", (r_big.error_redacted or "").lower())
+
+            fetch_mode["mode"] = "ok"
+            r_ok = await fetcher.fetch_bound_torrent(download_url=tl_url, external_id="555111")
+            self.assertTrue(r_ok.ok)
+            self.assertEqual(r_ok.info_hash, valid_hash)
+
+        # 4) Real QBittorrentClient multipart bytes-only verification (NO urls, NO pause/start overrides!)
+        captured_qbit_reqs: list[tuple[str, str, bytes]] = []
+
+        def _qbit_transport(request: httpx.Request) -> httpx.Response:
+            captured_qbit_reqs.append((request.method, str(request.url), request.content))
+            if request.url.path.endswith("/api/v2/auth/login"):
+                return httpx.Response(200, text="Ok.", headers={"Set-Cookie": "SID=clean_session"})
+            if request.url.path.endswith("/api/v2/torrents/add"):
+                return httpx.Response(200, text="Ok.")
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_qbit_transport), follow_redirects=False) as qb_http:
+            real_qb = QBittorrentClient(
+                base_url="https://qbit.seedbox.invalid/qbittorrent",
+                username="qbit_secret_user",
+                password="qbit_secret_password_999",
+                http_client=qb_http,
+            )
+            sess, _owns, login_r = await real_qb.open_authenticated_session()
+            self.assertTrue(login_r.ok)
+            add_r = await real_qb.add_torrent_bytes(
+                sess,
+                torrent_bytes=valid_torrent,
+                category="movies",
+                filename="555111.torrent",
+            )
+            self.assertEqual(add_r.outcome, "ok")
+            add_body = captured_qbit_reqs[-1][2]
+            self.assertIn(b'name="torrents"', add_body)
+            self.assertIn(b'name="category"', add_body)
+            self.assertIn(valid_torrent, add_body)
+            self.assertNotIn(b'name="urls"', add_body)
+            self.assertNotIn(b'name="paused"', add_body)
+            self.assertNotIn(b'name="stopped"', add_body)
+            self.assertNotIn(b'name="autoTMM"', add_body)
+
+        # 5) Radarr single-enabled HTTPS qBittorrent route validation
+        matching_client = {
+            "enable": True,
+            "implementation": "QBittorrent",
+            "protocol": "torrent",
+            "fields": [
+                {"name": "host", "value": "qbit.seedbox.invalid"},
+                {"name": "port", "value": 443},
+                {"name": "useSsl", "value": True},
+                {"name": "urlBase", "value": "/qbittorrent"},
+                {"name": "movieCategory", "value": "movies"},
+            ],
+        }
+        self.assertEqual(
+            validate_radarr_qbit_route(
+                [matching_client],
+                configured_url="https://qbit.seedbox.invalid/qbittorrent",
+                configured_category="movies",
+            )[0],
+            True,
+        )
+        # 0 enabled clients, 2 enabled clients, HTTP client, wrong category -> all refused!
+        self.assertFalse(
+            validate_radarr_qbit_route(
+                [], configured_url="https://qbit.seedbox.invalid/qbittorrent", configured_category="movies"
+            )[0]
+        )
+        self.assertFalse(
+            validate_radarr_qbit_route(
+                [matching_client, matching_client],
+                configured_url="https://qbit.seedbox.invalid/qbittorrent",
+                configured_category="movies",
+            )[0]
+        )
+        http_client = dict(
+            matching_client,
+            fields=[
+                {"name": "host", "value": "qbit.seedbox.invalid"},
+                {"name": "port", "value": 443},
+                {"name": "useSsl", "value": False},
+                {"name": "urlBase", "value": "/qbittorrent"},
+                {"name": "movieCategory", "value": "movies"},
+            ],
+        )
+        self.assertFalse(
+            validate_radarr_qbit_route(
+                [http_client],
+                configured_url="https://qbit.seedbox.invalid/qbittorrent",
+                configured_category="movies",
+            )[0]
+        )
+        self.assertFalse(
+            validate_radarr_qbit_route(
+                [matching_client],
+                configured_url="https://qbit.seedbox.invalid/qbittorrent",
+                configured_category="other-cat",
+            )[0]
+        )
+
+        # 6) End-to-end movie-actions-api Alternative Grab lifecycle & edge cases
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alt_cfg_path = self._write_alt_grab_config(tmpdir)
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            radarr.download_clients = [matching_client]
+            radarr.movies[80] = {
+                "id": 80,
+                "tmdbId": 880080,
+                "imdbId": "tt8800800",
+                "title": "Heat",
+                "monitored": True,
+                "qualityProfileId": 3,
+                "hasFile": True,
+                "movieFile": {
+                    "id": 801,
+                    "relativePath": "Heat.1995.Remux-1080p.mkv",
+                    "edition": "Director's Definitive Edition",
+                    "releaseGroup": "FraMeSToR",
+                    "size": 36_000_000_000,
+                    "quality": {"quality": {"name": "Remux-1080p"}},
+                },
+                "tags": [],
+            }
+            fb = ControllableFeedbackStub()
+            qbit = ShadowStubQbitClient(category="movies")
+
+            # Custom push stub emitting canonical TL download URL with external_id matching release
+            dl_map: dict[str, str] = {}
+
+            class _MapPushStub(ShadowStubIntakePushClient):
+                async def fetch_push_payload(
+                    self, *, release_id: str, source_occurrence_id: str
+                ) -> IntakePushPayloadResult:
+                    return IntakePushPayloadResult(
+                        ok=True,
+                        push_payload={
+                            "title": "Heat.1995.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                            "downloadUrl": dl_map[release_id],
+                            "protocol": "torrent",
+                            "publishDate": "2026-11-26T00:00:00Z",
+                            "indexer": "TorrentLeech",
+                        },
+                    )
+
+            post_fetch_hook: dict[str, Any] = {"fn": None}
+
+            class _HookFetcher(ShadowStubTorrentFetcher):
+                async def fetch_bound_torrent(self, *, download_url: str, external_id: str) -> Any:
+                    res = await super().fetch_bound_torrent(download_url=download_url, external_id=external_id)
+                    if post_fetch_hook["fn"] is not None:
+                        fn = post_fetch_hook["fn"]
+                        post_fetch_hook["fn"] = None
+                        fn()
+                    return res
+
+            fetcher = _HookFetcher(torrent_bytes=valid_torrent)
+            app = create_actions_app(
+                cfg,
+                radarr_client=radarr,
+                telegram_client=tg,
+                intake_push_client=_MapPushStub(),
+                triage_feedback_client=fb,
+                torrent_fetcher=fetcher,
+                qbit_client=qbit,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            snap_80 = build_movie_file_snapshot(radarr.movies[80])
+            assert snap_80 is not None
+
+            async def _mint_alt(client: httpx.AsyncClient, rel_id: str, ext_id: str) -> str:
+                dl_map[rel_id] = f"https://www.torrentleech.org/rss/download/{ext_id}/QBIT_PASSKEY_SECRET/Heat.torrent"
+                r = await client.post(
+                    "/internal/deliver/card",
+                    json=_verified_card_payload(
+                        release_id=rel_id,
+                        tmdb_id=880080,
+                        imdb_id="tt8800800",
+                        title="Heat",
+                        year=1995,
+                        release_name="Heat.1995.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
+                        external_id=ext_id,
+                        delivery_kind="alternative_grab",
+                        poster_path=None,
+                        extra={
+                            "bound_existing_movie_id": 80,
+                            "bound_existing_file_id": 801,
+                            "bound_rejection_class": "cutoff_met",
+                            "rejection_reasons": ["Existing file meets cutoff: Remux-1080p"],
+                            "bound_movie_file_snapshot": dict(snap_80),
+                        },
+                    ),
+                    headers=headers,
+                )
+                self.assertEqual(r.status_code, 200)
+                return _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["alternative_grab"]
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 6a: Rejected evidence_review with preferred_topic_kind routes to Grab Anyway topic (30) with 0 buttons
+                    r_ev = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-alt-ev",
+                            delivery_kind="evidence_review",
+                            poster_path=None,
+                            extra={
+                                "conflict_reason": "tracker_imdb_mismatch",
+                                "preferred_topic_kind": "alternative_grab",
+                            },
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_ev.status_code, 200)
+                    self.assertEqual(r_ev.json()["ack_thread_id"], 30)
+                    self.assertEqual(tg.sent_messages[-1]["reply_markup"], {"inline_keyboard": []})
+
+                    # 6b: Post-fetch 9-field snapshot drift -> 409 refused, 0 qBit adds!
+                    tok_drift = await _mint_alt(client, "rel-alt-drift", "660001")
+                    post_fetch_hook["fn"] = lambda: radarr.movies[80]["movieFile"].update({"size": 99_999_999})
+                    r_drift = await client.post(f"/action/{tok_drift}", data={"confirm": "1"})
+                    self.assertEqual(r_drift.status_code, 409)
+                    self.assertIn("Post-fetch revalidation failed", r_drift.text)
+                    self.assertEqual(len(qbit.add_calls), 0)
+                    # Restore snapshot size
+                    radarr.movies[80]["movieFile"]["size"] = 36_000_000_000
+
+                    # 6c: Missing qBit category -> 409 refused, 0 qBit adds
+                    tok_cat = await _mint_alt(client, "rel-alt-cat", "660002")
+                    qbit.categories = {"other": {"name": "other"}}
+                    r_cat = await client.post(f"/action/{tok_cat}", data={"confirm": "1"})
+                    self.assertEqual(r_cat.status_code, 409)
+                    self.assertIn("does not exist in qBittorrent", r_cat.text)
+                    self.assertEqual(len(qbit.add_calls), 0)
+                    qbit.categories = {"movies": {"name": "movies"}}
+
+                    # 6d: qBit autorun hook enabled -> 409 refused, 0 qBit adds
+                    tok_auto = await _mint_alt(client, "rel-alt-auto", "660003")
+                    qbit.preferences["autorun_enabled"] = True
+                    r_auto = await client.post(f"/action/{tok_auto}", data={"confirm": "1"})
+                    self.assertEqual(r_auto.status_code, 409)
+                    self.assertIn("autorun", r_auto.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 0)
+                    qbit.preferences["autorun_enabled"] = False
+
+                    # 6e: Already present in qBit (under a DIFFERENT category) -> 200 already_present, category untouched, 0 adds!
+                    tok_present = await _mint_alt(client, "rel-alt-present", "660004")
+                    qbit.torrents[valid_hash] = {"hash": valid_hash, "category": "manual-keep", "state": "stalledUP"}
+                    r_present = await client.post(f"/action/{tok_present}", data={"confirm": "1"})
+                    self.assertEqual(r_present.status_code, 200)
+                    self.assertIn("already_present", r_present.text)
+                    self.assertEqual(qbit.torrents[valid_hash]["category"], "manual-keep")
+                    self.assertEqual(len(qbit.add_calls), 0)
+                    qbit.torrents.clear()
+
+                    # 6f: Happy path -> GET read-only -> POST queues in qBit, 0600 receipt, 0 Radarr writes, 0 /feedback!
+                    tok_ok = await _mint_alt(client, "rel-alt-ok", "660005")
+                    r_get = await client.get(f"/action/{tok_ok}")
+                    self.assertEqual(r_get.status_code, 200)
+                    self.assertIn("qBittorrent", r_get.text)
+                    self.assertEqual(len(qbit.add_calls), 0)
+
+                    r_ok = await client.post(f"/action/{tok_ok}", data={"confirm": "1"})
+                    self.assertEqual(r_ok.status_code, 200)
+                    self.assertIn("queued", r_ok.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 1)
+                    self.assertEqual(qbit.add_calls[0]["category"], "movies")
+                    self.assertEqual(len(radarr.add_calls), 0)
+                    self.assertEqual(len(radarr.update_calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 0)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # Durable 0600 receipt written and zero credentials anywhere in DB or receipt
+                    receipt_dir = Path(tmpdir) / "alt-grab-state"
+                    receipt = read_alt_grab_receipt(receipt_dir, "660005")
+                    assert receipt is not None
+                    self.assertEqual(receipt["status"], "queued")
+                    self.assertEqual(receipt["info_hash"], valid_hash)
+                    receipt_file = receipt_dir / "alt-grab-tl-660005.json"
+                    self.assertEqual(os.lstat(receipt_dir).st_mode & 0o777, 0o700)
+                    self.assertEqual(os.lstat(receipt_file).st_mode & 0o777, 0o600)
+                    for blob in (
+                        cfg.actions_db_path.read_bytes(),
+                        receipt_file.read_bytes(),
+                        r_ok.text.encode("utf-8"),
+                    ):
+                        self.assertNotIn(b"qbit_secret_password_999", blob)
+                        self.assertNotIn(b"qbit_secret_user", blob)
+                        self.assertNotIn(b"QBIT_PASSKEY_SECRET", blob)
+
+                    # Prior durable receipt on disk prevents duplicate add even for a brand new release/token with same external_id!
+                    tok_dup_ext = await _mint_alt(client, "rel-alt-dup-ext", "660005")
+                    r_dup = await client.post(f"/action/{tok_dup_ext}", data={"confirm": "1"})
+                    self.assertEqual(r_dup.status_code, 200)
+                    self.assertEqual(len(qbit.add_calls), 1)  # Still 1 total!
+
+                    # 6g: Lost HTTP ack -> uncertain (ambiguous_radarr) -> wrong category stays uncertain -> expected category seals queued (0 duplicate adds!)
+                    qbit.torrents.clear()
+                    tok_amb = await _mint_alt(client, "rel-alt-amb", "660006")
+                    qbit.add_queue.append(QbitAddResult(outcome="ambiguous", error_redacted="qbit_add_ambiguous:ReadTimeout"))
+                    r_amb = await client.post(f"/action/{tok_amb}", data={"confirm": "1"})
+                    self.assertEqual(r_amb.status_code, 503)
+                    self.assertIn("uncertain", r_amb.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 2)
+                    rec_amb = read_alt_grab_receipt(receipt_dir, "660006")
+                    assert rec_amb is not None
+                    self.assertEqual(rec_amb["status"], "uncertain")
+
+                    # Reconcile when torrent appears in WRONG category -> MUST stay uncertain (never seal queued!)
+                    qbit.torrents[valid_hash] = {"hash": valid_hash, "category": "wrong-cat", "state": "downloading"}
+                    r_rec_wrong = await client.post(f"/action/{tok_amb}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_wrong.status_code, 200)
+                    self.assertIn("Still Uncertain", r_rec_wrong.text)
+                    self.assertEqual(len(qbit.add_calls), 2)
+
+                    # Reconcile when torrent appears in EXACT expected category -> seals completed_all (queued), 0 extra adds, 0 feedback!
+                    qbit.torrents[valid_hash] = {"hash": valid_hash, "category": "movies", "state": "downloading"}
+                    r_rec_ok = await client.post(f"/action/{tok_amb}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_ok.status_code, 200)
+                    self.assertIn("Confirmed in qBittorrent", r_rec_ok.text)
+                    self.assertEqual(len(qbit.add_calls), 2)  # Zero duplicate adds!
+                    self.assertEqual(len(fb.calls), 0)  # Zero evaluator feedback!
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(tok_amb)).action["status"],
+                        "completed_all",
+                    )
+
+                    # 6h: Hard crash during read-only qbit_alt_preflight (before receipt/add) -> startup orphan recovery
+                    # promotes attempt to ambiguous -> reconcile resets cleanly to active -> user re-confirms & queues!
+                    qbit.torrents.clear()
+                    tok_pf_crash = await _mint_alt(client, "rel-alt-pf-crash", "660007")
+                    pf_act = app.state.db.get_action_group_readonly(hash_token(tok_pf_crash)).action
+                    assert pf_act is not None
+                    ok_pf, _att_pf, _ = app.state.db.begin_write_attempt(
+                        action_id=str(pf_act["action_id"]),
+                        completion_group=str(pf_act["completion_group"]),
+                        phase="qbit_alt_preflight",
+                        process_instance_id="dead-process-instance",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=60)),
+                        request_fingerprint='{"phase":"preflight"}',
+                        allowed_action_statuses=frozenset({"active"}),
+                    )
+                    self.assertTrue(ok_pf)
+                    recov = app.state.db.recover_orphaned_state(app.state.process_instance_id)
+                    self.assertEqual(recov["promoted_attempts"], 1)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(tok_pf_crash)).action["status"],
+                        "ambiguous_radarr",
+                    )
+                    r_reset = await client.post(f"/action/{tok_pf_crash}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_reset.status_code, 200)
+                    self.assertIn("Preflight Reset", r_reset.text)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(tok_pf_crash)).action["status"],
+                        "active",
+                    )
+                    r_pf_ok = await client.post(f"/action/{tok_pf_crash}", data={"confirm": "1"})
+                    self.assertEqual(r_pf_ok.status_code, 200)
+                    self.assertIn("queued", r_pf_ok.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 3)
+
+                    # 6i (Codex Round 1 P2): failed_not_transmitted -> active retry -> crash in read-only preflight ->
+                    # reconcile MUST ignore the prior failed_definitive add, reset ambiguous preflight to active, and succeed!
+                    qbit.torrents.clear()
+                    tok_retry_pf = await _mint_alt(client, "rel-alt-retry-pf", "660008")
+                    qbit.add_queue.append(
+                        QbitAddResult(outcome="failed_not_transmitted", error_redacted="qbit_connect_error")
+                    )
+                    r_notx = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1"})
+                    self.assertEqual(r_notx.status_code, 502)
+                    retry_act = app.state.db.get_action_group_readonly(hash_token(tok_retry_pf)).action
+                    assert retry_act is not None
+                    self.assertEqual(retry_act["status"], "active")
+                    self.assertEqual(len(qbit.add_calls), 4)
+
+                    # Simulate retry crashing during read-only preflight before receipt/add
+                    ok_pf2, _att_pf2, _ = app.state.db.begin_write_attempt(
+                        action_id=str(retry_act["action_id"]),
+                        completion_group=str(retry_act["completion_group"]),
+                        phase="qbit_alt_preflight",
+                        process_instance_id="dead-process-instance-2",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=60)),
+                        request_fingerprint='{"phase":"preflight-retry"}',
+                        allowed_action_statuses=frozenset({"active"}),
+                    )
+                    self.assertTrue(ok_pf2)
+                    recov2 = app.state.db.recover_orphaned_state(app.state.process_instance_id)
+                    self.assertEqual(recov2["promoted_attempts"], 1)
+
+                    r_reset2 = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_reset2.status_code, 200)
+                    self.assertIn("Preflight Reset", r_reset2.text)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(tok_retry_pf)).action["status"],
+                        "active",
+                    )
+
+                    r_retry_ok = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1"})
+                    self.assertEqual(r_retry_ok.status_code, 200)
+                    self.assertIn("queued", r_retry_ok.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 5)
 
 
 if __name__ == "__main__":

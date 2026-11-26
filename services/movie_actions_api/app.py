@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
+from .alternative_grab import (
+    QBittorrentClient,
+    ShadowStubQbitClient,
+    ShadowStubTorrentFetcher,
+    TorrentFetcher,
+)
 from .clients import (
     IntakePushClient,
     RadarrClient,
@@ -22,7 +28,7 @@ from .clients import (
     TelegramClient,
     TriageFeedbackClient,
 )
-from .config import MAX_ACTION_FORM_BYTES, ActionsConfig, AlternativeGrabPolicy
+from .config import MAX_ACTION_FORM_BYTES, ActionsConfig, AlternativeGrabConfig
 from .db import ActionsDB
 from .html_views import SECURITY_HEADERS, render_simple_status_page
 from .security import constant_time_equals, install_log_redaction, redact_secrets
@@ -45,12 +51,24 @@ def _enforce_shadow_isolation(
     telegram: TelegramClient,
     intake_push: IntakePushClient,
     triage_feedback: TriageFeedbackClient,
+    *,
+    alt_grab_cfg: Optional[AlternativeGrabConfig] = None,
+    torrent_fetcher: Optional[TorrentFetcher] = None,
+    qbit_client: Optional[QBittorrentClient] = None,
 ) -> None:
     """Shadow mode MUST use isolated state outside ~/.local/state/movie-intel and zero-mutation stubs."""
     default_prod_state = Path.home() / ".local" / "state" / "movie-intel"
+    default_prod_config = Path.home() / ".config" / "movie-intel"
     if _is_within_dir(cfg.actions_db_path, default_prod_state):
         raise ValueError(
             "SHADOW_REPLAY_ENABLED=true requires ACTIONS_DB_PATH outside production ~/.local/state/movie-intel"
+        )
+    if alt_grab_cfg is not None and (
+        _is_within_dir(alt_grab_cfg.state_dir, default_prod_state)
+        or _is_within_dir(alt_grab_cfg.state_dir, default_prod_config)
+    ):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires Alternative Grab receipt state dir outside production movie-intel directories"
         )
     for label, client in (
         ("radarr", radarr),
@@ -62,6 +80,14 @@ def _enforce_shadow_isolation(
             raise ValueError(
                 f"SHADOW_REPLAY_ENABLED=true requires a shadow-stubbed {label} client (zero external mutations)"
             )
+    if torrent_fetcher is not None and not getattr(torrent_fetcher, "is_shadow_stub", False):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires a shadow-stubbed torrent_fetcher client (zero external network fetches)"
+        )
+    if qbit_client is not None and not getattr(qbit_client, "is_shadow_stub", False):
+        raise ValueError(
+            "SHADOW_REPLAY_ENABLED=true requires a shadow-stubbed qbit_client (zero external mutations)"
+        )
 
 
 async def _read_bounded_form(request: Request, max_bytes: int) -> dict[str, str]:
@@ -100,17 +126,19 @@ def create_app(
     telegram_client: Optional[TelegramClient] = None,
     intake_push_client: Optional[IntakePushClient] = None,
     triage_feedback_client: Optional[TriageFeedbackClient] = None,
-    alt_grab_policy: Optional[AlternativeGrabPolicy] = None,
+    alt_grab_config: Optional[AlternativeGrabConfig] = None,
+    torrent_fetcher: Optional[TorrentFetcher] = None,
+    qbit_client: Optional[QBittorrentClient] = None,
 ) -> FastAPI:
     cfg = config or ActionsConfig.from_env()
     install_log_redaction()
 
     instance_id = process_instance_id or str(uuid.uuid4())
     actions_db = db or ActionsDB(cfg.actions_db_path)
-    policy = (
-        alt_grab_policy
-        if alt_grab_policy is not None
-        else AlternativeGrabPolicy.load_from_file(cfg.alternative_grab_config_path)
+    alt_cfg = (
+        alt_grab_config
+        if alt_grab_config is not None
+        else AlternativeGrabConfig.load_from_file(cfg.alternative_grab_config_path)
     )
 
     if cfg.shadow_replay_enabled:
@@ -124,7 +152,22 @@ def create_app(
             if triage_feedback_client is not None
             else ShadowStubTriageFeedbackClient()
         )
-        _enforce_shadow_isolation(cfg, radarr, telegram, intake_push, triage_feedback)
+        fetcher = torrent_fetcher if torrent_fetcher is not None else ShadowStubTorrentFetcher()
+        qbit = (
+            qbit_client
+            if qbit_client is not None
+            else (ShadowStubQbitClient(category=alt_cfg.category) if alt_cfg is not None else None)
+        )
+        _enforce_shadow_isolation(
+            cfg,
+            radarr,
+            telegram,
+            intake_push,
+            triage_feedback,
+            alt_grab_cfg=alt_cfg,
+            torrent_fetcher=fetcher,
+            qbit_client=qbit,
+        )
     else:
         radarr = radarr_client or RadarrClient(
             base_url=cfg.radarr_url,
@@ -145,6 +188,17 @@ def create_app(
             internal_token=cfg.internal_api_secret,
             timeout_seconds=cfg.triage_timeout_seconds,
         )
+        fetcher = torrent_fetcher or TorrentFetcher(timeout_seconds=cfg.radarr_timeout_seconds)
+        qbit = qbit_client or (
+            QBittorrentClient(
+                base_url=alt_cfg.url,
+                username=alt_cfg.username,
+                password=alt_cfg.password,
+                timeout_seconds=cfg.radarr_timeout_seconds,
+            )
+            if alt_cfg is not None
+            else None
+        )
 
     service = ActionsService(
         config=cfg,
@@ -154,7 +208,9 @@ def create_app(
         telegram_client=telegram,
         intake_push_client=intake_push,
         triage_feedback_client=triage_feedback,
-        alt_grab_policy=policy,
+        alt_grab_config=alt_cfg,
+        torrent_fetcher=fetcher,
+        qbit_client=qbit,
     )
 
     def require_internal_token(
@@ -187,6 +243,9 @@ def create_app(
     app.state.telegram_client = telegram
     app.state.intake_push_client = intake_push
     app.state.triage_feedback_client = triage_feedback
+    app.state.alt_grab_config = alt_cfg
+    app.state.torrent_fetcher = fetcher
+    app.state.qbit_client = qbit
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -199,7 +258,17 @@ def create_app(
             "pending_ambiguous_radarr": counts["pending_ambiguous_radarr"],
             "active_actions": counts["active_actions"],
             "internal_auth_configured": bool(cfg.internal_api_secret),
+            "alternative_grab_configured": service.alternative_grab_configured,
             "shadow_replay_enabled": cfg.shadow_replay_enabled,
+        }
+
+    @app.get(
+        "/internal/capabilities",
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def internal_capabilities() -> dict[str, Any]:
+        return {
+            "alternative_grab_configured": service.alternative_grab_configured,
         }
 
     @app.get(
