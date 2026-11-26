@@ -331,15 +331,43 @@ def _extract_indexer_name(raw_payload: dict[str, Any], data_dict: dict[str, Any]
     return ""
 
 
-def _extract_action_info(raw_payload: dict[str, Any], data_dict: dict[str, Any]) -> tuple[bool, bool, list[str]]:
-    action = raw_payload.get("action")
-    action_dict = action if isinstance(action, dict) else {}
-    rejected = bool(_clean_bool(action_dict.get("rejected")) or False)
-    raw_type = _clean_str(action_dict.get("type"))
-    action_is_radarr = raw_type is None or raw_type.lower() == "radarr"
+_REJECTED_EVENTS = frozenset({"action.rejected", "push_rejected", "push.rejected"})
+_REJECTED_RESULT_STATUSES = frozenset({"PUSH_REJECTED", "REJECTED"})
+
+
+def _extract_action_info(
+    raw_payload: dict[str, Any],
+    data_dict: dict[str, Any],
+    *,
+    top_event: str = "",
+) -> tuple[bool, bool, list[str]]:
+    top_action = raw_payload.get("action")
+    top_action_dict = top_action if isinstance(top_action, dict) else {}
+    data_action = data_dict.get("action")
+    data_action_dict = data_action if isinstance(data_action, dict) else {}
 
     result = data_dict.get("result")
+    if not isinstance(result, dict):
+        result = raw_payload.get("result")
     result_dict = result if isinstance(result, dict) else {}
+
+    raw_type = _clean_str(top_action_dict.get("type")) or _clean_str(data_action_dict.get("type"))
+    action_is_radarr = raw_type is None or raw_type.lower() == "radarr"
+
+    action_rejected_flag = _clean_bool(top_action_dict.get("rejected"))
+    if action_rejected_flag is None:
+        action_rejected_flag = _clean_bool(data_action_dict.get("rejected"))
+    result_rejected_flag = _clean_bool(result_dict.get("rejected"))
+    result_status = (_clean_str(result_dict.get("status")) or "").upper()
+    event_norm = top_event.strip().lower()
+
+    rejected = bool(
+        action_rejected_flag is True
+        or result_rejected_flag is True
+        or event_norm in _REJECTED_EVENTS
+        or result_status in _REJECTED_RESULT_STATUSES
+    )
+
     raw_rejections = result_dict.get("rejections")
     rejections: list[str] = []
     if isinstance(raw_rejections, list):
@@ -582,7 +610,9 @@ def classify_webhook_payload(raw_payload: dict[str, Any]) -> ClassifiedWebhook:
             diagnostic_note=f"unclassified_non_movie:cat={redact_secrets(category or 'none', max_chars=40)},type={release_type or 'none'}",
         )
 
-    action_rejected, action_is_radarr, rejections = _extract_action_info(raw_payload, data)
+    action_rejected, action_is_radarr, rejections = _extract_action_info(
+        raw_payload, data, top_event=top_event
+    )
     hint_title = _clean_str(release.get("title"))
     hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
     parsed_title, parsed_year = _extract_title_year_from_release_name(exact_name)

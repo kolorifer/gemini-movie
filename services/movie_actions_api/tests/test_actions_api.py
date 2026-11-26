@@ -2606,6 +2606,190 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("queued", r_retry_ok.text.lower())
                     self.assertEqual(len(qbit.add_calls), 5)
 
+    async def test_card_edit_with_preserve_eval_reply_keeps_existing_reply_and_blocks_duplicate_send(self) -> None:
+        """OPS-REPORT #6: Card-only edit with preserve_eval_reply=True keeps sent eval reply and blocks duplicate sends."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alt_state = Path(tmpdir) / "alt-state"
+            alt_state.mkdir(mode=0o700)
+            alt_cfg_path = Path(tmpdir) / "alt-grab.json"
+            alt_cfg_path.write_text(
+                json.dumps(
+                    {
+                        "url": "https://qbit.invalid:8443",
+                        "username": "qbit-user",
+                        "password": "qbit-secret-password",
+                        "category": "radarr-alt",
+                        "state": str(alt_state),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(alt_cfg_path, 0o600)
+
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
+            tg = ControllableTelegramStub()
+            app = create_actions_app(
+                cfg,
+                radarr_client=ControllableRadarrStub(),
+                telegram_client=tg,
+                intake_push_client=ShadowStubIntakePushClient(),
+                triage_feedback_client=ControllableFeedbackStub(),
+                torrent_fetcher=ShadowStubTorrentFetcher(),
+                qbit_client=ShadowStubQbitClient(category="radarr-alt"),
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+            sample_eval = {
+                "identification": {"canonical_title": "Elio", "year": 2025, "director": "D", "match_confidence": "high"},
+                "ratings": {},
+                "recognition": {"awards_highlights": [], "critic_consensus": "Strong"},
+                "decision_aid": {"one_line_pitch": "P", "verdict": "WATCH", "verdict_reason": "Good", "similar_to": [], "red_flags": []},
+            }
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. Deliver rev 1 actionable_grab card + send rev 1 evaluation reply
+                    r_c1 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(release_id="rel-preserve-1", card_revision=1, poster_path=None),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_c1.status_code, 200)
+                    ack1 = r_c1.json()
+                    r_e1 = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-preserve-1",
+                            "card_revision": 1,
+                            "ack_chat_id": ack1["ack_chat_id"],
+                            "ack_message_id": ack1["ack_message_id"],
+                            "evaluation": sample_eval,
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_e1.status_code, 200)
+                    orig_reply_msg_id = r_e1.json()["reply_message_id"]
+                    sent_count_after_e1 = len(tg.sent_messages)
+
+                    # 2. Edit card to rev 2 (alternative_grab) with preserve_eval_reply=True
+                    r_c2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-preserve-1",
+                            card_revision=2,
+                            delivery_kind="alternative_grab",
+                            poster_path=None,
+                            extra={
+                                "external_id": "241889121",
+                                "exact_release_name": "Elio 2025 2160p UHD BluRay REMUX DV HDR HEVC Atmos-TRiToN",
+                                "verified_title": "Elio",
+                                "verified_year": 2025,
+                                "verified_imdb_id": "tt4919268",
+                                "verified_tmdb_id": 1022789,
+                                "bound_existing_movie_id": 501,
+                                "bound_existing_file_id": 901,
+                                "bound_rejection_class": "cutoff_met",
+                                "rejection_reasons": ["Existing file meets cutoff: Remux-2160p"],
+                                "bound_movie_file_snapshot": {
+                                    "movie_id": 501,
+                                    "file_id": 901,
+                                    "monitored": True,
+                                    "quality_profile_id": 4,
+                                    "relative_path": "Elio.2025.2160p.REMUX-OLD.mkv",
+                                    "edition": "",
+                                    "release_group": "OLD",
+                                    "size": 55_000_000_000,
+                                    "quality": "Remux-2160p",
+                                },
+                                "preserve_eval_reply": True,
+                            },
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_c2.status_code, 200)
+                    self.assertTrue(r_c2.json().get("eval_reply_preserved"))
+                    self.assertEqual(len(tg.edited_texts), 1)
+                    row_r2 = app.state.db.get_delivery("rel-preserve-1")
+                    assert row_r2 is not None
+                    self.assertEqual(row_r2["card_revision"], 2)
+                    self.assertEqual(row_r2["delivery_kind"], "alternative_grab")
+                    self.assertEqual(row_r2["eval_reply_status"], "sent")
+                    self.assertEqual(row_r2["eval_reply_card_revision"], 2)
+                    self.assertEqual(row_r2["eval_reply_message_id"], orig_reply_msg_id)
+
+                    # Duplicate rev 2 evaluation call MUST be blocked as already_sent (0 new Telegram messages)
+                    r_e2_dup = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-preserve-1",
+                            "card_revision": 2,
+                            "ack_chat_id": ack1["ack_chat_id"],
+                            "ack_message_id": ack1["ack_message_id"],
+                            "evaluation": sample_eval,
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_e2_dup.status_code, 200)
+                    self.assertEqual(r_e2_dup.json().get("detail"), "already_sent")
+                    self.assertEqual(len(tg.sent_messages), sent_count_after_e1)
+
+                    # 3. Subsequent rev 3 conflict edit WITHOUT preserve_eval_reply MUST reset eval state & allow rev 3 reply
+                    r_c3 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-preserve-1",
+                            card_revision=3,
+                            delivery_kind="evidence_review",
+                            poster_path=None,
+                            extra={"conflict_reason": "real_conflict"},
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_c3.status_code, 200)
+                    self.assertFalse(r_c3.json().get("eval_reply_preserved"))
+                    row_r3 = app.state.db.get_delivery("rel-preserve-1")
+                    assert row_r3 is not None
+                    self.assertEqual(row_r3["eval_reply_status"], "pending")
+                    self.assertIsNone(row_r3["eval_reply_message_id"])
+
+                    r_e3 = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-preserve-1",
+                            "card_revision": 3,
+                            "ack_chat_id": ack1["ack_chat_id"],
+                            "ack_message_id": ack1["ack_message_id"],
+                            "evaluation": sample_eval,
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_e3.status_code, 200)
+                    self.assertEqual(len(tg.sent_messages), sent_count_after_e1 + 1)
+
+                    # 4. Safety fallback: preserve_eval_reply=True when rev 1 eval was NEVER sent returns False & keeps pending
+                    r_u1 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(release_id="rel-preserve-unsent", card_revision=1, poster_path=None),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_u1.status_code, 200)
+                    r_u2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-preserve-unsent",
+                            card_revision=2,
+                            delivery_kind="evidence_review",
+                            poster_path=None,
+                            extra={"conflict_reason": "unsent_check", "preserve_eval_reply": True},
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_u2.status_code, 200)
+                    self.assertFalse(r_u2.json().get("eval_reply_preserved"))
+                    row_unsent = app.state.db.get_delivery("rel-preserve-unsent")
+                    assert row_unsent is not None
+                    self.assertEqual(row_unsent["eval_reply_status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

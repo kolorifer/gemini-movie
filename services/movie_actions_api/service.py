@@ -532,6 +532,7 @@ class ActionsService:
         release_id = str(card_payload["release_id"]).strip()
         card_revision = int(card_payload["card_revision"])
         delivery_kind = str(card_payload["delivery_kind"]).strip()
+        preserve_eval_reply = card_payload.get("preserve_eval_reply") is True
         target_chat_id = self.config.telegram_chat_id
         if not target_chat_id:
             return {"status": "failed", "detail": "telegram_chat_id_not_configured"}
@@ -562,6 +563,9 @@ class ActionsService:
                 "ack_chat_id": plan.ack_chat_id,
                 "ack_message_id": plan.ack_message_id,
                 "ack_thread_id": plan.ack_thread_id,
+                "eval_reply_preserved": bool(
+                    preserve_eval_reply and plan.eval_reply_status in ("sent", "ambiguous_reply")
+                ),
                 "detail": plan.detail or plan.mode,
             }
         if plan.mode in ("ambiguous", "in_flight"):
@@ -597,7 +601,7 @@ class ActionsService:
                 )
 
             if res.outcome in ("ok", "not_modified"):
-                await asyncio.to_thread(
+                eval_reply_preserved = await asyncio.to_thread(
                     self.db.finish_card_delivery_success,
                     release_id,
                     card_revision=card_revision,
@@ -607,12 +611,14 @@ class ActionsService:
                     ack_thread_id=plan.ack_thread_id,
                     used_poster=plan.used_poster,
                     is_edit=True,
+                    preserve_eval_reply=preserve_eval_reply,
                 )
                 return {
                     "status": "delivered",
                     "ack_chat_id": plan.ack_chat_id,
                     "ack_message_id": plan.ack_message_id,
                     "ack_thread_id": plan.ack_thread_id,
+                    "eval_reply_preserved": eval_reply_preserved,
                 }
             if res.outcome == "failed_definitive":
                 await asyncio.to_thread(

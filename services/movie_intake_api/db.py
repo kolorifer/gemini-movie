@@ -149,6 +149,8 @@ class IntakeDB:
                     ack_message_id             INTEGER,
                     ack_thread_id              INTEGER,
                     ack_incoming_digest        TEXT,
+                    last_card_digest           TEXT,
+                    last_eval_reply_digest     TEXT,
                     eval_reply_status          TEXT NOT NULL DEFAULT 'pending',
                     pending_card_supersede_json TEXT,
                     pending_eval_reply_json    TEXT,
@@ -184,6 +186,30 @@ class IntakeDB:
                     ON occurrences(release_id, received_at);
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing_cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(releases)").fetchall()
+                }
+                if "last_card_digest" not in existing_cols:
+                    conn.execute("ALTER TABLE releases ADD COLUMN last_card_digest TEXT;")
+                if "last_eval_reply_digest" not in existing_cols:
+                    conn.execute("ALTER TABLE releases ADD COLUMN last_eval_reply_digest TEXT;")
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET last_eval_reply_digest = last_evaluated_digest
+                        WHERE last_eval_reply_digest IS NULL
+                          AND eval_reply_status IN ('sent', 'ambiguous_reply')
+                          AND last_evaluated_digest IS NOT NULL
+                          AND last_evaluated_digest = full_evidence_digest
+                        """
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         finally:
             conn.close()
         self._harden_db_files()
@@ -340,7 +366,7 @@ class IntakeDB:
                             retry_count = 0,
                             pending_card_supersede_json = NULL,
                             pending_eval_reply_json = NULL,
-                            eval_reply_status = 'pending',
+                            eval_reply_status = CASE WHEN card_revision >= 1 THEN eval_reply_status ELSE 'pending' END,
                             next_attempt_at = ?,
                             updated_at = ?
                         WHERE release_id = ?
@@ -393,7 +419,7 @@ class IntakeDB:
                             retry_count = 0,
                             pending_card_supersede_json = NULL,
                             pending_eval_reply_json = NULL,
-                            eval_reply_status = 'pending',
+                            eval_reply_status = CASE WHEN card_revision >= 1 THEN eval_reply_status ELSE 'pending' END,
                             suppression_reason = NULL,
                             lease_owner = NULL,
                             lease_expires_at = NULL,
@@ -579,6 +605,7 @@ class IntakeDB:
         ack_message_id: int,
         ack_thread_id: Optional[int],
         ack_incoming_digest: str,
+        last_card_digest: Optional[str] = None,
         pending_eval_reply: Any = ...,
         full_evidence_digest: Optional[str] = None,
         last_evaluated_digest: Optional[str] = None,
@@ -638,6 +665,8 @@ class IntakeDB:
                     ack_message_id = ?,
                     ack_thread_id = ?,
                     ack_incoming_digest = ?,
+                    last_card_digest = COALESCE(?, last_card_digest),
+                    last_eval_reply_digest = NULL,
                     eval_reply_status = 'pending',
                     pending_eval_reply_json = ?,
                     full_evidence_digest = COALESCE(?, full_evidence_digest),
@@ -660,6 +689,7 @@ class IntakeDB:
                     ack_message_id,
                     ack_thread_id,
                     ack_incoming_digest,
+                    last_card_digest,
                     final_pending_reply,
                     full_evidence_digest,
                     last_evaluated_digest,
@@ -700,6 +730,8 @@ class IntakeDB:
         card_revision: Optional[int] = None,
         full_evidence_digest: Optional[str] = None,
         last_evaluated_digest: Optional[str] = None,
+        last_card_digest: Optional[str] = None,
+        last_eval_reply_digest: Any = ...,
         tl_outcome: Optional[str] = None,
         identity_gate_status: Optional[str] = None,
         identity_conflict_reason: Any = ...,
@@ -736,7 +768,8 @@ class IntakeDB:
                        suppression_reason, identity_gate_status, identity_conflict_reason,
                        verified_tmdb_id, verified_imdb_id,
                        verified_title, verified_year, retry_count,
-                       ack_chat_id, ack_message_id, ack_thread_id, eval_reply_status,
+                       ack_chat_id, ack_message_id, ack_thread_id,
+                       last_card_digest, last_eval_reply_digest, eval_reply_status,
                        pending_card_supersede_json, pending_eval_reply_json
                 FROM releases
                 WHERE release_id = ? AND lease_owner = ?
@@ -798,7 +831,18 @@ class IntakeDB:
                     else None
                 )
             )
+            final_card_rev = (
+                card_revision if card_revision is not None else int(cur_row["card_revision"])
+            )
             final_eval_reply_status = eval_reply_status or str(cur_row["eval_reply_status"])
+            final_last_card_digest = (
+                last_card_digest if last_card_digest is not None else cur_row["last_card_digest"]
+            )
+            final_last_eval_reply_digest = (
+                cur_row["last_eval_reply_digest"]
+                if last_eval_reply_digest is ...
+                else last_eval_reply_digest
+            )
 
             final_state = state
             final_pending = 0
@@ -811,11 +855,9 @@ class IntakeDB:
                 final_retries = 0
                 final_pending_supersede = None
                 final_pending_reply = None
-                final_eval_reply_status = "pending"
+                if final_card_rev < 1:
+                    final_eval_reply_status = "pending"
 
-            final_card_rev = (
-                card_revision if card_revision is not None else int(cur_row["card_revision"])
-            )
             final_ack_chat = ack_chat_id if ack_chat_id is not None else cur_row["ack_chat_id"]
             final_ack_msg = ack_message_id if ack_message_id is not None else cur_row["ack_message_id"]
             final_ack_thread = ack_thread_id if ack_thread_id is not None else cur_row["ack_thread_id"]
@@ -833,6 +875,8 @@ class IntakeDB:
                     next_attempt_at = ?,
                     full_evidence_digest = COALESCE(?, full_evidence_digest),
                     last_evaluated_digest = COALESCE(?, last_evaluated_digest),
+                    last_card_digest = ?,
+                    last_eval_reply_digest = ?,
                     tl_outcome = COALESCE(?, tl_outcome),
                     identity_gate_status = ?,
                     identity_conflict_reason = ?,
@@ -860,6 +904,8 @@ class IntakeDB:
                     final_next_attempt,
                     full_evidence_digest,
                     last_evaluated_digest,
+                    final_last_card_digest,
+                    final_last_eval_reply_digest,
                     tl_outcome,
                     final_gate,
                     final_conflict_reason,

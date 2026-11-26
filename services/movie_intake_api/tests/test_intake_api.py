@@ -234,6 +234,7 @@ class StubActionsClient(ActionsApiClient):
         self.eval_reply_calls: list[dict[str, Any]] = []
         self._next_msg_id = 500
         self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+        self._eval_sent_releases: set[str] = set()
 
     async def get_capabilities(self) -> Optional[bool]:
         self.capability_calls += 1
@@ -262,7 +263,18 @@ class StubActionsClient(ActionsApiClient):
             return self._delivered_by_release[rel_id]
         if rel_id in self._delivered_by_release:
             prev = self._delivered_by_release[rel_id]
-            return prev
+            preserved = bool(
+                card_payload.get("preserve_eval_reply") is True and rel_id in self._eval_sent_releases
+            )
+            if not preserved:
+                self._eval_sent_releases.discard(rel_id)
+            return DeliveryCardResponse(
+                status=prev.status,
+                ack_chat_id=prev.ack_chat_id,
+                ack_message_id=prev.ack_message_id,
+                ack_thread_id=prev.ack_thread_id,
+                eval_reply_preserved=preserved,
+            )
         self._next_msg_id += 1
         resp = DeliveryCardResponse(
             status="delivered",
@@ -276,8 +288,13 @@ class StubActionsClient(ActionsApiClient):
     async def deliver_evaluation(self, eval_reply_payload: dict[str, Any]) -> DeliveryEvalResponse:
         self.eval_reply_calls.append(eval_reply_payload)
         if self._eval_reply_handler is not None:
-            return self._eval_reply_handler(eval_reply_payload)
-        return DeliveryEvalResponse(status="sent")
+            res = self._eval_reply_handler(eval_reply_payload)
+        else:
+            res = DeliveryEvalResponse(status="sent")
+        rel_id = str(eval_reply_payload.get("release_id") or "")
+        if rel_id and res.status in ("sent", "ambiguous_reply"):
+            self._eval_sent_releases.add(rel_id)
+        return res
 
 
 def _make_config(tmpdir: Path, **overrides: Any) -> IntakeConfig:
@@ -3294,6 +3311,476 @@ Language : German
             db_bytes = cfg.intake_db_path.read_bytes()
             self.assertNotIn(b"SUPER_SECRET_PASSKEY_VALUE", db_bytes)
             self.assertNotIn(b"/rss/download/", db_bytes)
+
+    def test_live_autobrr_release_new_then_action_rejected_shapes_and_eval_reuse(self) -> None:
+        """
+        OPS-REPORT #6 regressions:
+          1) Live autobrr emits event='action.rejected' with nested data.action.type='RADARR'
+             and data.result.status='PUSH_REJECTED' (no top-level 'action' object).
+          2) release.new -> action.rejected ('Unknown Movie...') produces 1 card (rev 1) + 1 eval
+             both when Occ 2 arrives mid-flight and when Occ 2 arrives after completion.
+          3) release.new (owned -> suppressed) -> action.rejected (4-form quality cutoff)
+             upgrades cleanly to 1 Alternative Grab card + 1 eval.
+          4) Radarr action change (actionable_grab -> alternative_grab) with unchanged movie
+             evidence edits card to rev 2 with preserve_eval_reply=True and reuses the single eval reply.
+          5) Unresolved path (evidence_review) release.new -> action.rejected also avoids a 2nd eval.
+          6) Pre-migration intake.db cleanly adds last_card_digest / last_eval_reply_digest.
+        """
+        import sqlite3
+
+        def _live_release_obj(
+            *,
+            name: str,
+            external_id: str,
+            title: str,
+            year: int,
+            meta_imdb: Optional[str] = "tt4919268",
+        ) -> dict[str, Any]:
+            return {
+                "name": name,
+                "title": title,
+                "year": year,
+                "type": "movie",
+                "category": "Movies :: 4K",
+                "external_id": external_id,
+                "meta_imdb": meta_imdb,
+                "resolution": "2160p",
+                "source": "UHD BluRay",
+                "hdr": ["DV", "HDR"],
+                "media_processing": "REMUX",
+                "group": "TRiToN",
+                "size": 58_000_000_000,
+                "freeleech": True,
+                "download_url": f"https://www.torrentleech.org/rss/download/{external_id}/LIVEKEY123/{name.replace(' ', '.')}.torrent",
+            }
+
+        def _live_release_new(rel_obj: dict[str, Any], *, evt_id: str = "evt-new-1") -> dict[str, Any]:
+            return {
+                "event": "release.new",
+                "id": evt_id,
+                "timestamp": "2026-11-26T17:34:42Z",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "release": dict(rel_obj),
+                },
+            }
+
+        def _live_action_rejected(
+            rel_obj: dict[str, Any],
+            *,
+            rejections: list[str],
+            action_type: str = "RADARR",
+            evt_id: str = "evt-rej-1",
+        ) -> dict[str, Any]:
+            return {
+                "event": "action.rejected",
+                "id": evt_id,
+                "timestamp": "2026-11-26T17:35:04Z",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"name": "Radarr 4K", "type": action_type},
+                    "filter": {"id": 7, "name": "Movies 4K"},
+                    "release": dict(rel_obj),
+                    "result": {
+                        "status": "PUSH_REJECTED",
+                        "rejections": list(rejections),
+                    },
+                },
+            }
+
+        elio_name = "Elio 2025 2160p UHD BluRay REMUX DV HDR HEVC Atmos-TRiToN"
+        elio_rel = _live_release_obj(
+            name=elio_name, external_id="241889121", title="Elio", year=2025, meta_imdb="tt4919268"
+        )
+
+        # 1) Live autobrr rejection classification without top-level `action` object
+        cw_new = classify_webhook_payload(_live_release_new(elio_rel))
+        self.assertFalse(cw_new.action_rejected)
+        self.assertTrue(cw_new.action_is_radarr)
+        self.assertEqual(classify_rejection_reasons(cw_new), ("not_rejected", None))
+
+        cw_unknown = classify_webhook_payload(
+            _live_action_rejected(
+                elio_rel,
+                rejections=["Unknown Movie. Unable to match to existing movie in Library using release title."],
+            )
+        )
+        self.assertTrue(cw_unknown.action_rejected)
+        self.assertTrue(cw_unknown.action_is_radarr)
+        self.assertEqual(classify_rejection_reasons(cw_unknown), ("needs_identity_and_radarr_check", None))
+
+        cw_cutoff = classify_webhook_payload(
+            _live_action_rejected(elio_rel, rejections=["Existing file meets cutoff: Remux-2160p"])
+        )
+        self.assertTrue(cw_cutoff.action_rejected)
+        self.assertTrue(cw_cutoff.action_is_radarr)
+        self.assertEqual(classify_rejection_reasons(cw_cutoff), ("legacy_alt_grab_eligible", "cutoff_met"))
+
+        cw_non_radarr = classify_webhook_payload(
+            _live_action_rejected(
+                elio_rel,
+                action_type="QBITTORRENT",
+                rejections=["Existing file meets cutoff: Remux-2160p"],
+            )
+        )
+        self.assertTrue(cw_non_radarr.action_rejected)
+        self.assertFalse(cw_non_radarr.action_is_radarr)
+        self.assertEqual(classify_rejection_reasons(cw_non_radarr), ("quality_rejected_suppress", "cutoff_met"))
+
+        cw_unwanted = classify_webhook_payload(
+            _live_action_rejected(elio_rel, rejections=["Quality is not wanted in profile"])
+        )
+        self.assertTrue(cw_unwanted.action_rejected)
+        self.assertEqual(classify_rejection_reasons(cw_unwanted), ("quality_rejected_suppress", "quality_unwanted"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            elio_movie = TmdbMovieRecord(
+                tmdb_id=1022789,
+                title="Elio",
+                original_title="Elio",
+                year=2025,
+                imdb_id="tt4919268",
+                runtime_minutes=98,
+                poster_path="/elio_poster.jpg",
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {1022789: elio_movie}, {"tt4919268": [1022789]})
+            tl_mode: dict[str, TorrentLeechResult] = {
+                "241889121": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt4919268",
+                    file_runtime_minutes=98,
+                    audio_languages=("English",),
+                ),
+                "241889122": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt4919268",
+                    file_runtime_minutes=98,
+                    audio_languages=("English",),
+                ),
+                "241889123": TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt4919268",
+                    file_runtime_minutes=98,
+                    audio_languages=("English",),
+                ),
+                "241889124": TorrentLeechResult(
+                    outcome="listing_id_missing",
+                    imdb_id=None,
+                    file_runtime_minutes=98,
+                    audio_languages=("English",),
+                ),
+            }
+            tl = StubTlScraper(db, cfg.tl_cookie_file, lambda ext, _n: tl_mode[ext])
+
+            triage_hook: dict[str, Any] = {"on_eval": None}
+
+            def _triage_handler(req_body: dict[str, Any]) -> TriageEvalResult:
+                if callable(triage_hook["on_eval"]):
+                    cb = triage_hook["on_eval"]
+                    triage_hook["on_eval"] = None
+                    cb()
+                if "Mystery.Unidentified.2025" in str(req_body.get("raw_text") or ""):
+                    return TriageEvalResult(
+                        ok=True,
+                        payload=_make_eval_payload(
+                            title="Mystery Unidentified",
+                            year=2025,
+                            imdb_id=None,
+                            tmdb_id=None,
+                            confidence="low",
+                        ),
+                    )
+                return TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Elio",
+                        year=2025,
+                        imdb_id="tt4919268",
+                        tmdb_id=1022789,
+                        confidence="high",
+                    ),
+                )
+
+            triage = StubTriageClient(_triage_handler)
+            owned_snapshot = {
+                "movie_id": 501,
+                "file_id": 901,
+                "monitored": True,
+                "quality_profile_id": 4,
+                "relative_path": "Elio.2025.2160p.REMUX-OLD.mkv",
+                "edition": "",
+                "release_group": "OLD",
+                "size": 55_000_000_000,
+                "quality": "Remux-2160p",
+            }
+            radarr_state: dict[str, RadarrStatusResponse] = {
+                "status": RadarrStatusResponse(status="absent", alternative_grab_configured=True)
+            }
+            actions = StubActionsClient(
+                radarr_handler=lambda _t, _i: radarr_state["status"],
+                alternative_grab_configured=True,
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                # 2) Exact Elio live regression: Occ 2 arrives MID-FLIGHT while Pass 1 is evaluating,
+                #    then a 3rd identical action.rejected / post-completion follow-up arrives.
+                r1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(elio_rel))
+                self.assertEqual(r1.status_code, 200)
+                rel_elio = r1.json()["release_id"]
+
+                # Simulate Occ 2 (action.rejected "Unknown Movie...") arriving while Pass 1 is in /evaluate!
+                def _post_midflight_reject() -> None:
+                    r_mid = client.post(
+                        "/webhook/test-webhook-secret",
+                        json=_live_action_rejected(
+                            elio_rel,
+                            rejections=[
+                                "Unknown Movie. Unable to match to existing movie in Library using release title."
+                            ],
+                        ),
+                    )
+                    self.assertEqual(r_mid.status_code, 200)
+                    self.assertEqual(r_mid.json()["status"], "updated_correction")
+
+                triage_hook["on_eval"] = _post_midflight_reject
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+
+                # Pass 1 re-queued due to mid-flight pending_reprocess while PRESERVING eval_reply_status='sent'!
+                mid_row = db.get_release(rel_elio)
+                assert mid_row is not None
+                self.assertEqual(mid_row["state"], "queued")
+                self.assertEqual(mid_row["card_revision"], 1)
+                self.assertEqual(mid_row["eval_reply_status"], "sent")
+                self.assertIsNotNone(mid_row["last_card_digest"])
+                self.assertIsNotNone(mid_row["last_eval_reply_digest"])
+
+                # Pass 2 runs for Occ 2 -> MUST be a complete no-op (0 extra card edits, 0 extra evals, 0 extra replies!)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                done_elio = db.get_release(rel_elio)
+                assert done_elio is not None
+                self.assertEqual(done_elio["state"], "completed")
+                self.assertEqual(done_elio["card_revision"], 1)
+                self.assertEqual(done_elio["eval_reply_status"], "sent")
+                self.assertEqual(len(db.list_occurrences_for_release(rel_elio)), 2)
+                self.assertEqual(len([c for c in actions.card_calls if c["release_id"] == rel_elio]), 1)
+                self.assertEqual(len([e for e in actions.eval_reply_calls if e["release_id"] == rel_elio]), 1)
+                self.assertEqual(len(triage.calls), 1)
+
+                # 3) Live release.new (owned -> suppressed) -> action.rejected (4-form cutoff) -> 1 alt-grab card + 1 eval
+                radarr_state["status"] = RadarrStatusResponse(
+                    status="owned_file",
+                    movie_id=501,
+                    file_id=901,
+                    existing_quality="Remux-2160p",
+                    monitored=True,
+                    movie_file_snapshot=owned_snapshot,
+                    alternative_grab_configured=True,
+                )
+                alt_rel = _live_release_obj(
+                    name=elio_name, external_id="241889122", title="Elio", year=2025, meta_imdb="tt4919268"
+                )
+                r_alt1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(alt_rel, evt_id="evt-a1"))
+                rel_alt = r_alt1.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                sup_row = db.get_release(rel_alt)
+                assert sup_row is not None
+                self.assertEqual(sup_row["state"], "suppressed")
+                self.assertEqual(sup_row["suppression_reason"], "already_owned")
+                self.assertEqual(sup_row["card_revision"], 0)
+                self.assertEqual(len([c for c in actions.card_calls if c["release_id"] == rel_alt]), 0)
+
+                r_alt2 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(
+                        alt_rel,
+                        rejections=["Existing file meets cutoff: Remux-2160p"],
+                        evt_id="evt-a2",
+                    ),
+                )
+                self.assertEqual(r_alt2.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                alt_done = db.get_release(rel_alt)
+                assert alt_done is not None
+                self.assertEqual(alt_done["state"], "completed")
+                self.assertEqual(alt_done["card_revision"], 1)
+                self.assertEqual(alt_done["eval_reply_status"], "sent")
+                alt_cards = [c for c in actions.card_calls if c["release_id"] == rel_alt]
+                alt_replies = [e for e in actions.eval_reply_calls if e["release_id"] == rel_alt]
+                self.assertEqual(len(alt_cards), 1)
+                self.assertEqual(alt_cards[0]["delivery_kind"], "alternative_grab")
+                self.assertEqual(len(alt_replies), 1)
+
+                # 4) Codex corrective case: Radarr action changes (actionable_grab -> alternative_grab)
+                #    while movie evaluation evidence is unchanged -> edit card to rev 2 with
+                #    preserve_eval_reply=True, ZERO extra /evaluate calls, ZERO extra evaluation replies!
+                radarr_state["status"] = RadarrStatusResponse(status="absent", alternative_grab_configured=True)
+                triage_before_case4 = len(triage.calls)
+                trans_rel = _live_release_obj(
+                    name=elio_name, external_id="241889123", title="Elio", year=2025, meta_imdb="tt4919268"
+                )
+                r_tr1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(trans_rel, evt_id="evt-t1"))
+                rel_trans = r_tr1.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(triage.calls), triage_before_case4 + 1)
+
+                # Now Radarr has an existing file and autobrr reports 4-form quality cutoff rejection
+                radarr_state["status"] = RadarrStatusResponse(
+                    status="owned_file",
+                    movie_id=501,
+                    file_id=901,
+                    existing_quality="Remux-2160p",
+                    monitored=True,
+                    movie_file_snapshot=owned_snapshot,
+                    alternative_grab_configured=True,
+                )
+                r_tr2 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(
+                        trans_rel,
+                        rejections=["Existing file meets cutoff: Remux-2160p"],
+                        evt_id="evt-t2",
+                    ),
+                )
+                self.assertEqual(r_tr2.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+
+                trans_done = db.get_release(rel_trans)
+                assert trans_done is not None
+                self.assertEqual(trans_done["state"], "completed")
+                self.assertEqual(trans_done["card_revision"], 2)
+                self.assertEqual(trans_done["eval_reply_status"], "sent")
+                trans_cards = [c for c in actions.card_calls if c["release_id"] == rel_trans]
+                trans_replies = [e for e in actions.eval_reply_calls if e["release_id"] == rel_trans]
+                self.assertEqual(len(trans_cards), 2)
+                self.assertEqual(trans_cards[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(trans_cards[1]["delivery_kind"], "alternative_grab")
+                self.assertEqual(trans_cards[1]["card_revision"], 2)
+                self.assertTrue(trans_cards[1].get("preserve_eval_reply"))
+                # Evaluation MUST be reused: still 1 /evaluate call and 1 Telegram reply!
+                self.assertEqual(len(triage.calls), triage_before_case4 + 1)
+                self.assertEqual(len(trans_replies), 1)
+
+                # 5) Unresolved path (evidence_review) release.new -> action.rejected ("Unknown Movie...") -> 1 card + 1 eval
+                triage_before_case5 = len(triage.calls)
+                unres_rel = _live_release_obj(
+                    name="Mystery.Unidentified.2025.2160p.UHD.BluRay.REMUX-TRiToN",
+                    external_id="241889124",
+                    title="Mystery Unidentified",
+                    year=2025,
+                    meta_imdb=None,
+                )
+                r_u1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(unres_rel, evt_id="evt-u1"))
+                rel_unres = r_u1.json()["release_id"]
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(triage.calls), triage_before_case5 + 1)
+
+                r_u2 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(
+                        unres_rel,
+                        rejections=[
+                            "Unknown Movie. Unable to match to existing movie in Library using release title."
+                        ],
+                        evt_id="evt-u2",
+                    ),
+                )
+                self.assertEqual(r_u2.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                unres_done = db.get_release(rel_unres)
+                assert unres_done is not None
+                self.assertEqual(unres_done["state"], "completed")
+                self.assertEqual(unres_done["card_revision"], 1)
+                self.assertEqual(len([c for c in actions.card_calls if c["release_id"] == rel_unres]), 1)
+                self.assertEqual(len([e for e in actions.eval_reply_calls if e["release_id"] == rel_unres]), 1)
+                self.assertEqual(len(triage.calls), triage_before_case5 + 1)
+
+            # 6) Pre-migration intake.db cleanly adds last_card_digest / last_eval_reply_digest & backfills
+            legacy_db_path = tmpdir / "state" / "legacy-intake.db"
+            legacy_db_path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(legacy_db_path.parent, 0o700)
+            conn = sqlite3.connect(str(legacy_db_path))
+            conn.executescript(
+                """
+                CREATE TABLE releases (
+                    release_id TEXT PRIMARY KEY,
+                    indexer_norm TEXT NOT NULL,
+                    external_id_norm TEXT NOT NULL,
+                    exact_release_name TEXT NOT NULL,
+                    first_occurrence_id TEXT NOT NULL,
+                    latest_occurrence_id TEXT NOT NULL,
+                    source_occurrence_id TEXT NOT NULL,
+                    card_revision INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    pending_reprocess INTEGER NOT NULL DEFAULT 0,
+                    suppression_reason TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    incoming_evidence_digest TEXT NOT NULL,
+                    incoming_snapshot_json TEXT NOT NULL,
+                    full_evidence_digest TEXT,
+                    last_evaluated_digest TEXT,
+                    tl_outcome TEXT,
+                    identity_gate_status TEXT NOT NULL DEFAULT 'pending',
+                    identity_conflict_reason TEXT,
+                    verified_tmdb_id INTEGER,
+                    verified_imdb_id TEXT,
+                    verified_title TEXT,
+                    verified_year INTEGER,
+                    ack_chat_id TEXT,
+                    ack_message_id INTEGER,
+                    ack_thread_id INTEGER,
+                    ack_incoming_digest TEXT,
+                    eval_reply_status TEXT NOT NULL DEFAULT 'pending',
+                    pending_card_supersede_json TEXT,
+                    pending_eval_reply_json TEXT,
+                    radarr_status_snapshot TEXT,
+                    evaluation_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(indexer_norm, external_id_norm, exact_release_name)
+                );
+                INSERT INTO releases (
+                    release_id, indexer_norm, external_id_norm, exact_release_name,
+                    first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                    card_revision, state, incoming_evidence_digest, incoming_snapshot_json,
+                    full_evidence_digest, last_evaluated_digest, eval_reply_status,
+                    created_at, updated_at
+                ) VALUES (
+                    'legacy-rel-1', 'torrentleech', '1001', 'Legacy.2025.2160p-GRP',
+                    'occ-1', 'occ-1', 'occ-1',
+                    1, 'completed', 'in-dig', '{}',
+                    'full-dig-1', 'full-dig-1', 'sent',
+                    '2026-11-26T17:00:00Z', '2026-11-26T17:01:00Z'
+                );
+                """
+            )
+            conn.commit()
+            conn.close()
+            os.chmod(legacy_db_path, 0o600)
+
+            migrated_db = IntakeDB(legacy_db_path)
+            migrated_db.init_db()
+            mig_row = migrated_db.get_release("legacy-rel-1")
+            assert mig_row is not None
+            self.assertIsNone(mig_row["last_card_digest"])
+            self.assertEqual(mig_row["last_eval_reply_digest"], "full-dig-1")
 
 
 if __name__ == "__main__":
