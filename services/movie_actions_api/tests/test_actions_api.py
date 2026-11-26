@@ -2565,6 +2565,47 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("queued", r_pf_ok.text.lower())
                     self.assertEqual(len(qbit.add_calls), 3)
 
+                    # 6i (Codex Round 1 P2): failed_not_transmitted -> active retry -> crash in read-only preflight ->
+                    # reconcile MUST ignore the prior failed_definitive add, reset ambiguous preflight to active, and succeed!
+                    qbit.torrents.clear()
+                    tok_retry_pf = await _mint_alt(client, "rel-alt-retry-pf", "660008")
+                    qbit.add_queue.append(
+                        QbitAddResult(outcome="failed_not_transmitted", error_redacted="qbit_connect_error")
+                    )
+                    r_notx = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1"})
+                    self.assertEqual(r_notx.status_code, 502)
+                    retry_act = app.state.db.get_action_group_readonly(hash_token(tok_retry_pf)).action
+                    assert retry_act is not None
+                    self.assertEqual(retry_act["status"], "active")
+                    self.assertEqual(len(qbit.add_calls), 4)
+
+                    # Simulate retry crashing during read-only preflight before receipt/add
+                    ok_pf2, _att_pf2, _ = app.state.db.begin_write_attempt(
+                        action_id=str(retry_act["action_id"]),
+                        completion_group=str(retry_act["completion_group"]),
+                        phase="qbit_alt_preflight",
+                        process_instance_id="dead-process-instance-2",
+                        lease_expires_at=utc_now_iso(utc_now() + timedelta(seconds=60)),
+                        request_fingerprint='{"phase":"preflight-retry"}',
+                        allowed_action_statuses=frozenset({"active"}),
+                    )
+                    self.assertTrue(ok_pf2)
+                    recov2 = app.state.db.recover_orphaned_state(app.state.process_instance_id)
+                    self.assertEqual(recov2["promoted_attempts"], 1)
+
+                    r_reset2 = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_reset2.status_code, 200)
+                    self.assertIn("Preflight Reset", r_reset2.text)
+                    self.assertEqual(
+                        app.state.db.get_action_group_readonly(hash_token(tok_retry_pf)).action["status"],
+                        "active",
+                    )
+
+                    r_retry_ok = await client.post(f"/action/{tok_retry_pf}", data={"confirm": "1"})
+                    self.assertEqual(r_retry_ok.status_code, 200)
+                    self.assertIn("queued", r_retry_ok.text.lower())
+                    self.assertEqual(len(qbit.add_calls), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

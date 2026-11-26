@@ -3283,6 +3283,7 @@ class ActionsService:
                         for a in group_attempts
                         if a["action_id"] == amb_act["action_id"]
                         and a["phase"] == "qbit_alternative_grab"
+                        and a["status"] in ("attempting", "succeeded")
                     ),
                     None,
                 )
@@ -3292,9 +3293,20 @@ class ActionsService:
                     for a in group_attempts
                     if a["action_id"] == amb_act["action_id"]
                     and a["phase"] == "qbit_alt_preflight"
+                    and a["status"] == "ambiguous"
                 ),
                 None,
             )
+            if preflight_att is None:
+                preflight_att = next(
+                    (
+                        a
+                        for a in group_attempts
+                        if a["action_id"] == amb_act["action_id"]
+                        and a["phase"] == "qbit_alt_preflight"
+                    ),
+                    None,
+                )
             return await self._reconcile_ambiguous_qbit_alt_grab(amb_act, qbit_att, preflight_att)
 
         # Hard single-push invariant: if ANY radarr_release_push attempt for this action is ambiguous,
