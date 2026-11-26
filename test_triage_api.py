@@ -1111,6 +1111,475 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             assert res_bare.movie is not None
             self.assertEqual(res_bare.movie.tmdb_id, 10)
 
+    def test_issue_13_3a_conflicting_tracker_imdb_and_tmdb_both_resolved_and_not_trusted(self) -> None:
+        """Issue #13 §3a: When tracker supplies BOTH tmdb_id and imdb_id, resolve and compare BOTH."""
+        from schemas import TorrentInfo
+
+        client = TmdbClient(api_key="0123456789abcdef0123456789abcdef")
+        movie_a = TmdbMovie(
+            tmdb_id=1001,
+            canonical_title="Harbor Line",
+            original_title="Harbor Line",
+            year=2024,
+            imdb_id="tt1111111",
+            runtime_minutes=112,
+            director="Clara Lindholm",
+        )
+        movie_b = TmdbMovie(
+            tmdb_id=2002,
+            canonical_title="Harbor Line",
+            original_title="Harbor Line",
+            year=2024,
+            imdb_id="tt2222222",
+            runtime_minutes=112,
+            director="Tomasz Nowak",
+        )
+
+        imdb_lookup_calls: list[str] = []
+
+        def _find_by_imdb(imdb_id: str) -> int | None:
+            imdb_lookup_calls.append(imdb_id)
+            return {"tt1111111": 1001, "tt2222222": 2002}.get(imdb_id.lower())
+
+        def _fetch(tid: int) -> TmdbMovie:
+            return {1001: movie_a, 2002: movie_b}[tid]
+
+        req_conflict = EvaluateRequest(
+            raw_text="Harbor.Line.2024.2160p.UHD.BluRay.REMUX-GROUP",
+            torrent_info=TorrentInfo(
+                indexer="TorrentLeech",
+                tmdb_id=1001,
+                imdb_id="tt2222222",
+            ),
+        )
+        with (
+            patch.object(client, "_find_tmdb_id_by_imdb", side_effect=_find_by_imdb),
+            patch.object(client, "_fetch_movie_details", side_effect=_fetch),
+            patch.object(client, "_search_results", return_value=[]),
+        ):
+            res = asyncio.run(client.lookup_with_diagnostics(req_conflict))
+            self.assertIn("tt2222222", imdb_lookup_calls)
+            self.assertIsNotNone(res.tracker_conflict)
+            assert res.tracker_conflict is not None
+            self.assertIn("tt1111111", res.tracker_conflict)
+            self.assertIn("tt2222222", res.tracker_conflict)
+            self.assertFalse(res.trusted_for_cache)
+            self.assertIsNone(res.movie)
+
+        # Control: agreeing tracker tmdb_id + imdb_id pair resolves cleanly as trusted_for_cache=True
+        imdb_lookup_calls.clear()
+        req_ok = EvaluateRequest(
+            raw_text="Harbor.Line.2024.2160p.UHD.BluRay.REMUX-GROUP",
+            torrent_info=TorrentInfo(
+                indexer="TorrentLeech",
+                tmdb_id=1001,
+                imdb_id="tt1111111",
+            ),
+        )
+        with (
+            patch.object(client, "_find_tmdb_id_by_imdb", side_effect=_find_by_imdb),
+            patch.object(client, "_fetch_movie_details", side_effect=_fetch),
+        ):
+            res_ok = asyncio.run(client.lookup_with_diagnostics(req_ok))
+            self.assertIn("tt1111111", imdb_lookup_calls)
+            self.assertIsNone(res_ok.tracker_conflict)
+            self.assertTrue(res_ok.trusted_for_cache)
+            assert res_ok.movie is not None
+            self.assertEqual(res_ok.movie.tmdb_id, 1001)
+
+    def test_issue_13_3b_shared_director_first_name_and_contradictory_ids_rejected_and_separated(self) -> None:
+        """Issue #13 §3b: Same-year films sharing director first name or conflicting TMDb IDs never merge."""
+        import main
+        from tmdb_client import TmdbLookupResult, is_tmdb_compatible
+
+        film_a_payload = _sample_payload(
+            title="Paper Harbor",
+            year=2024,
+            director="David Mercer",
+            imdb_id=None,
+            tmdb_id=50101,
+        )
+        film_b_tmdb = TmdbMovie(
+            tmdb_id=50202,
+            canonical_title="Silent Valley",
+            original_title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            runtime_minutes=104,
+            director="David Kowalski",
+        )
+
+        # 1) Contradictory TMDB ID + shared first name ONLY -> strictly incompatible
+        self.assertFalse(is_tmdb_compatible(film_a_payload.identification, film_b_tmdb))
+
+        # 2) Even if model omitted tmdb_id, shared first name ONLY and different title -> incompatible
+        film_a_no_id = _sample_payload(
+            title="Paper Harbor",
+            year=2024,
+            director="David Mercer",
+            imdb_id=None,
+            tmdb_id=None,
+        )
+        self.assertFalse(is_tmdb_compatible(film_a_no_id.identification, film_b_tmdb))
+
+        # 3) Same title + same year + directors sharing only first name -> incompatible
+        same_title_other_dir = TmdbMovie(
+            tmdb_id=50203,
+            canonical_title="Paper Harbor",
+            original_title="Paper Harbor",
+            year=2024,
+            imdb_id="tt5020300",
+            runtime_minutes=104,
+            director="David Kowalski",
+        )
+        self.assertFalse(is_tmdb_compatible(film_a_no_id.identification, same_title_other_dir))
+
+        # 4) apply_tmdb_verification preserves model_identification and catalogue_identification separately
+        #    and NEVER substitutes Film B's IDs onto Film A's title/ratings!
+        merged = apply_tmdb_verification(film_a_payload, film_b_tmdb)
+        self.assertEqual(merged.identification.canonical_title, "Paper Harbor")
+        self.assertEqual(merged.identification.tmdb_id, 50101)
+        self.assertIsNone(merged.identification.imdb_id)
+        self.assertEqual(merged.identification.match_confidence, "low")
+        self.assertIsNotNone(merged.model_identification)
+        assert merged.model_identification is not None
+        self.assertEqual(merged.model_identification.canonical_title, "Paper Harbor")
+        self.assertEqual(merged.model_identification.tmdb_id, 50101)
+        self.assertIsNotNone(merged.catalogue_identification)
+        assert merged.catalogue_identification is not None
+        self.assertFalse(merged.catalogue_identification.compatible)
+        self.assertEqual(merged.catalogue_identification.tmdb_id, 50202)
+        self.assertEqual(merged.catalogue_identification.imdb_id, "tt5020200")
+        self.assertIsNotNone(merged.catalogue_identification.conflict_reason)
+
+        # 5) End-to-end /evaluate withholds caching when catalogue conflict occurs
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            mock_tmdb = TmdbClient(api_key="dummy-key")
+            mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                return_value=TmdbLookupResult(movie=film_b_tmdb, trusted_for_cache=True)
+            )
+            mock_tmdb.verify_identification = AsyncMock(return_value=None)  # type: ignore[method-assign]
+            mock_gemini = AsyncMock(return_value=film_a_payload)
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", mock_tmdb),
+                patch.object(main.gemini_client, "evaluate", mock_gemini),
+            ):
+                resp = asyncio.run(
+                    main.evaluate(EvaluateRequest(raw_text="Paper.Harbor.2024.2160p.UHD.BluRay.REMUX-GRP"))
+                )
+                self.assertFalse(resp.cached)
+                self.assertEqual(resp.identification.tmdb_id, 50101)
+                self.assertIsNone(resp.identification.imdb_id)
+                self.assertIsNotNone(resp.catalogue_identification)
+                assert resp.catalogue_identification is not None
+                self.assertFalse(resp.catalogue_identification.compatible)
+                # Conflict result must NOT be cached
+                self.assertEqual(test_db.get_cache_entries_count(), 0)
+
+    def test_issue_13_4d_edition_aware_cache_and_exact_only_early_lookup(self) -> None:
+        """Issue #13 §4d: Theatrical vs Extended cut with identical movie/group/quality must not share cache."""
+        import main
+        from db import extract_edition_key
+        from tmdb_client import TmdbLookupResult
+
+        self.assertEqual(
+            extract_edition_key("Example.Film.2024.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"), ""
+        )
+        self.assertEqual(
+            extract_edition_key("Example.Film.2024.Extended.Cut.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"),
+            "extended",
+        )
+        self.assertEqual(
+            extract_edition_key("Example.Film.2024.Directors.Cut.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"),
+            "directors_cut",
+        )
+        self.assertEqual(
+            extract_edition_key("Example.Film.2024.Theatrical.Cut.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"),
+            "theatrical",
+        )
+
+        tmdb_movie = TmdbMovie(
+            tmdb_id=88001,
+            canonical_title="Example Film",
+            original_title="Example Film",
+            year=2024,
+            imdb_id="tt8800100",
+            runtime_minutes=120,
+            director="Elena Vance",
+        )
+        eval_theatrical = _sample_payload(
+            title="Example Film", year=2024, director="Elena Vance", imdb_id="tt8800100", tmdb_id=88001
+        )
+        eval_extended = eval_theatrical.model_copy(
+            update={
+                "decision_aid": eval_theatrical.decision_aid.model_copy(
+                    update={"verdict_reason": "Extended cut adds 24 minutes of restored scenes."}
+                )
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            mock_tmdb = TmdbClient(api_key="dummy-key")
+            mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                return_value=TmdbLookupResult(movie=tmdb_movie, trusted_for_cache=True)
+            )
+            mock_tmdb.verify_identification = AsyncMock(return_value=tmdb_movie)  # type: ignore[method-assign]
+            mock_gemini = AsyncMock(side_effect=[eval_theatrical, eval_extended])
+
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", mock_tmdb),
+                patch.object(main.gemini_client, "evaluate", mock_gemini),
+            ):
+                # 1) Theatrical cut (no supplemental torrent_info)
+                r_theat = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Example.Film.2024.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"
+                        )
+                    )
+                )
+                self.assertFalse(r_theat.cached)
+                self.assertEqual(mock_gemini.await_count, 1)
+
+                # 2) Extended cut with identical movie, group, quality, and NO supplemental torrent_info
+                #    MUST miss both early exact lookup and post-TMDB lookup!
+                r_ext = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Example.Film.2024.Extended.Cut.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"
+                        )
+                    )
+                )
+                self.assertFalse(r_ext.cached)
+                self.assertEqual(mock_gemini.await_count, 2)
+                self.assertIn("Extended cut", r_ext.decision_aid.verdict_reason)
+
+                # 3) Repeating exact Extended cut hits cache cleanly
+                r_ext_repeat = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Example.Film.2024.Extended.Cut.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES"
+                        )
+                    )
+                )
+                self.assertTrue(r_ext_repeat.cached)
+                self.assertEqual(mock_gemini.await_count, 2)
+
+                # 4) Early lookup does NOT reuse another release string before independent identification
+                mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                    return_value=TmdbLookupResult(movie=None, trusted_for_cache=False)
+                )
+                mock_gemini.side_effect = [eval_theatrical]
+                r_unverified_other = asyncio.run(
+                    main.evaluate(
+                        EvaluateRequest(
+                            raw_text="Example.Film.2024.2160p.UHD.BluRay.REMUX.DV.HEVC-CiNEPHiLES"
+                        )
+                    )
+                )
+                self.assertFalse(r_unverified_other.cached)
+                self.assertEqual(mock_gemini.await_count, 3)
+
+    def test_issue_13_4e_feedback_preserves_tmdb_id_and_distinct_same_title_films(self) -> None:
+        """Issue #13 §4e: Feedback stores tmdb_id and keeps two same-title films separate when IMDb is absent."""
+        import sqlite3
+        import main
+        from schemas import FeedbackRequest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Verify additive migration on a legacy feedback table lacking tmdb_id
+            db_path = Path(tmpdir) / "triage.db"
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE feedback (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        imdb_id TEXT,
+                        title TEXT NOT NULL,
+                        decision TEXT NOT NULL CHECK (decision IN ('WATCH', 'MAYBE', 'SKIP')),
+                        note TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+            test_db = TriageDB(db_path)
+            test_db.init_db()
+
+            with patch.object(main, "db", test_db):
+                r1 = asyncio.run(
+                    main.submit_feedback(
+                        FeedbackRequest(
+                            imdb_id=None,
+                            tmdb_id=7001,
+                            title="Same Title Film",
+                            decision="watch",  # type: ignore[arg-type]
+                            note="watched",
+                        )
+                    )
+                )
+                self.assertEqual(r1.status, "saved")
+                self.assertEqual(r1.decision, "WATCH")
+                self.assertEqual(r1.total_feedback, 1)
+
+                r2 = asyncio.run(
+                    main.submit_feedback(
+                        FeedbackRequest(
+                            imdb_id=None,
+                            tmdb_id=7002,
+                            title="Same Title Film",
+                            decision="skip",  # type: ignore[arg-type]
+                            note="watched",
+                        )
+                    )
+                )
+                self.assertEqual(r2.status, "saved")
+                self.assertEqual(r2.decision, "SKIP")
+                self.assertEqual(r2.total_feedback, 2)
+
+                items = asyncio.run(main.list_feedback(limit=10))
+                by_tmdb = {item.tmdb_id: item for item in items}
+                self.assertEqual(set(by_tmdb.keys()), {7001, 7002})
+                self.assertEqual(by_tmdb[7001].decision, "WATCH")
+                self.assertEqual(by_tmdb[7001].note, "watched")
+                self.assertEqual(by_tmdb[7002].decision, "SKIP")
+                self.assertEqual(by_tmdb[7002].note, "watched")
+
+                # Re-rating tmdb_id=7001 updates ONLY 7001 and preserves 7002
+                r3 = asyncio.run(
+                    main.submit_feedback(
+                        FeedbackRequest(
+                            imdb_id=None,
+                            tmdb_id=7001,
+                            title="Same Title Film",
+                            decision="skip",  # type: ignore[arg-type]
+                            note="watched",
+                        )
+                    )
+                )
+                self.assertEqual(r3.total_feedback, 2)
+
+    def test_issue_13_6d_rating_range_bounds_and_grounding_source_verification(self) -> None:
+        """Issue #13 §6d: Enforce numeric rating ranges and strip ungrounded ratings while retaining verified sources."""
+        import json
+        from types import SimpleNamespace
+        from pydantic import ValidationError
+        from gemini_client import GeminiTriageClient, validate_and_ground_ratings
+
+        # 1) Schema enforces platform-specific numeric ranges
+        for bad_kwargs in (
+            {"rotten_tomatoes_critics": 101},
+            {"rotten_tomatoes_critics": -1},
+            {"rotten_tomatoes_audience": 120},
+            {"metacritic": 105},
+            {"imdb": 10.5},
+            {"imdb": -0.1},
+            {"letterboxd": 5.5},
+            {"letterboxd": -0.5},
+        ):
+            with self.assertRaises(ValidationError):
+                Ratings(**bad_kwargs)  # type: ignore[arg-type]
+
+        # 2) Out-of-range and ungrounded ratings become None (unknown); grounded ratings retain supporting source
+        raw_ratings = {
+            "rotten_tomatoes_critics": 94,       # grounded (rottentomatoes.com) -> kept
+            "rotten_tomatoes_audience": 115,     # out of range -> None
+            "metacritic": 88,                    # in range but NO metacritic grounding chunk -> None
+            "imdb": 8.1,                         # grounded (imdb.com) -> kept
+            "letterboxd": 6.2,                   # out of range (>5.0) -> None
+            "missing_sources": [],
+        }
+        grounding = [
+            {"domain": "rottentomatoes.com", "title": "Example Film | Rotten Tomatoes"},
+            {"domain": "imdb.com", "title": "Example Film (2024) - IMDb"},
+            {"domain": "en.wikipedia.org", "title": "Example Film - Wikipedia"},
+        ]
+        cleaned = validate_and_ground_ratings(raw_ratings, grounding_sources=grounding)
+        self.assertEqual(cleaned["rotten_tomatoes_critics"], 94)
+        self.assertIsNone(cleaned["rotten_tomatoes_audience"])
+        self.assertIsNone(cleaned["metacritic"])
+        self.assertEqual(cleaned["imdb"], 8.1)
+        self.assertIsNone(cleaned["letterboxd"])
+        self.assertEqual(
+            cleaned["sources"],
+            {"rotten_tomatoes_critics": "rottentomatoes.com", "imdb": "imdb.com"},
+        )
+        self.assertIn("Rotten Tomatoes Audience", cleaned["missing_sources"])
+        self.assertIn("Metacritic", cleaned["missing_sources"])
+        self.assertIn("Letterboxd", cleaned["missing_sources"])
+
+        # 3) End-to-end GeminiTriageClient._call_sync strips ungrounded ratings when grounding_metadata is empty
+        fake_payload_json = json.dumps(
+            {
+                "identification": {
+                    "canonical_title": "Example Film",
+                    "year": 2024,
+                    "director": "Elena Vance",
+                    "imdb_id": "tt1234567",
+                    "tmdb_id": 12345,
+                    "runtime_minutes": 110,
+                    "genres": ["Drama"],
+                    "match_confidence": "high",
+                },
+                "ratings": {
+                    "rotten_tomatoes_critics": 92,
+                    "rotten_tomatoes_audience": 85,
+                    "metacritic": 80,
+                    "imdb": 11.4,
+                    "letterboxd": 4.2,
+                    "missing_sources": [],
+                },
+                "recognition": {"awards_highlights": [], "critic_consensus": "Well received."},
+                "decision_aid": {
+                    "one_line_pitch": "Sharp drama.",
+                    "similar_to": ["Film X"],
+                    "red_flags": [],
+                    "verdict": "WATCH",
+                    "verdict_reason": "Strong craft.",
+                },
+            }
+        )
+        fake_response = SimpleNamespace(
+            text=fake_payload_json,
+            candidates=[
+                SimpleNamespace(
+                    grounding_metadata=SimpleNamespace(
+                        grounding_chunks=[
+                            SimpleNamespace(
+                                web=SimpleNamespace(
+                                    uri="https://www.rottentomatoes.com/m/example_film",
+                                    title="Example Film - Rotten Tomatoes",
+                                )
+                            )
+                        ]
+                    )
+                )
+            ],
+        )
+        fake_sdk = SimpleNamespace(
+            models=SimpleNamespace(generate_content=lambda **kwargs: fake_response)
+        )
+        gclient = GeminiTriageClient(api_key="dummy-test-key")
+        with patch.object(gclient, "_get_client", return_value=fake_sdk):
+            parsed = gclient._call_sync(EvaluateRequest(raw_text="Example.Film.2024"), "sys")
+            self.assertEqual(parsed.ratings.rotten_tomatoes_critics, 92)
+            self.assertEqual(parsed.ratings.rotten_tomatoes_audience, 85)
+            self.assertIsNone(parsed.ratings.metacritic)
+            self.assertIsNone(parsed.ratings.imdb)
+            self.assertIsNone(parsed.ratings.letterboxd)
+            self.assertEqual(
+                parsed.ratings.sources,
+                {
+                    "rotten_tomatoes_critics": "rottentomatoes.com",
+                    "rotten_tomatoes_audience": "rottentomatoes.com",
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

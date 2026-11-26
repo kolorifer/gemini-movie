@@ -89,11 +89,16 @@ def build_system_instruction(
         lines.append("")
         lines.append("RECENT USER FEEDBACK HISTORY (most recent first):")
         for row in recent_feedback[:20]:
-            imdb_part = f" [{row['imdb_id']}]" if row.get("imdb_id") else ""
+            if row.get("imdb_id"):
+                id_part = f" [{row['imdb_id']}]"
+            elif row.get("tmdb_id") is not None:
+                id_part = f" [tmdb:{row['tmdb_id']}]"
+            else:
+                id_part = ""
             clean_note = sanitize_tracker_text(row.get("note"), max_chars=200)
             note_part = f" — {clean_note}" if clean_note else ""
             lines.append(
-                f"- {row['decision']}: {row['title']}{imdb_part}{note_part}"
+                f"- {row['decision']}: {row['title']}{id_part}{note_part}"
             )
 
     return "\n".join(lines)
@@ -139,6 +144,179 @@ def _strip_json_fences(raw: str) -> str:
     return text.strip()
 
 
+_RATING_PLATFORM_SPECS: dict[str, tuple[str, float, float, bool, tuple[str, ...], tuple[str, ...]]] = {
+    # key: (display_label, min_val, max_val, is_int, domains, title_keywords)
+    "rotten_tomatoes_critics": (
+        "Rotten Tomatoes Critics",
+        0.0,
+        100.0,
+        True,
+        ("rottentomatoes.com",),
+        ("rotten tomatoes", "rottentomatoes"),
+    ),
+    "rotten_tomatoes_audience": (
+        "Rotten Tomatoes Audience",
+        0.0,
+        100.0,
+        True,
+        ("rottentomatoes.com",),
+        ("rotten tomatoes", "rottentomatoes"),
+    ),
+    "metacritic": (
+        "Metacritic",
+        0.0,
+        100.0,
+        True,
+        ("metacritic.com",),
+        ("metacritic",),
+    ),
+    "imdb": (
+        "IMDb",
+        0.0,
+        10.0,
+        False,
+        ("imdb.com",),
+        ("imdb",),
+    ),
+    "letterboxd": (
+        "Letterboxd",
+        0.0,
+        5.0,
+        False,
+        ("letterboxd.com",),
+        ("letterboxd",),
+    ),
+}
+
+
+def extract_grounding_sources(response: Any) -> list[dict[str, str]]:
+    """Extract normalized web grounding sources (domain + title) from a Gemini GenerateContentResponse."""
+    sources: list[dict[str, str]] = []
+    candidates = getattr(response, "candidates", None)
+    if candidates is None and isinstance(response, dict):
+        candidates = response.get("candidates")
+    if not candidates:
+        return sources
+
+    for cand in candidates:
+        gm = getattr(cand, "grounding_metadata", None)
+        if gm is None and isinstance(cand, dict):
+            gm = cand.get("grounding_metadata") or cand.get("groundingMetadata")
+        if gm is None:
+            continue
+        chunks = getattr(gm, "grounding_chunks", None)
+        if chunks is None and isinstance(gm, dict):
+            chunks = gm.get("grounding_chunks") or gm.get("groundingChunks")
+        if not chunks:
+            continue
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            if web is None and isinstance(chunk, dict):
+                web = chunk.get("web")
+            if web is None:
+                continue
+            uri = str(getattr(web, "uri", None) or (web.get("uri") if isinstance(web, dict) else "") or "").strip()
+            title = str(getattr(web, "title", None) or (web.get("title") if isinstance(web, dict) else "") or "").strip()
+            domain = ""
+            if uri:
+                m = re.match(r"^https?://([^/\s:?#]+)", uri, flags=re.IGNORECASE)
+                if m:
+                    domain = m.group(1).lower().lstrip("www.")
+            if domain or title:
+                sources.append({"domain": domain, "title": title})
+    return sources
+
+
+def _find_supporting_grounding_source(
+    rating_key: str,
+    grounding_sources: list[dict[str, str]],
+) -> Optional[str]:
+    spec = _RATING_PLATFORM_SPECS.get(rating_key)
+    if spec is None:
+        return None
+    _label, _lo, _hi, _is_int, domains, keywords = spec
+    for src in grounding_sources:
+        dom = (src.get("domain") or "").lower()
+        title = (src.get("title") or "").lower()
+        for expected_dom in domains:
+            if dom == expected_dom or dom.endswith("." + expected_dom):
+                return expected_dom
+        for kw in keywords:
+            if kw in title or kw in dom:
+                return domains[0]
+    return None
+
+
+def validate_and_ground_ratings(
+    raw_ratings: Any,
+    *,
+    grounding_sources: list[dict[str, str]],
+) -> dict[str, Any]:
+    """
+    Validate platform-specific numeric score bounds and verify that every displayed rating
+    is backed by an actual retrieved Google Search grounding source for that platform.
+    Out-of-range or ungrounded scores are coerced to None (unknown) and listed in missing_sources.
+    """
+    ratings_in = dict(raw_ratings) if isinstance(raw_ratings, dict) else {}
+    existing_missing = ratings_in.get("missing_sources")
+    missing: list[str] = [
+        str(m).strip()
+        for m in (existing_missing if isinstance(existing_missing, list) else [])
+        if str(m).strip()
+    ]
+    verified_sources: dict[str, str] = {}
+    cleaned: dict[str, Any] = {}
+
+    def _add_missing(label: str) -> None:
+        if not any(m.lower() == label.lower() for m in missing):
+            missing.append(label)
+
+    for key, (label, lo, hi, is_int, _domains, _keywords) in _RATING_PLATFORM_SPECS.items():
+        val = ratings_in.get(key)
+        if val is None:
+            cleaned[key] = None
+            continue
+
+        # Validate numeric type and platform-specific bounds (reject bool/NaN/Inf/out-of-range)
+        valid_num: Optional[int | float] = None
+        if not isinstance(val, bool) and isinstance(val, (int, float)):
+            fval = float(val)
+            if fval == fval and fval not in (float("inf"), float("-inf")) and lo <= fval <= hi:
+                if is_int:
+                    if float(int(round(fval))) == fval:
+                        valid_num = int(round(fval))
+                else:
+                    valid_num = round(fval, 2)
+
+        if valid_num is None:
+            cleaned[key] = None
+            _add_missing(label)
+            continue
+
+        # Verify actual grounding source support for this rating platform
+        supporting_src = _find_supporting_grounding_source(key, grounding_sources)
+        if supporting_src is None:
+            cleaned[key] = None
+            _add_missing(label)
+            continue
+
+        cleaned[key] = valid_num
+        verified_sources[key] = supporting_src
+
+    cleaned["sources"] = verified_sources
+    cleaned["missing_sources"] = missing
+    return cleaned
+
+
+def _build_gemini_response_schema() -> dict[str, Any]:
+    schema = EvaluationPayload.model_json_schema()
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        props.pop("model_identification", None)
+        props.pop("catalogue_identification", None)
+    return schema
+
+
 class GeminiTriageClient:
     def __init__(
         self,
@@ -178,7 +356,7 @@ class GeminiTriageClient:
             system_instruction=system_instruction,
             tools=[{"google_search": {}}],
             response_mime_type="application/json",
-            response_json_schema=EvaluationPayload.model_json_schema(),
+            response_json_schema=_build_gemini_response_schema(),
         )
         response = client.models.generate_content(
             model=self.model,
@@ -199,6 +377,17 @@ class GeminiTriageClient:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             raise GeminiClientError(f"Gemini returned non-JSON output: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise GeminiClientError("Gemini returned non-object JSON payload")
+
+        grounding_sources = extract_grounding_sources(response)
+        parsed["ratings"] = validate_and_ground_ratings(
+            parsed.get("ratings"),
+            grounding_sources=grounding_sources,
+        )
+        # Never allow model output to pre-populate server-owned verification snapshots
+        parsed.pop("model_identification", None)
+        parsed.pop("catalogue_identification", None)
 
         return EvaluationPayload.model_validate(parsed)
 

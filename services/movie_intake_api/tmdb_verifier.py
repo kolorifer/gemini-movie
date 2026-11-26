@@ -112,6 +112,133 @@ def parse_release_title_year(exact_release_name: str) -> tuple[Optional[str], Op
     return title, year
 
 
+_ROMAN_TO_INT: dict[str, int] = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+    "xi": 11,
+    "xii": 12,
+}
+_WORD_TO_INT: dict[str, int] = {
+    "one": 1,
+    "first": 1,
+    "two": 2,
+    "second": 2,
+    "three": 3,
+    "third": 3,
+    "four": 4,
+    "fourth": 4,
+    "five": 5,
+    "fifth": 5,
+    "six": 6,
+    "sixth": 6,
+    "seven": 7,
+    "seventh": 7,
+    "eight": 8,
+    "eighth": 8,
+    "nine": 9,
+    "ninth": 9,
+    "ten": 10,
+    "tenth": 10,
+}
+_INSTALLMENT_PREFIXES = frozenset({"part", "pt", "chapter", "ch", "vol", "volume", "book", "act", "episode", "ep"})
+_SEQUEL_SUBTITLE_TOKENS = frozenset(
+    {
+        "part",
+        "pt",
+        "chapter",
+        "vol",
+        "volume",
+        "book",
+        "sequel",
+        "returns",
+        "reloaded",
+        "revolutions",
+        "resurrection",
+        "resurrections",
+        "begins",
+        "forever",
+        "revenge",
+        "rising",
+        "reborn",
+        "awakens",
+        "origins",
+        "redux",
+        "final",
+    }
+)
+
+
+def _extract_installment_signature(norm_title: str) -> tuple[int, ...]:
+    """
+    Extract canonical numeric sequel/part/installment markers so 'North Crossing'
+    cannot match 'North Crossing II', 'North Crossing 2', or 'North Crossing Part 2',
+    while equivalent notations like 'II' and '2' or 'Part Two' and 'Part 2' align.
+    """
+    tokens = norm_title.split()
+    if not tokens:
+        return ()
+    markers: list[int] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _INSTALLMENT_PREFIXES and idx + 1 < len(tokens):
+            nxt = tokens[idx + 1]
+            if nxt.isdigit():
+                markers.append(int(nxt))
+                idx += 2
+                continue
+            if nxt in _ROMAN_TO_INT:
+                markers.append(_ROMAN_TO_INT[nxt])
+                idx += 2
+                continue
+            if nxt in _WORD_TO_INT:
+                markers.append(_WORD_TO_INT[nxt])
+                idx += 2
+                continue
+        if tok.isdigit():
+            markers.append(int(tok))
+        elif tok in _ROMAN_TO_INT and (tok != "i" or (len(tokens) >= 2 and idx == len(tokens) - 1)):
+            markers.append(_ROMAN_TO_INT[tok])
+        idx += 1
+    return tuple(markers)
+
+
+def _canonicalize_installment_tokens(norm_title: str) -> str:
+    tokens = norm_title.split()
+    out: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _INSTALLMENT_PREFIXES and idx + 1 < len(tokens):
+            nxt = tokens[idx + 1]
+            if nxt.isdigit():
+                out.extend([tok, str(int(nxt))])
+                idx += 2
+                continue
+            if nxt in _ROMAN_TO_INT:
+                out.extend([tok, str(_ROMAN_TO_INT[nxt])])
+                idx += 2
+                continue
+            if nxt in _WORD_TO_INT:
+                out.extend([tok, str(_WORD_TO_INT[nxt])])
+                idx += 2
+                continue
+        if tok in _ROMAN_TO_INT and (tok != "i" or (len(tokens) >= 2 and idx == len(tokens) - 1)):
+            out.append(str(_ROMAN_TO_INT[tok]))
+        else:
+            out.append(tok)
+        idx += 1
+    return " ".join(out)
+
+
 def _token_jaccard(a: str, b: str) -> float:
     ta = set(a.split())
     tb = set(b.split())
@@ -124,17 +251,30 @@ def _titles_match(release_title: str, candidate_titles: list[str]) -> bool:
     norm_rel = normalize_title(release_title)
     if not norm_rel:
         return False
-    rel_tokens = norm_rel.split()
+    rel_sig = _extract_installment_signature(norm_rel)
+    canon_rel = _canonicalize_installment_tokens(norm_rel)
+    rel_tokens = canon_rel.split()
     for cand in candidate_titles:
         norm_cand = normalize_title(cand)
         if not norm_cand:
             continue
         if norm_rel == norm_cand:
             return True
-        if _token_jaccard(norm_rel, norm_cand) >= 0.75:
+        # Preserve sequel, part, and numeral differences unless exact alias matches above
+        cand_sig = _extract_installment_signature(norm_cand)
+        if rel_sig != cand_sig:
+            continue
+        canon_cand = _canonicalize_installment_tokens(norm_cand)
+        if canon_rel == canon_cand:
+            return True
+        cand_tokens = canon_cand.split()
+        extra_tokens = set(rel_tokens) ^ set(cand_tokens)
+        if extra_tokens & _SEQUEL_SUBTITLE_TOKENS:
+            continue
+        if _token_jaccard(canon_rel, canon_cand) >= 0.75:
             return True
         # Handle subtitle/article drops when >= 2 significant tokens match completely
-        cand_tokens = norm_cand.split()
+        # and installment/sequel signatures agree.
         if len(rel_tokens) >= 2 and len(cand_tokens) >= 2:
             shorter, longer = (
                 (rel_tokens, cand_tokens)
@@ -156,6 +296,7 @@ class TmdbMovieRecord:
     imdb_id: Optional[str] = None
     runtime_minutes: Optional[int] = None
     poster_path: Optional[str] = None
+    director: Optional[str] = None
 
     def all_titles(self) -> list[str]:
         out = [self.title]
@@ -283,7 +424,7 @@ class TmdbIndependentClient:
         if data is None:
             data = await self._get_json(
                 f"/movie/{tmdb_id}",
-                params={"append_to_response": "external_ids,alternative_titles"},
+                params={"append_to_response": "external_ids,alternative_titles,credits"},
             )
             if data is not None:
                 await self._cached_set(cache_key, data)
@@ -319,6 +460,15 @@ class TmdbIndependentClient:
                     if isinstance(item, dict) and isinstance(item.get("title"), str) and item["title"].strip():
                         alt_titles_list.append(item["title"].strip())
 
+        directors: list[str] = []
+        credits_obj = data.get("credits")
+        if isinstance(credits_obj, dict):
+            for member in credits_obj.get("crew") or []:
+                if isinstance(member, dict) and member.get("job") == "Director":
+                    name = str(member.get("name") or "").strip()
+                    if name and name not in directors:
+                        directors.append(name)
+
         poster_path = str(data.get("poster_path") or "").strip() or None
         return TmdbMovieRecord(
             tmdb_id=int(data["id"]),
@@ -329,6 +479,7 @@ class TmdbIndependentClient:
             imdb_id=imdb_id,
             runtime_minutes=runtime_minutes,
             poster_path=poster_path,
+            director=", ".join(directors) if directors else None,
         )
 
     async def find_movies_by_imdb_id(self, imdb_id: str) -> Optional[list[int]]:
