@@ -10,6 +10,12 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 
+HEALTH_WAIT_SECONDS="${HEALTH_WAIT_SECONDS:-60}"
+if [[ ! "$HEALTH_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || (( HEALTH_WAIT_SECONDS > 300 )); then
+  echo "Error: HEALTH_WAIT_SECONDS must be an integer between 1 and 300 (got '${HEALTH_WAIT_SECONDS}')." >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$HOME/apps/movie-triage-api"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
@@ -266,18 +272,25 @@ systemctl --user restart "$SERVICE_NAME"
 wait_for_health() {
   local svc_name="$1"
   local port="$2"
-  local attempt body
-  for attempt in $(seq 1 15); do
+  local start_ts="$SECONDS"
+  local body
+  while true; do
     if port_owned_by_service "$port" "$svc_name"; then
       if body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
         if python3 "$SCRIPT_DIR/deploy/port_check.py" verify-health --role triage --port "$port" <<< "$body"; then
           return 0
         fi
       fi
+    elif command -v systemctl >/dev/null 2>&1 && systemctl --user is-failed --quiet "$svc_name" 2>/dev/null; then
+      echo "Error: ${svc_name} entered failed state before passing /health on 127.0.0.1:${port}. Inspect: journalctl --user -u ${svc_name} -n 50" >&2
+      return 1
+    fi
+    if (( SECONDS - start_ts >= HEALTH_WAIT_SECONDS )); then
+      break
     fi
     sleep 1
   done
-  echo "Error: ${svc_name} did not pass PID-verified loopback /health on 127.0.0.1:${port}. Inspect: journalctl --user -u ${svc_name} -n 50" >&2
+  echo "Error: ${svc_name} did not pass PID-verified loopback /health on 127.0.0.1:${port} within ${HEALTH_WAIT_SECONDS}s. Inspect: journalctl --user -u ${svc_name} -n 50" >&2
   return 1
 }
 
