@@ -15,7 +15,7 @@ APP_DIR="$HOME/apps/movie-triage-api"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 SERVICE_NAME="movie-triage-api.service"
 
-for required_file in main.py db.py schemas.py tmdb_client.py gemini_client.py requirements.txt taste_profile.txt; do
+for required_file in main.py db.py schemas.py tmdb_client.py gemini_client.py requirements.txt taste_profile.txt deploy/port_check.py; do
   if [[ ! -f "$SCRIPT_DIR/$required_file" ]]; then
     echo "Error: Missing $required_file next to deploy-ultra.sh. Run from the repository checkout." >&2
     exit 1
@@ -52,17 +52,51 @@ except OSError:
 PYEOF
 }
 
+port_listening() {
+  local p="$1"
+  python3 "$SCRIPT_DIR/deploy/port_check.py" is-listening "$p"
+}
+
+port_owned_by_service() {
+  local p="$1"
+  local svc_name="$2"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! systemctl --user is-active --quiet "$svc_name" 2>/dev/null; then
+    return 1
+  fi
+  local main_pid
+  main_pid="$(systemctl --user show -p MainPID --value "$svc_name" 2>/dev/null || true)"
+  if [[ ! "$main_pid" =~ ^[0-9]+$ ]] || (( main_pid <= 0 )); then
+    return 1
+  fi
+  python3 "$SCRIPT_DIR/deploy/port_check.py" owned-by-pid "$p" "$main_pid"
+}
+
+port_claimed_by_other_unit() {
+  local p="$1"
+  local ignore_unit="${2:-}"
+  if [[ -d "$SYSTEMD_DIR" ]]; then
+    local unit_file
+    for unit_file in "$SYSTEMD_DIR"/*.service "$SYSTEMD_DIR"/*.socket; do
+      [[ -f "$unit_file" ]] || continue
+      if [[ -n "$ignore_unit" && "$(basename "$unit_file")" == "$ignore_unit" ]]; then
+        continue
+      fi
+      if grep -qsE "(--port[[:space:]=]+|127\.0\.0\.1:|ListenStream=.*:)${p}([^0-9]|$)" "$unit_file"; then
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
 port_in_use() {
   local p="$1"
-  if command -v ss >/dev/null 2>&1; then
-    if ss -tlnH 2>/dev/null | grep -Eq "[:.]${p}[[:space:]]"; then
-      return 0
-    fi
-  fi
-  if [[ -d "$SYSTEMD_DIR" ]]; then
-    if grep -RqsE "(--port[[:space:]=]+|127\.0\.0\.1:|ListenStream=.*:)${p}([^0-9]|$)" "$SYSTEMD_DIR"/*.service "$SYSTEMD_DIR"/*.socket 2>/dev/null; then
-      return 0
-    fi
+  local ignore_unit="${2:-}"
+  if port_listening "$p" || port_claimed_by_other_unit "$p" "$ignore_unit"; then
+    return 0
   fi
   return 1
 }
@@ -77,8 +111,8 @@ fi
 echo "[1/6] Finding an unassigned Ultra.cc port via app-ports free..."
 CHOSEN_PORT=""
 if [[ -n "${PORT:-}" ]]; then
-  if [[ ! "$PORT" =~ ^[0-9]{4,5}$ ]]; then
-    echo "Error: PORT must be a 4-5 digit TCP port number." >&2
+  if [[ ! "$PORT" =~ ^[0-9]{4,5}$ ]] || (( PORT < 1024 || PORT > 65535 )); then
+    echo "Error: PORT must be a TCP port number between 1024 and 65535." >&2
     exit 1
   fi
   CHOSEN_PORT="$PORT"
@@ -87,16 +121,25 @@ else
     echo "Error: 'app-ports' command not found. Run this on your Ultra.cc seedbox or pass PORT=<port>." >&2
     exit 1
   fi
+  APP_PORTS_RAW="$(app-ports free 2>/dev/null || true)"
   while read -r candidate; do
-    if [[ -n "$candidate" ]] && ! port_in_use "$candidate"; then
+    if [[ -n "$candidate" ]] && ! port_in_use "$candidate" "$SERVICE_NAME"; then
       CHOSEN_PORT="$candidate"
       break
     fi
-  done < <(app-ports free | grep -Eo '[0-9]{4,5}' || true)
+  done < <(python3 "$SCRIPT_DIR/deploy/port_check.py" parse-app-ports <<< "$APP_PORTS_RAW")
 fi
 
 if [[ -z "$CHOSEN_PORT" ]]; then
   echo "Error: Could not find an unused port from 'app-ports free'." >&2
+  exit 1
+fi
+if port_claimed_by_other_unit "$CHOSEN_PORT" "$SERVICE_NAME"; then
+  echo "Error: PORT ($CHOSEN_PORT) is already configured in another user systemd unit." >&2
+  exit 1
+fi
+if port_listening "$CHOSEN_PORT" && ! port_owned_by_service "$CHOSEN_PORT" "$SERVICE_NAME"; then
+  echo "Error: PORT ($CHOSEN_PORT) is already listening under another process on this host." >&2
   exit 1
 fi
 echo "Selected local port: $CHOSEN_PORT"
@@ -114,6 +157,13 @@ if [[ -z "${GEMINI_API_KEY:-}" ]]; then
   exit 1
 fi
 
+if [[ -z "${GEMINI_MODEL:-}" && ! -L "$APP_DIR/.env" && -f "$APP_DIR/.env" ]]; then
+  GEMINI_MODEL="$(read_existing_env_key "$APP_DIR/.env" "GEMINI_MODEL")"
+fi
+if [[ -z "${CACHE_TTL_HOURS:-}" && ! -L "$APP_DIR/.env" && -f "$APP_DIR/.env" ]]; then
+  CACHE_TTL_HOURS="$(read_existing_env_key "$APP_DIR/.env" "CACHE_TTL_HOURS")"
+fi
+
 if [[ -z "${INTERNAL_API_SECRET:-}" && ! -L "$APP_DIR/.env" && -f "$APP_DIR/.env" ]]; then
   INTERNAL_API_SECRET="$(read_existing_env_key "$APP_DIR/.env" "INTERNAL_API_SECRET")"
 fi
@@ -125,26 +175,33 @@ if [[ -z "${TMDB_API_KEY:-}" && ! -L "$APP_DIR/.env" && -f "$APP_DIR/.env" ]]; t
   TMDB_API_KEY="$(read_existing_env_key "$APP_DIR/.env" "TMDB_API_KEY")"
 fi
 
-echo "[2/6] Copying microservice files into $APP_DIR..."
-mkdir -p "$APP_DIR" "$SYSTEMD_DIR"
-mkdir -m 700 -p "$APP_DIR/data"
-chmod 700 "$APP_DIR/data"
+refuse_symlink() {
+  local target_path="$1"
+  if [[ -L "$target_path" ]]; then
+    echo "Error: Refusing symlinked path: $target_path" >&2
+    exit 1
+  fi
+}
 
-install -m 600 "$SCRIPT_DIR/main.py" "$APP_DIR/main.py"
-install -m 600 "$SCRIPT_DIR/db.py" "$APP_DIR/db.py"
-install -m 600 "$SCRIPT_DIR/schemas.py" "$APP_DIR/schemas.py"
-install -m 600 "$SCRIPT_DIR/tmdb_client.py" "$APP_DIR/tmdb_client.py"
-install -m 600 "$SCRIPT_DIR/gemini_client.py" "$APP_DIR/gemini_client.py"
-install -m 600 "$SCRIPT_DIR/requirements.txt" "$APP_DIR/requirements.txt"
-if [[ ! -f "$APP_DIR/taste_profile.txt" ]]; then
+echo "[2/6] Copying microservice files into $APP_DIR..."
+umask 077
+for dir_path in "$HOME/apps" "$APP_DIR" "$APP_DIR/data" "$SYSTEMD_DIR"; do
+  refuse_symlink "$dir_path"
+done
+mkdir -m 700 -p "$APP_DIR" "$APP_DIR/data" "$SYSTEMD_DIR"
+chmod 700 "$APP_DIR" "$APP_DIR/data"
+
+for f in main.py db.py schemas.py tmdb_client.py gemini_client.py requirements.txt; do
+  refuse_symlink "$APP_DIR/$f"
+  install -m 600 "$SCRIPT_DIR/$f" "$APP_DIR/$f"
+done
+if [[ ! -e "$APP_DIR/taste_profile.txt" ]]; then
+  refuse_symlink "$APP_DIR/taste_profile.txt"
   install -m 600 "$SCRIPT_DIR/taste_profile.txt" "$APP_DIR/taste_profile.txt"
 fi
 
 echo "[3/6] Writing locked-down .env (chmod 600)..."
-if [[ -L "$APP_DIR/.env" ]]; then
-  echo "Error: Refusing to overwrite symlinked $APP_DIR/.env" >&2
-  exit 1
-fi
+refuse_symlink "$APP_DIR/.env"
 (
   umask 077
   ENV_TMP="$(mktemp "$APP_DIR/.env.tmp.XXXXXX")"
@@ -167,8 +224,20 @@ python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
 
-echo "[5/6] Configuring and starting userland systemd unit..."
-cat <<EOF_UNIT > "$SYSTEMD_DIR/$SERVICE_NAME"
+echo "[5/6] Configuring and restarting userland systemd unit..."
+write_unit_atomic() {
+  local unit_path="$1"
+  refuse_symlink "$SYSTEMD_DIR"
+  refuse_symlink "$unit_path"
+  local tmp_unit
+  tmp_unit="$(mktemp "${unit_path}.tmp.XXXXXX")"
+  if ! cat > "$tmp_unit" || ! chmod 600 "$tmp_unit" || ! mv -f "$tmp_unit" "$unit_path"; then
+    rm -f "$tmp_unit"
+    return 1
+  fi
+}
+
+write_unit_atomic "$SYSTEMD_DIR/$SERVICE_NAME" <<EOF_UNIT
 [Unit]
 Description=Local-only Movie Triage FastAPI Microservice
 After=network-online.target
@@ -180,7 +249,7 @@ WorkingDirectory=%h/apps/movie-triage-api
 EnvironmentFile=%h/apps/movie-triage-api/.env
 UMask=0077
 NoNewPrivileges=true
-ExecStart=%h/apps/movie-triage-api/.venv/bin/uvicorn main:app --host 127.0.0.1 --port ${CHOSEN_PORT}
+ExecStart=%h/apps/movie-triage-api/.venv/bin/uvicorn main:app --host 127.0.0.1 --port ${CHOSEN_PORT} --no-access-log
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -191,9 +260,26 @@ WantedBy=default.target
 EOF_UNIT
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$SERVICE_NAME"
-sleep 2
-systemctl --user status "$SERVICE_NAME" --no-pager
+systemctl --user enable "$SERVICE_NAME"
+systemctl --user restart "$SERVICE_NAME"
+
+wait_for_health() {
+  local svc_name="$1"
+  local port="$2"
+  local attempt body
+  for attempt in $(seq 1 15); do
+    if port_owned_by_service "$port" "$svc_name"; then
+      if body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
+        if python3 "$SCRIPT_DIR/deploy/port_check.py" verify-health --role triage --port "$port" <<< "$body"; then
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+  done
+  echo "Error: ${svc_name} did not pass PID-verified loopback /health on 127.0.0.1:${port}. Inspect: journalctl --user -u ${svc_name} -n 50" >&2
+  return 1
+}
 
 smoke_post_evaluate() {
   local payload="$1"
@@ -216,10 +302,10 @@ with urllib.request.urlopen(req, timeout=90) as resp:
 ' <<< "$payload"
 }
 
-echo "[6/6] Running live smoke tests against http://127.0.0.1:${CHOSEN_PORT}..."
+echo "[6/6] Running PID-verified health and live smoke tests against http://127.0.0.1:${CHOSEN_PORT}..."
 echo ""
-echo "--- Smoke Test 1: GET /health ---"
-curl -sS "http://127.0.0.1:${CHOSEN_PORT}/health" | python3 -m json.tool
+echo "--- Smoke Test 1: PID-verified GET /health ---"
+wait_for_health "$SERVICE_NAME" "$CHOSEN_PORT"
 
 echo ""
 echo "--- Smoke Test 2: POST /evaluate (La Chimera, expect cached: false) ---"
