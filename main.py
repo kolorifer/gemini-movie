@@ -121,8 +121,10 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             hint_year=payload.hint_year,
             extra_context=payload.extra_context,
             quality_key=release_quality.cache_key,
+            edition_key=release_quality.edition_key,
             evidence_key=evidence_key,
             allow_imdb_lookup=False,
+            allow_release_key_fallback=False,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached is not None:
@@ -132,7 +134,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     tmdb_movie = lookup.movie
 
     # Cross-language/alias cache check ONLY when TMDB lookup had no tracker conflict
-    # and both quality tier and supplemental evidence digest match.
+    # and quality tier, edition, and supplemental evidence digest all match.
     if (
         not payload.force_refresh
         and lookup.trusted_for_cache
@@ -146,8 +148,10 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             hint_year=tmdb_movie.year,
             extra_context=tmdb_movie.imdb_id,
             quality_key=release_quality.cache_key,
+            edition_key=release_quality.edition_key,
             evidence_key=evidence_key,
             allow_imdb_lookup=True,
+            allow_release_key_fallback=False,
             ttl_hours=CACHE_TTL_HOURS,
         )
         if cached_by_imdb is not None:
@@ -172,22 +176,34 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     except GeminiClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    pre_conflict_tmdb = None
     if tmdb_client.enabled and (
         tmdb_movie is None or not is_tmdb_compatible(result.identification, tmdb_movie)
     ):
-        tmdb_movie = await tmdb_client.verify_identification(result.identification)
+        if tmdb_movie is not None and not is_tmdb_compatible(result.identification, tmdb_movie):
+            pre_conflict_tmdb = tmdb_movie
+        verified_candidate = await tmdb_client.verify_identification(result.identification)
+        tmdb_movie = verified_candidate if verified_candidate is not None else pre_conflict_tmdb
 
     verified_result = apply_tmdb_verification(result, tmdb_movie)
     result_dict = verified_result.model_dump()
-    await asyncio.to_thread(
-        db.save_evaluation,
-        payload.raw_text,
-        result_dict,
-        hint_title=payload.hint_title,
-        hint_year=payload.hint_year,
-        quality_key=release_quality.cache_key,
-        evidence_key=evidence_key,
+
+    # Withhold caching when catalogue verification found an unresolved incompatibility
+    has_catalogue_conflict = bool(
+        verified_result.catalogue_identification is not None
+        and not verified_result.catalogue_identification.compatible
     )
+    if not has_catalogue_conflict:
+        await asyncio.to_thread(
+            db.save_evaluation,
+            payload.raw_text,
+            result_dict,
+            hint_title=payload.hint_title,
+            hint_year=payload.hint_year,
+            quality_key=release_quality.cache_key,
+            edition_key=release_quality.edition_key,
+            evidence_key=evidence_key,
+        )
     return EvaluateResponse(cached=False, **result_dict)
 
 
@@ -200,6 +216,7 @@ async def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
     total = await asyncio.to_thread(
         db.add_feedback,
         imdb_id=payload.imdb_id,
+        tmdb_id=payload.tmdb_id,
         title=payload.title,
         decision=payload.decision,
         note=payload.note,

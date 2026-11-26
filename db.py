@@ -191,6 +191,56 @@ def _detect_dv_profile_and_el(
     return dv_profile, None, None
 
 
+_EDITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("directors_cut", re.compile(r"(?<![a-z0-9])(?:director['’]?s?[\s._-]*cut|dir[\s._-]*cut)(?![a-z0-9])", re.IGNORECASE)),
+    ("extended", re.compile(r"(?<![a-z0-9])(?:extended(?:[\s._-]*(?:cut|edition|version))?)(?![a-z0-9])", re.IGNORECASE)),
+    ("theatrical", re.compile(r"(?<![a-z0-9])(?:theatrical(?:[\s._-]*(?:cut|edition|version))?)(?![a-z0-9])", re.IGNORECASE)),
+    ("final_cut", re.compile(r"(?<![a-z0-9])final[\s._-]*cut(?![a-z0-9])", re.IGNORECASE)),
+    ("ultimate_cut", re.compile(r"(?<![a-z0-9])ultimate[\s._-]*(?:cut|edition)(?![a-z0-9])", re.IGNORECASE)),
+    ("assembly_cut", re.compile(r"(?<![a-z0-9])assembly[\s._-]*cut(?![a-z0-9])", re.IGNORECASE)),
+    ("alternate_cut", re.compile(r"(?<![a-z0-9])alternate[\s._-]*(?:cut|edition|ending)(?![a-z0-9])", re.IGNORECASE)),
+    ("special_edition", re.compile(r"(?<![a-z0-9])special[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("collectors_edition", re.compile(r"(?<![a-z0-9])collector['’]?s?[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("anniversary_edition", re.compile(r"(?<![a-z0-9])(?:\d{1,2}(?:th|st|nd|rd)[\s._-]*)?anniversary[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("unrated", re.compile(r"(?<![a-z0-9])unrated(?![a-z0-9])", re.IGNORECASE)),
+    ("uncut", re.compile(r"(?<![a-z0-9])uncut(?![a-z0-9])", re.IGNORECASE)),
+    ("redux", re.compile(r"(?<![a-z0-9])redux(?![a-z0-9])", re.IGNORECASE)),
+    ("workprint", re.compile(r"(?<![a-z0-9])workprint(?![a-z0-9])", re.IGNORECASE)),
+    ("roadshow", re.compile(r"(?<![a-z0-9])roadshow(?![a-z0-9])", re.IGNORECASE)),
+    ("open_matte", re.compile(r"(?<![a-z0-9])open[\s._-]*matte(?![a-z0-9])", re.IGNORECASE)),
+    ("imax", re.compile(r"(?<![a-z0-9])imax(?:[\s._-]*enhanced)?(?![a-z0-9])", re.IGNORECASE)),
+    ("criterion", re.compile(r"(?<![a-z0-9])criterion(?![a-z0-9])", re.IGNORECASE)),
+    ("remastered", re.compile(r"(?<![a-z0-9])remastered(?![a-z0-9])", re.IGNORECASE)),
+    ("restored", re.compile(r"(?<![a-z0-9])restored(?![a-z0-9])", re.IGNORECASE)),
+)
+_DC_TOKEN_RE = re.compile(r"(?<![a-z0-9])dc(?![a-z0-9])", re.IGNORECASE)
+
+
+def extract_edition_key(raw_text: str) -> str:
+    """
+    Extract canonical sorted edition/cut markers from the release string's post-year/tag section
+    so theatrical, extended, director's cut, unrated, IMAX, Criterion, etc. never collide in cache.
+    """
+    text = _TRAILING_EXT_RE.sub("", (raw_text or "").strip())
+    if not text:
+        return ""
+    # Focus on post-year text when a release year is present so title words are not misread as editions
+    tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", text) if t]
+    search_text = text
+    for idx in range(len(tokens) - 1, 0, -1):
+        if YEAR_RE.match(tokens[idx]):
+            search_text = " ".join(tokens[idx + 1 :])
+            break
+
+    found: list[str] = []
+    for label, pattern in _EDITION_PATTERNS:
+        if pattern.search(search_text):
+            found.append(label)
+    if "directors_cut" not in found and search_text != text and _DC_TOKEN_RE.search(search_text):
+        found.append("directors_cut")
+    return "+".join(sorted(set(found)))
+
+
 @dataclass(frozen=True)
 class ReleaseQuality:
     resolution: Optional[str] = None
@@ -204,6 +254,7 @@ class ReleaseQuality:
     format_label: str = "unknown"
     release_group: Optional[str] = None
     is_favorite_group: bool = False
+    edition_key: str = ""
     cache_key: str = ""
 
     def to_prompt_line(self) -> Optional[str]:
@@ -365,6 +416,8 @@ def parse_release_quality(
             parts.append(f"fav_{release_group.lower()}")
         cache_key = "_".join(parts)
 
+    edition_key = extract_edition_key(raw_text)
+
     return ReleaseQuality(
         resolution=detected_res,
         is_remux=is_remux,
@@ -377,6 +430,7 @@ def parse_release_quality(
         format_label=format_label,
         release_group=release_group,
         is_favorite_group=is_favorite_group,
+        edition_key=edition_key,
         cache_key=cache_key,
     )
 
@@ -598,6 +652,7 @@ class TriageDB:
                     raw_text_normalized TEXT NOT NULL,
                     release_key TEXT,
                     quality_key TEXT NOT NULL DEFAULT '',
+                    edition_key TEXT NOT NULL DEFAULT '',
                     evidence_key TEXT NOT NULL DEFAULT '',
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
@@ -623,6 +678,7 @@ class TriageDB:
                 CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     imdb_id TEXT,
+                    tmdb_id INTEGER,
                     title TEXT NOT NULL,
                     decision TEXT NOT NULL CHECK (decision IN ('WATCH', 'MAYBE', 'SKIP')),
                     note TEXT,
@@ -633,18 +689,29 @@ class TriageDB:
                     ON feedback (created_at DESC, id DESC);
                 """
             )
-            cols = {
+            eval_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
             }
-            if "quality_key" not in cols:
+            if "quality_key" not in eval_cols:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN quality_key TEXT NOT NULL DEFAULT ''"
                 )
-            if "evidence_key" not in cols:
+            if "edition_key" not in eval_cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN edition_key TEXT NOT NULL DEFAULT ''"
+                )
+            if "evidence_key" not in eval_cols:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN evidence_key TEXT NOT NULL DEFAULT ''"
                 )
+            fb_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(feedback)").fetchall()
+            }
+            if "tmdb_id" not in fb_cols:
+                conn.execute("ALTER TABLE feedback ADD COLUMN tmdb_id INTEGER")
+
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_quality
@@ -659,20 +726,32 @@ class TriageDB:
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_raw_qual_ev
-                    ON evaluations (raw_text_normalized, quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_raw_qual_ed_ev
+                    ON evaluations (raw_text_normalized, quality_key, edition_key, evidence_key, created_at DESC)
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_qual_ev
-                    ON evaluations (lower(imdb_id), quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_qual_ed_ev
+                    ON evaluations (lower(imdb_id), quality_key, edition_key, evidence_key, created_at DESC)
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_qual_ev
-                    ON evaluations (release_key, quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_qual_ed_ev
+                    ON evaluations (release_key, quality_key, edition_key, evidence_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feedback_imdb_id
+                    ON feedback (lower(imdb_id))
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feedback_tmdb_id
+                    ON feedback (tmdb_id)
                 """
             )
         self._harden_db_file_permissions()
@@ -685,8 +764,10 @@ class TriageDB:
         hint_year: Optional[int] = None,
         extra_context: Optional[str] = None,
         quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
         evidence_key: str = "",
         allow_imdb_lookup: bool = True,
+        allow_release_key_fallback: bool = True,
         ttl_hours: int = 72,
     ) -> Optional[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
@@ -700,11 +781,9 @@ class TriageDB:
             tail = rel_key.rsplit(" ", 1)[-1]
             if YEAR_RE.match(tail):
                 query_year = int(tail)
-        q_key = (
-            quality_key
-            if quality_key is not None
-            else parse_release_quality(raw_text).cache_key
-        )
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
         ev_key = (evidence_key or "").strip()
 
         with self._connect() as conn:
@@ -712,11 +791,11 @@ class TriageDB:
                 """
                 SELECT response_json, year
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                WHERE raw_text_normalized = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, q_key, ev_key, cutoff),
+                (norm_raw, q_key, ed_key, ev_key, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
@@ -724,27 +803,27 @@ class TriageDB:
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), q_key, ev_key, cutoff),
+                    (imdb_id.lower(), q_key, ed_key, ev_key, cutoff),
                 ).fetchone()
                 if candidate is not None:
                     cached_year = int(candidate["year"])
                     if query_year is None or abs(cached_year - query_year) <= 1:
                         row = candidate
 
-            if row is None and rel_key:
+            if row is None and allow_release_key_fallback and rel_key:
                 row = conn.execute(
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE release_key = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE release_key = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, q_key, ev_key, cutoff),
+                    (rel_key, q_key, ed_key, ev_key, cutoff),
                 ).fetchone()
 
         if row is None:
@@ -760,6 +839,7 @@ class TriageDB:
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
         quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
         evidence_key: str = "",
         created_at: Optional[str] = None,
     ) -> None:
@@ -776,30 +856,28 @@ class TriageDB:
             normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
             or canonical_release_key(canonical_title, year)
         )
-        q_key = (
-            quality_key
-            if quality_key is not None
-            else parse_release_quality(raw_text).cache_key
-        )
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
         ev_key = (evidence_key or "").strip()
         ts = created_at or utc_now_iso()
         serialized = json.dumps(payload, ensure_ascii=False)
 
         with self._connect() as conn:
-            # Replace superseded entries for the same movie, quality tier, AND evidence digest
+            # Replace superseded entries for the same movie, quality tier, edition, AND evidence digest
             conn.execute(
-                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ?",
-                (norm_raw, q_key, ev_key),
+                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                (norm_raw, q_key, ed_key, ev_key),
             )
             if imdb_id:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ?",
-                    (imdb_id, q_key, ev_key),
+                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                    (imdb_id, q_key, ed_key, ev_key),
                 )
             elif rel_key:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ? AND evidence_key = ?",
-                    (rel_key, q_key, ev_key),
+                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                    (rel_key, q_key, ed_key, ev_key),
                 )
 
             conn.execute(
@@ -808,6 +886,7 @@ class TriageDB:
                     raw_text_normalized,
                     release_key,
                     quality_key,
+                    edition_key,
                     evidence_key,
                     raw_text_original,
                     imdb_id,
@@ -816,12 +895,13 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
                     rel_key,
                     q_key,
+                    ed_key,
                     ev_key,
                     raw_text,
                     imdb_id,
@@ -872,6 +952,7 @@ class TriageDB:
         self,
         *,
         imdb_id: Optional[str],
+        tmdb_id: Optional[int] = None,
         title: str,
         decision: str,
         note: Optional[str],
@@ -879,26 +960,45 @@ class TriageDB:
     ) -> int:
         ts = created_at or utc_now_iso()
         clean_imdb = imdb_id.strip().lower() if imdb_id and imdb_id.strip() else None
+        clean_tmdb = (
+            int(tmdb_id)
+            if isinstance(tmdb_id, int) and not isinstance(tmdb_id, bool) and tmdb_id > 0
+            else None
+        )
         clean_title = title.strip()
         clean_decision = decision.strip().upper()
         clean_note = note.strip() if note and note.strip() else None
         with self._connect() as conn:
-            if clean_imdb:
+            if clean_imdb and clean_tmdb is not None:
                 conn.execute(
-                    "DELETE FROM feedback WHERE lower(imdb_id) = ?",
+                    """
+                    DELETE FROM feedback
+                    WHERE (imdb_id IS NOT NULL AND lower(imdb_id) = ?)
+                       OR (tmdb_id = ? AND (imdb_id IS NULL OR lower(imdb_id) = ?))
+                    """,
+                    (clean_imdb, clean_tmdb, clean_imdb),
+                )
+            elif clean_imdb:
+                conn.execute(
+                    "DELETE FROM feedback WHERE imdb_id IS NOT NULL AND lower(imdb_id) = ?",
                     (clean_imdb,),
+                )
+            elif clean_tmdb is not None:
+                conn.execute(
+                    "DELETE FROM feedback WHERE tmdb_id = ?",
+                    (clean_tmdb,),
                 )
             else:
                 conn.execute(
-                    "DELETE FROM feedback WHERE imdb_id IS NULL AND lower(trim(title)) = ?",
+                    "DELETE FROM feedback WHERE imdb_id IS NULL AND tmdb_id IS NULL AND lower(trim(title)) = ?",
                     (clean_title.lower(),),
                 )
             conn.execute(
                 """
-                INSERT INTO feedback (imdb_id, title, decision, note, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO feedback (imdb_id, tmdb_id, title, decision, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (clean_imdb, clean_title, clean_decision, clean_note, ts),
+                (clean_imdb, clean_tmdb, clean_title, clean_decision, clean_note, ts),
             )
             row = conn.execute("SELECT COUNT(*) AS cnt FROM feedback").fetchone()
             return int(row["cnt"]) if row else 0
@@ -908,7 +1008,7 @@ class TriageDB:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, imdb_id, title, decision, note, created_at
+                SELECT id, imdb_id, tmdb_id, title, decision, note, created_at
                 FROM feedback
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?

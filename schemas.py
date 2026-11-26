@@ -100,21 +100,62 @@ class Identification(BaseModel):
     )
 
 
+class ModelIdentificationSnapshot(BaseModel):
+    canonical_title: str
+    original_title: Optional[str] = None
+    year: int
+    director: str
+    imdb_id: Optional[str] = None
+    tmdb_id: Optional[int] = None
+
+
+class CatalogueIdentification(BaseModel):
+    source: Literal["tmdb"] = "tmdb"
+    canonical_title: str
+    original_title: Optional[str] = None
+    year: Optional[int] = None
+    director: Optional[str] = None
+    imdb_id: Optional[str] = None
+    tmdb_id: int
+    runtime_minutes: Optional[int] = None
+    compatible: bool = True
+    conflict_reason: Optional[str] = None
+
+
 class Ratings(BaseModel):
     rotten_tomatoes_critics: Optional[int] = Field(
-        default=None, description="Tomatometer critics percentage (0-100) or null if unverified"
+        default=None,
+        ge=0,
+        le=100,
+        description="Tomatometer critics percentage (0-100) or null if unverified",
     )
     rotten_tomatoes_audience: Optional[int] = Field(
-        default=None, description="Popcornmeter audience percentage (0-100) or null if unverified"
+        default=None,
+        ge=0,
+        le=100,
+        description="Popcornmeter audience percentage (0-100) or null if unverified",
     )
     metacritic: Optional[int] = Field(
-        default=None, description="Metascore (0-100) or null if unverified"
+        default=None,
+        ge=0,
+        le=100,
+        description="Metascore (0-100) or null if unverified",
     )
     imdb: Optional[float] = Field(
-        default=None, description="IMDb rating out of 10 (e.g. 7.4) or null if unverified"
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description="IMDb rating out of 10 (0.0-10.0) or null if unverified",
     )
     letterboxd: Optional[float] = Field(
-        default=None, description="Letterboxd rating out of 5 (e.g. 3.9) or null if unverified"
+        default=None,
+        ge=0.0,
+        le=5.0,
+        description="Letterboxd rating out of 5 (0.0-5.0) or null if unverified",
+    )
+    sources: dict[str, str] = Field(
+        default_factory=dict,
+        description="Verified supporting grounding source (domain/label) per shown rating key",
     )
     missing_sources: list[str] = Field(
         default_factory=list,
@@ -152,6 +193,14 @@ class EvaluationPayload(BaseModel):
     ratings: Ratings
     recognition: Recognition
     decision_aid: DecisionAid
+    model_identification: Optional[ModelIdentificationSnapshot] = Field(
+        default=None,
+        description="Original model-produced identification preserved separately from catalogue enrichment",
+    )
+    catalogue_identification: Optional[CatalogueIdentification] = Field(
+        default=None,
+        description="Independent catalogue (TMDB) identification and compatibility verdict",
+    )
 
 
 class EvaluateResponse(EvaluationPayload):
@@ -162,10 +211,21 @@ class FeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     imdb_id: Optional[str] = Field(default=None, description="IMDb ID if known (e.g. tt14561712)")
-    tmdb_id: Optional[int] = Field(default=None, description="Optional TMDB movie ID")
+    tmdb_id: Optional[int] = Field(default=None, ge=1, description="Optional TMDB movie ID")
     title: str = Field(..., min_length=1, description="Movie title")
     decision: FeedbackDecision = Field(..., description="User decision: watch or skip (case-insensitive)")
     note: Optional[str] = Field(default=None, description="Optional personal note explaining why")
+
+    @field_validator("imdb_id", mode="before")
+    @classmethod
+    def _clean_imdb_id(cls, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if _IMDB_ID_RE.fullmatch(text):
+                return text
+        return None
 
     @field_validator("decision", mode="before")
     @classmethod
@@ -184,6 +244,7 @@ class FeedbackResponse(BaseModel):
 class FeedbackItem(BaseModel):
     id: int
     imdb_id: Optional[str] = None
+    tmdb_id: Optional[int] = None
     title: str
     decision: FeedbackDecision
     note: Optional[str] = None

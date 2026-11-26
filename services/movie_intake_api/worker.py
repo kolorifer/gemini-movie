@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import timedelta
 from typing import Any, Optional
@@ -20,7 +21,14 @@ from .clients import (
 from .config import IntakeConfig
 from .db import IntakeDB, utc_now, utc_now_iso
 from .security import redact_secrets
-from .tmdb_verifier import IdentityGateResult, TmdbIndependentClient, TmdbMovieRecord, run_independent_identity_gate
+from .tmdb_verifier import (
+    IdentityGateResult,
+    TmdbIndependentClient,
+    TmdbMovieRecord,
+    _titles_match,
+    normalize_title,
+    run_independent_identity_gate,
+)
 from .torrentleech import (
     TL_TRANSIENT_FAILURE_OUTCOMES,
     TorrentLeechResult,
@@ -46,22 +54,100 @@ def compute_card_content_digest(card_payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _directors_match_full(a: Optional[str], b: Optional[str]) -> bool:
+    """Require full director name agreement (never match on shared first name alone)."""
+    if not a or not b:
+        return False
+
+    def _split_names(raw: str) -> list[list[str]]:
+        parts = re.split(r"\s*(?:,|&|\band\b|/)\s*", raw, flags=re.IGNORECASE)
+        out: list[list[str]] = []
+        for part in parts:
+            norm = normalize_title(part)
+            toks = [t for t in norm.split() if t]
+            if toks and norm not in ("unknown", "n a", "na", "none"):
+                out.append(toks)
+        return out
+
+    names_a = _split_names(a)
+    names_b = _split_names(b)
+    if not names_a or not names_b:
+        return False
+    for ta in names_a:
+        for tb in names_b:
+            if ta == tb:
+                return True
+            if len(ta) >= 2 and len(tb) >= 2 and ta[-1] == tb[-1] and len(ta[-1]) >= 2:
+                if ta[0] == tb[0] or (
+                    (len(ta[0]) == 1 or len(tb[0]) == 1) and ta[0][0] == tb[0][0]
+                ):
+                    return True
+    return False
+
+
 def _eval_contradicts_movie(eval_payload: Any, movie: TmdbMovieRecord) -> Optional[str]:
     if not isinstance(eval_payload, dict):
         return None
-    ident = eval_payload.get("identification")
-    if not isinstance(ident, dict):
+    cat_ident = eval_payload.get("catalogue_identification")
+    if isinstance(cat_ident, dict) and cat_ident.get("compatible") is False:
+        reason = str(cat_ident.get("conflict_reason") or "Evaluator catalogue verification reported incompatibility")
+        return f"Evaluator catalogue conflict: {reason}"
+
+    ident_blocks: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(eval_payload.get("identification"), dict):
+        ident_blocks.append(("identification", eval_payload["identification"]))
+    if isinstance(eval_payload.get("model_identification"), dict):
+        ident_blocks.append(("model_identification", eval_payload["model_identification"]))
+    if not ident_blocks:
         return None
-    ev_imdb = str(ident.get("imdb_id") or "").strip().lower() or None
-    ev_tmdb = ident.get("tmdb_id")
-    if ev_imdb and movie.imdb_id and ev_imdb != movie.imdb_id:
-        return f"Evaluator proposed {ev_imdb}, contradicting pre-verified {movie.imdb_id}"
-    if (
-        isinstance(ev_tmdb, int)
-        and not isinstance(ev_tmdb, bool)
-        and ev_tmdb != movie.tmdb_id
-    ):
-        return f"Evaluator proposed TMDB {ev_tmdb}, contradicting pre-verified TMDB {movie.tmdb_id}"
+
+    all_movie_titles = movie.all_titles()
+    for label, ident in ident_blocks:
+        ev_imdb = str(ident.get("imdb_id") or "").strip().lower() or None
+        ev_tmdb = ident.get("tmdb_id")
+        if ev_imdb and movie.imdb_id and ev_imdb != movie.imdb_id:
+            return f"Evaluator ({label}) proposed {ev_imdb}, contradicting pre-verified {movie.imdb_id}"
+        if (
+            isinstance(ev_tmdb, int)
+            and not isinstance(ev_tmdb, bool)
+            and ev_tmdb != movie.tmdb_id
+        ):
+            return f"Evaluator ({label}) proposed TMDB {ev_tmdb}, contradicting pre-verified TMDB {movie.tmdb_id}"
+
+        ev_year = ident.get("year")
+        if (
+            isinstance(ev_year, int)
+            and not isinstance(ev_year, bool)
+            and movie.year is not None
+            and abs(ev_year - movie.year) > 1
+        ):
+            return f"Evaluator ({label}) proposed year {ev_year}, contradicting pre-verified {movie.year}"
+
+        ev_titles = [
+            str(ident.get(k) or "").strip()
+            for k in ("canonical_title", "original_title")
+            if str(ident.get(k) or "").strip()
+            and str(ident.get(k) or "").strip().lower() not in ("unknown", "n/a")
+        ]
+        if ev_titles and all_movie_titles:
+            if not any(_titles_match(et, all_movie_titles) for et in ev_titles):
+                return (
+                    f"Evaluator ({label}) proposed title '{ev_titles[0]}', "
+                    f"contradicting pre-verified '{movie.title}'"
+                )
+
+        ev_dir = str(ident.get("director") or "").strip()
+        if (
+            ev_dir
+            and ev_dir.lower() not in ("unknown", "n/a", "none")
+            and movie.director
+            and not _directors_match_full(ev_dir, movie.director)
+        ):
+            return (
+                f"Evaluator ({label}) proposed director '{ev_dir}', "
+                f"contradicting pre-verified director '{movie.director}'"
+            )
+
     return None
 
 

@@ -3829,6 +3829,159 @@ Language : German
             self.assertIsNone(mig_row["last_card_digest"])
             self.assertEqual(mig_row["last_eval_reply_digest"], "full-dig-1")
 
+    def test_issue_13_3c_same_year_sequel_and_3b_intake_contradiction(self) -> None:
+        """
+        Issue #13 §3c & §3b regressions:
+          - Invented release 'North Crossing' (2021) with no listing IMDb ID MUST NOT pass Intake's
+            identity gate for 'North Crossing II' (2021); must land in evidence_review with 0 buttons.
+          - Sequel/part/numeral variants ('II', '2', 'Part 2', 'Chapter 2', 'III') never falsely match.
+          - Independently supported TMDB alias overrides cleanly.
+          - Downstream _eval_contradicts_movie catches title, year, director, model_identification,
+            and catalogue_identification conflicts (not just IDs).
+        """
+        from services.movie_intake_api.tmdb_verifier import _titles_match
+        from services.movie_intake_api.worker import _eval_contradicts_movie
+
+        # Unit matrix for sequel/part/numeral separation
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing II"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing 2"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing Part 2"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing Chapter 2"]))
+        self.assertFalse(_titles_match("North Crossing II", ["North Crossing III"]))
+        self.assertFalse(_titles_match("North Crossing Part 1", ["North Crossing Part 2"]))
+        # Equivalent numeral notations and explicit TMDB alias match
+        self.assertTrue(_titles_match("North Crossing 2", ["North Crossing II"]))
+        self.assertTrue(_titles_match("North Crossing Part Two", ["North Crossing Part 2"]))
+        self.assertTrue(_titles_match("North Crossing", ["North Crossing II", "North Crossing"]))
+
+        # End-to-end Intake pipeline: North Crossing (2021) without listing IMDb -> evaluator proposes North Crossing II (2021)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            sequel = TmdbMovieRecord(
+                tmdb_id=8820212,
+                title="North Crossing II",
+                original_title="North Crossing II",
+                year=2021,
+                imdb_id="tt8820212",
+                runtime_minutes=115,
+                director="Elena Rostova",
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {sequel.tmdb_id: sequel}, {sequel.imdb_id: [sequel.tmdb_id]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _ext, _n: TorrentLeechResult(
+                    outcome="listing_id_missing",
+                    imdb_id=None,
+                    file_runtime_minutes=115,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _body: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="North Crossing II",
+                        year=2021,
+                        imdb_id="tt8820212",
+                        tmdb_id=8820212,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                r = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="North.Crossing.2021.2160p.UHD.BluRay.REMUX-GROUP",
+                        external_id="882021",
+                        title="North Crossing",
+                        year=2021,
+                        meta_imdb=None,
+                        meta_tmdb=None,
+                    ),
+                )
+                self.assertEqual(r.status_code, 200)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                card = actions.card_calls[0]
+                self.assertEqual(card["delivery_kind"], "evidence_review")
+                self.assertEqual(card["identity_gate_status"], "evidence_review")
+                self.assertNotIn("verified_tmdb_id", card)
+                self.assertIn("does not match", str(card.get("conflict_reason") or "").lower())
+
+        # §3b downstream _eval_contradicts_movie checks beyond IDs
+        verified_film = TmdbMovieRecord(
+            tmdb_id=50202,
+            title="Silent Valley",
+            original_title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            runtime_minutes=104,
+            director="David Kowalski",
+        )
+        # Same IDs substituted onto wrong title/director -> MUST contradict!
+        swapped_eval = _make_eval_payload(
+            title="Paper Harbor",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        swapped_eval["identification"]["director"] = "David Mercer"
+        contradiction = _eval_contradicts_movie(swapped_eval, verified_film)
+        self.assertIsNotNone(contradiction)
+
+        # Same title/IDs but director shares only first name -> MUST contradict!
+        dir_mismatch_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        dir_mismatch_eval["identification"]["director"] = "David Mercer"
+        self.assertIsNotNone(_eval_contradicts_movie(dir_mismatch_eval, verified_film))
+
+        # Explicit catalogue_identification.compatible == False -> MUST contradict!
+        cat_conflict_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        cat_conflict_eval["identification"]["director"] = "David Kowalski"
+        cat_conflict_eval["catalogue_identification"] = {
+            "source": "tmdb",
+            "canonical_title": "Silent Valley",
+            "tmdb_id": 50202,
+            "compatible": False,
+            "conflict_reason": "contradictory TMDB IDs",
+        }
+        self.assertIsNotNone(_eval_contradicts_movie(cat_conflict_eval, verified_film))
+
+        # Agreeing title, year, director, and IDs -> None (no contradiction)
+        agree_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        agree_eval["identification"]["director"] = "David Kowalski"
+        self.assertIsNone(_eval_contradicts_movie(agree_eval, verified_film))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from db import RELEASE_STOP_TOKENS, YEAR_RE, extract_imdb_id
-from schemas import EvaluateRequest, EvaluationPayload, Identification, TorrentInfo
+from schemas import (
+    CatalogueIdentification,
+    EvaluateRequest,
+    EvaluationPayload,
+    Identification,
+    ModelIdentificationSnapshot,
+    TorrentInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +216,16 @@ class TmdbMovie:
     director: Optional[str] = None
     genres: list[str] = field(default_factory=list)
     original_language: Optional[str] = None
+    alternative_titles: tuple[str, ...] = ()
+
+    def all_titles(self) -> list[str]:
+        out = [self.canonical_title]
+        if self.original_title and self.original_title not in out:
+            out.append(self.original_title)
+        for alt in self.alternative_titles:
+            if alt and alt not in out:
+                out.append(alt)
+        return out
 
     def to_prompt_block(self) -> str:
         lines = [
@@ -231,6 +248,146 @@ class TmdbMovie:
         return "\n".join(lines)
 
 
+_ROMAN_TO_INT: dict[str, int] = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+    "xi": 11,
+    "xii": 12,
+}
+_WORD_TO_INT: dict[str, int] = {
+    "one": 1,
+    "first": 1,
+    "two": 2,
+    "second": 2,
+    "three": 3,
+    "third": 3,
+    "four": 4,
+    "fourth": 4,
+    "five": 5,
+    "fifth": 5,
+    "six": 6,
+    "sixth": 6,
+    "seven": 7,
+    "seventh": 7,
+    "eight": 8,
+    "eighth": 8,
+    "nine": 9,
+    "ninth": 9,
+    "ten": 10,
+    "tenth": 10,
+}
+_INSTALLMENT_PREFIXES = frozenset({"part", "pt", "chapter", "ch", "vol", "volume", "book", "act", "episode", "ep"})
+_SEQUEL_SUBTITLE_TOKENS = frozenset(
+    {
+        "part",
+        "pt",
+        "chapter",
+        "vol",
+        "volume",
+        "book",
+        "sequel",
+        "returns",
+        "reloaded",
+        "revolutions",
+        "resurrection",
+        "resurrections",
+        "begins",
+        "forever",
+        "revenge",
+        "rising",
+        "reborn",
+        "awakens",
+        "origins",
+        "redux",
+        "final",
+    }
+)
+
+
+def _extract_installment_signature(norm_title: str) -> tuple[int, ...]:
+    tokens = norm_title.split()
+    if not tokens:
+        return ()
+    markers: list[int] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _INSTALLMENT_PREFIXES and idx + 1 < len(tokens):
+            nxt = tokens[idx + 1]
+            if nxt.isdigit():
+                markers.append(int(nxt))
+                idx += 2
+                continue
+            if nxt in _ROMAN_TO_INT:
+                markers.append(_ROMAN_TO_INT[nxt])
+                idx += 2
+                continue
+            if nxt in _WORD_TO_INT:
+                markers.append(_WORD_TO_INT[nxt])
+                idx += 2
+                continue
+        if tok.isdigit():
+            markers.append(int(tok))
+        elif tok in _ROMAN_TO_INT and (tok != "i" or (len(tokens) >= 2 and idx == len(tokens) - 1)):
+            markers.append(_ROMAN_TO_INT[tok])
+        idx += 1
+    return tuple(markers)
+
+
+def _canonicalize_installment_tokens(norm_title: str) -> str:
+    tokens = norm_title.split()
+    out: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _INSTALLMENT_PREFIXES and idx + 1 < len(tokens):
+            nxt = tokens[idx + 1]
+            if nxt.isdigit():
+                out.extend([tok, str(int(nxt))])
+                idx += 2
+                continue
+            if nxt in _ROMAN_TO_INT:
+                out.extend([tok, str(_ROMAN_TO_INT[nxt])])
+                idx += 2
+                continue
+            if nxt in _WORD_TO_INT:
+                out.extend([tok, str(_WORD_TO_INT[nxt])])
+                idx += 2
+                continue
+        if tok in _ROMAN_TO_INT and (tok != "i" or (len(tokens) >= 2 and idx == len(tokens) - 1)):
+            out.append(str(_ROMAN_TO_INT[tok]))
+        else:
+            out.append(tok)
+        idx += 1
+    return " ".join(out)
+
+
+def _titles_compatible(norm_a: str, norm_b: str) -> bool:
+    if not norm_a or not norm_b:
+        return False
+    if norm_a == norm_b:
+        return True
+    if _extract_installment_signature(norm_a) != _extract_installment_signature(norm_b):
+        return False
+    canon_a = _canonicalize_installment_tokens(norm_a)
+    canon_b = _canonicalize_installment_tokens(norm_b)
+    if canon_a == canon_b:
+        return True
+    ta = set(canon_a.split())
+    tb = set(canon_b.split())
+    if (ta ^ tb) & _SEQUEL_SUBTITLE_TOKENS:
+        return False
+    return _token_jaccard(canon_a, canon_b) >= 0.6
+
+
 def select_best_tmdb_candidate(
     results: list[dict[str, Any]],
     query_title: str,
@@ -238,11 +395,12 @@ def select_best_tmdb_candidate(
 ) -> Optional[dict[str, Any]]:
     """
     Score TMDB search results and return the top candidate only when confidence is high
-    enough to avoid false-positive overrides (especially across remakes/different years).
+    enough to avoid false-positive overrides (especially across remakes/different years/sequels).
     """
     norm_query = _normalize_title_for_compare(query_title)
     if not norm_query:
         return None
+    query_sig = _extract_installment_signature(norm_query)
 
     best_score = -1.0
     best_item: Optional[dict[str, Any]] = None
@@ -256,10 +414,16 @@ def select_best_tmdb_candidate(
         if norm_query in (norm_title, norm_orig):
             title_score = 100.0
         else:
-            sim = max(
-                _token_jaccard(norm_query, norm_title),
-                _token_jaccard(norm_query, norm_orig),
-            )
+            compat_scores: list[float] = []
+            for cand_norm in (norm_title, norm_orig):
+                if not cand_norm:
+                    continue
+                if _extract_installment_signature(cand_norm) != query_sig:
+                    continue
+                if (set(norm_query.split()) ^ set(cand_norm.split())) & _SEQUEL_SUBTITLE_TOKENS:
+                    continue
+                compat_scores.append(_token_jaccard(norm_query, cand_norm))
+            sim = max(compat_scores) if compat_scores else 0.0
             if sim < 0.6:
                 continue
             title_score = 65.0 * sim
@@ -287,20 +451,50 @@ def select_best_tmdb_candidate(
 
 
 def _directors_overlap(a: Optional[str], b: Optional[str]) -> bool:
+    """
+    Compare full director names (split on co-director separators).
+    NEVER match two different directors who share only a first name (e.g. 'David Fincher' vs 'David Lynch').
+    """
     if not a or not b:
         return False
-    tokens_a = {t for t in _normalize_title_for_compare(a).split() if len(t) >= 3}
-    tokens_b = {t for t in _normalize_title_for_compare(b).split() if len(t) >= 3}
-    return bool(tokens_a & tokens_b)
+
+    def _parse_people(raw: str) -> list[list[str]]:
+        people: list[list[str]] = []
+        for part in re.split(r"\s*(?:,|&|\band\b|/)\s*", raw, flags=re.IGNORECASE):
+            norm = _normalize_title_for_compare(part)
+            toks = [t for t in norm.split() if t]
+            if toks and norm not in ("unknown", "n a", "na", "none"):
+                people.append(toks)
+        return people
+
+    people_a = _parse_people(a)
+    people_b = _parse_people(b)
+    if not people_a or not people_b:
+        return False
+
+    for ta in people_a:
+        for tb in people_b:
+            if ta == tb:
+                return True
+            if len(ta) >= 2 and len(tb) >= 2 and ta[-1] == tb[-1] and len(ta[-1]) >= 2:
+                if ta[0] == tb[0] or (
+                    (len(ta[0]) == 1 or len(tb[0]) == 1) and ta[0][0] == tb[0][0]
+                ):
+                    return True
+    return False
 
 
-def is_tmdb_compatible(ident: Identification, tmdb: TmdbMovie) -> bool:
-    """Ensure TMDB metadata refers to the same film as Gemini's identification."""
+def _tmdb_incompatibility_reason(ident: Identification, tmdb: TmdbMovie) -> Optional[str]:
+    """Return None if TMDB record is compatible with model identification, else a specific conflict reason."""
     if ident.imdb_id and tmdb.imdb_id:
-        return ident.imdb_id.strip().lower() == tmdb.imdb_id.strip().lower()
+        if ident.imdb_id.strip().lower() != tmdb.imdb_id.strip().lower():
+            return f"contradictory IMDb IDs (model={ident.imdb_id.strip().lower()}, tmdb={tmdb.imdb_id.strip().lower()})"
+
+    if ident.tmdb_id is not None and ident.tmdb_id != tmdb.tmdb_id:
+        return f"contradictory TMDB IDs (model={ident.tmdb_id}, tmdb={tmdb.tmdb_id})"
 
     if tmdb.year is not None and abs(ident.year - tmdb.year) > 1:
-        return False
+        return f"year mismatch (model={ident.year}, tmdb={tmdb.year})"
 
     ident_titles = [
         _normalize_title_for_compare(t)
@@ -309,17 +503,49 @@ def is_tmdb_compatible(ident: Identification, tmdb: TmdbMovie) -> bool:
     ]
     tmdb_titles = [
         _normalize_title_for_compare(t)
-        for t in (tmdb.canonical_title, tmdb.original_title or "")
+        for t in tmdb.all_titles()
         if t and t.strip()
     ]
-
     title_match = any(
-        it == tt or _token_jaccard(it, tt) >= 0.6
+        _titles_compatible(it, tt)
         for it in ident_titles
         for tt in tmdb_titles
     )
-    director_match = _directors_overlap(ident.director, tmdb.director)
-    return title_match or director_match
+
+    ident_dir_clean = (ident.director or "").strip()
+    tmdb_dir_clean = (tmdb.director or "").strip()
+    both_have_directors = bool(
+        ident_dir_clean
+        and ident_dir_clean.lower() not in ("unknown", "n/a", "none")
+        and tmdb_dir_clean
+        and tmdb_dir_clean.lower() not in ("unknown", "n/a", "none")
+    )
+    director_match = _directors_overlap(ident_dir_clean, tmdb_dir_clean)
+
+    # Matching IMDb IDs confirm identity unless contradictory TMDB ID or completely unrelated title+director
+    if ident.imdb_id and tmdb.imdb_id and ident.imdb_id.strip().lower() == tmdb.imdb_id.strip().lower():
+        if both_have_directors and not director_match and not title_match:
+            return (
+                f"title and director mismatch despite IMDb match "
+                f"(model='{ident.canonical_title}' by '{ident.director}', tmdb='{tmdb.canonical_title}' by '{tmdb.director}')"
+            )
+        return None
+
+    # Without matching comparable IMDb IDs, require meaningful title/alias match AND compatible full director
+    if not title_match:
+        return (
+            f"title mismatch (model='{ident.canonical_title}', tmdb='{tmdb.canonical_title}')"
+        )
+    if both_have_directors and not director_match:
+        return (
+            f"director mismatch (model='{ident.director}', tmdb='{tmdb.director}')"
+        )
+    return None
+
+
+def is_tmdb_compatible(ident: Identification, tmdb: TmdbMovie) -> bool:
+    """Ensure TMDB metadata refers to the same film as Gemini's identification."""
+    return _tmdb_incompatibility_reason(ident, tmdb) is None
 
 
 def apply_tmdb_verification(
@@ -327,24 +553,67 @@ def apply_tmdb_verification(
     tmdb: Optional[TmdbMovie],
 ) -> EvaluationPayload:
     """
-    Deterministically fill and verify movie IDs, runtime, original title, director,
-    and genres using TMDB metadata when compatible with Gemini's identification.
+    Preserve the model's original identification separately from catalogue identification.
+    Deterministically fill verified movie fields ONLY when TMDB metadata is strictly compatible;
+    when incompatible, keep model fields intact, record an explicit catalogue conflict, and
+    never substitute another film's IDs onto the model's assessment.
     """
-    if tmdb is None:
-        return payload
-
     ident = payload.identification
-    if not is_tmdb_compatible(ident, tmdb):
+    model_snap = payload.model_identification or ModelIdentificationSnapshot(
+        canonical_title=ident.canonical_title,
+        original_title=ident.original_title,
+        year=ident.year,
+        director=ident.director,
+        imdb_id=ident.imdb_id,
+        tmdb_id=ident.tmdb_id,
+    )
+
+    if tmdb is None:
+        return payload.model_copy(update={"model_identification": model_snap})
+
+    incompat_reason = _tmdb_incompatibility_reason(ident, tmdb)
+    if incompat_reason is not None:
         logger.warning(
-            "Skipping TMDB merge due to mismatch: gemini=(%r, %s, %s) vs tmdb=(%r, %s, %s)",
+            "Skipping TMDB merge due to conflict (%s): gemini=(%r, %s, %s, tmdb=%s, dir=%r) vs tmdb=(%r, %s, %s, tmdb=%s, dir=%r)",
+            incompat_reason,
             ident.canonical_title,
             ident.year,
             ident.imdb_id,
+            ident.tmdb_id,
+            ident.director,
             tmdb.canonical_title,
             tmdb.year,
             tmdb.imdb_id,
+            tmdb.tmdb_id,
+            tmdb.director,
         )
-        return payload
+        conflict_note = f"Catalogue verification conflict: {incompat_reason}"
+        existing_note = (ident.disambiguation_note or "").strip()
+        merged_note = f"{existing_note}; {conflict_note}" if existing_note else conflict_note
+        updated_ident = ident.model_copy(
+            update={
+                "match_confidence": "low" if ident.match_confidence == "high" else ident.match_confidence,
+                "disambiguation_note": merged_note,
+            }
+        )
+        cat_ident = CatalogueIdentification(
+            canonical_title=tmdb.canonical_title,
+            original_title=tmdb.original_title,
+            year=tmdb.year,
+            director=tmdb.director,
+            imdb_id=tmdb.imdb_id,
+            tmdb_id=tmdb.tmdb_id,
+            runtime_minutes=tmdb.runtime_minutes,
+            compatible=False,
+            conflict_reason=incompat_reason,
+        )
+        return payload.model_copy(
+            update={
+                "identification": updated_ident,
+                "model_identification": model_snap,
+                "catalogue_identification": cat_ident,
+            }
+        )
 
     verified_imdb = tmdb.imdb_id or (ident.imdb_id.strip().lower() if ident.imdb_id else None)
     verified_runtime = tmdb.runtime_minutes if tmdb.runtime_minutes else ident.runtime_minutes
@@ -372,7 +641,24 @@ def apply_tmdb_verification(
             "genres": verified_genres,
         }
     )
-    return payload.model_copy(update={"identification": updated_ident})
+    cat_ident = CatalogueIdentification(
+        canonical_title=tmdb.canonical_title,
+        original_title=tmdb.original_title,
+        year=tmdb.year,
+        director=tmdb.director,
+        imdb_id=tmdb.imdb_id,
+        tmdb_id=tmdb.tmdb_id,
+        runtime_minutes=tmdb.runtime_minutes,
+        compatible=True,
+        conflict_reason=None,
+    )
+    return payload.model_copy(
+        update={
+            "identification": updated_ident,
+            "model_identification": model_snap,
+            "catalogue_identification": cat_ident,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -411,16 +697,24 @@ def check_tracker_movie_consistency(
 
     if query_title:
         norm_query = _normalize_title_for_compare(query_title)
+        query_sig = _extract_installment_signature(norm_query)
         cand_norms = [
             _normalize_title_for_compare(t)
-            for t in (movie.canonical_title, movie.original_title or "")
+            for t in movie.all_titles()
             if t and t.strip()
         ]
         title_matches = False
         for cn in cand_norms:
             if not cn:
                 continue
-            if norm_query == cn or _token_jaccard(norm_query, cn) >= 0.45:
+            if norm_query == cn:
+                title_matches = True
+                break
+            if _extract_installment_signature(cn) != query_sig:
+                continue
+            if (set(norm_query.split()) ^ set(cn.split())) & _SEQUEL_SUBTITLE_TOKENS:
+                continue
+            if _token_jaccard(norm_query, cn) >= 0.45:
                 title_matches = True
                 break
             if len(norm_query) >= 4 and len(cn) >= 4 and (norm_query in cn or cn in norm_query):
@@ -762,7 +1056,7 @@ class TmdbClient:
     def _fetch_movie_details(self, tmdb_id: int) -> TmdbMovie:
         data = self._get_json(
             f"/movie/{tmdb_id}",
-            params={"append_to_response": "credits,external_ids"},
+            params={"append_to_response": "credits,external_ids,alternative_titles"},
         )
         external_ids = data.get("external_ids") or {}
         raw_imdb = external_ids.get("imdb_id") or data.get("imdb_id")
@@ -785,6 +1079,15 @@ class TmdbClient:
             if isinstance(g, dict) and g.get("name")
         ][:4]
 
+        alt_titles: list[str] = []
+        alt_container = data.get("alternative_titles")
+        if isinstance(alt_container, dict):
+            titles_arr = alt_container.get("titles") or alt_container.get("results") or []
+            if isinstance(titles_arr, list):
+                for item in titles_arr:
+                    if isinstance(item, dict) and isinstance(item.get("title"), str) and item["title"].strip():
+                        alt_titles.append(item["title"].strip())
+
         canonical_title = str(data.get("title") or data.get("original_title") or "").strip()
         raw_orig = data.get("original_title")
         original_title = str(raw_orig).strip() if raw_orig and str(raw_orig).strip() else None
@@ -799,6 +1102,7 @@ class TmdbClient:
             director=", ".join(directors) if directors else None,
             genres=genres,
             original_language=str(data.get("original_language") or "").strip() or None,
+            alternative_titles=tuple(alt_titles[:30]),
         )
 
     def _lookup_with_diagnostics_sync(self, request: EvaluateRequest) -> TmdbLookupResult:
@@ -816,51 +1120,143 @@ class TmdbClient:
         audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
 
         # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context
-        # Cross-check against release title/year/MediaInfo whenever those signals exist.
+        # Cross-check against release title/year/MediaInfo AND any tracker-supplied IDs.
         tracker_conflict: Optional[str] = None
         direct_imdb = extract_imdb_id(request.raw_text, request.extra_context)
         if direct_imdb:
             direct_tmdb_id = self._find_tmdb_id_by_imdb(direct_imdb)
             if direct_tmdb_id is not None:
                 direct_movie = self._fetch_movie_details(direct_tmdb_id)
-                conflict = check_tracker_movie_consistency(
+                id_disagreements: list[str] = []
+                if direct_movie.imdb_id and direct_movie.imdb_id.lower() != direct_imdb.lower():
+                    id_disagreements.append(
+                        f"direct IMDb {direct_imdb} resolved to TMDB {direct_movie.tmdb_id} whose IMDb is {direct_movie.imdb_id}"
+                    )
+                if tinfo is not None and tinfo.imdb_id and tinfo.imdb_id.lower() != direct_imdb.lower():
+                    id_disagreements.append(
+                        f"direct IMDb {direct_imdb} conflicts with tracker IMDb {tinfo.imdb_id}"
+                    )
+                if tinfo is not None and tinfo.tmdb_id is not None and tinfo.tmdb_id != direct_movie.tmdb_id:
+                    id_disagreements.append(
+                        f"direct IMDb {direct_imdb} (TMDB {direct_movie.tmdb_id}) conflicts with tracker TMDB {tinfo.tmdb_id}"
+                    )
+                consistency_conflict = check_tracker_movie_consistency(
                     direct_movie,
                     query_title=query_title,
                     query_year=query_year,
                     nfo_runtime=nfo_runtime,
                     audio_languages=audio_languages,
                 )
-                if conflict is None:
+                if not id_disagreements and consistency_conflict is None:
                     return TmdbLookupResult(
                         movie=direct_movie,
                         tracker_conflict=None,
                         trusted_for_cache=True,
                     )
-                logger.warning("Rejecting conflicting direct IMDb TMDB candidate: %s", conflict)
-                tracker_conflict = conflict
-
-        # 2) Check tracker-supplied TMDB/IMDb ID — ALWAYS cross-checked against release & MediaInfo!
-        if tinfo is not None and (tinfo.tmdb_id is not None or tinfo.imdb_id):
-            tracker_tmdb_id: Optional[int] = tinfo.tmdb_id
-            if tracker_tmdb_id is None and tinfo.imdb_id:
-                tracker_tmdb_id = self._find_tmdb_id_by_imdb(tinfo.imdb_id)
-            if tracker_tmdb_id is not None:
-                tracker_movie = self._fetch_movie_details(tracker_tmdb_id)
-                conflict = check_tracker_movie_consistency(
-                    tracker_movie,
-                    query_title=query_title,
-                    query_year=query_year,
-                    nfo_runtime=nfo_runtime,
-                    audio_languages=audio_languages,
+                conflict_msg = "; ".join(
+                    p for p in (*id_disagreements, consistency_conflict) if p
                 )
-                if conflict is None:
-                    return TmdbLookupResult(
-                        movie=tracker_movie,
-                        tracker_conflict=None,
-                        trusted_for_cache=True,
+                logger.warning("Rejecting conflicting direct IMDb TMDB candidate: %s", conflict_msg)
+                tracker_conflict = conflict_msg
+
+        # 2) Check tracker-supplied TMDB/IMDb IDs — when BOTH are supplied, resolve AND compare BOTH!
+        if tinfo is not None and (tinfo.tmdb_id is not None or tinfo.imdb_id):
+            supplied_tmdb_id: Optional[int] = tinfo.tmdb_id
+            supplied_imdb_id: Optional[str] = tinfo.imdb_id.strip().lower() if tinfo.imdb_id else None
+
+            if supplied_tmdb_id is not None and supplied_imdb_id:
+                movie_by_tmdb = self._fetch_movie_details(supplied_tmdb_id)
+                imdb_resolved_tmdb_id = self._find_tmdb_id_by_imdb(supplied_imdb_id)
+                movie_by_imdb: Optional[TmdbMovie] = None
+                if imdb_resolved_tmdb_id is not None:
+                    movie_by_imdb = (
+                        movie_by_tmdb
+                        if imdb_resolved_tmdb_id == supplied_tmdb_id
+                        else self._fetch_movie_details(imdb_resolved_tmdb_id)
                     )
-                logger.warning("Rejecting tracker-supplied TMDB candidate: %s", conflict)
-                tracker_conflict = conflict
+
+                pair_conflicts: list[str] = []
+                if movie_by_tmdb.imdb_id and movie_by_tmdb.imdb_id.lower() != supplied_imdb_id:
+                    pair_conflicts.append(
+                        f"tracker tmdb_id={supplied_tmdb_id} ('{movie_by_tmdb.canonical_title}', {movie_by_tmdb.year}) "
+                        f"links to imdb={movie_by_tmdb.imdb_id}, contradicting tracker imdb_id={supplied_imdb_id}"
+                    )
+                if imdb_resolved_tmdb_id is None:
+                    pair_conflicts.append(
+                        f"tracker imdb_id={supplied_imdb_id} could not be resolved to tracker tmdb_id={supplied_tmdb_id}"
+                    )
+                elif imdb_resolved_tmdb_id != supplied_tmdb_id:
+                    other_desc = (
+                        f"'{movie_by_imdb.canonical_title}' ({movie_by_imdb.year})"
+                        if movie_by_imdb is not None
+                        else f"tmdb_id={imdb_resolved_tmdb_id}"
+                    )
+                    pair_conflicts.append(
+                        f"tracker imdb_id={supplied_imdb_id} resolved to tmdb_id={imdb_resolved_tmdb_id} ({other_desc}), "
+                        f"contradicting tracker tmdb_id={supplied_tmdb_id} ('{movie_by_tmdb.canonical_title}', {movie_by_tmdb.year})"
+                    )
+
+                if pair_conflicts:
+                    conflict_msg = "Conflicting tracker IDs: " + "; ".join(pair_conflicts)
+                    logger.warning("Rejecting conflicting tracker ID pair: %s", conflict_msg)
+                    tracker_conflict = (
+                        f"{tracker_conflict}; {conflict_msg}" if tracker_conflict else conflict_msg
+                    )
+                else:
+                    consistency_conflict = check_tracker_movie_consistency(
+                        movie_by_tmdb,
+                        query_title=query_title,
+                        query_year=query_year,
+                        nfo_runtime=nfo_runtime,
+                        audio_languages=audio_languages,
+                    )
+                    if consistency_conflict is None and tracker_conflict is None:
+                        return TmdbLookupResult(
+                            movie=movie_by_tmdb,
+                            tracker_conflict=None,
+                            trusted_for_cache=True,
+                        )
+                    if consistency_conflict is not None:
+                        logger.warning("Rejecting tracker-supplied TMDB candidate: %s", consistency_conflict)
+                        tracker_conflict = (
+                            f"{tracker_conflict}; {consistency_conflict}"
+                            if tracker_conflict
+                            else consistency_conflict
+                        )
+            else:
+                tracker_tmdb_id: Optional[int] = supplied_tmdb_id
+                if tracker_tmdb_id is None and supplied_imdb_id:
+                    tracker_tmdb_id = self._find_tmdb_id_by_imdb(supplied_imdb_id)
+                if tracker_tmdb_id is not None:
+                    tracker_movie = self._fetch_movie_details(tracker_tmdb_id)
+                    id_mismatch = (
+                        f"tracker imdb_id={supplied_imdb_id} resolved to tmdb_id={tracker_movie.tmdb_id} whose IMDb is {tracker_movie.imdb_id}"
+                        if (
+                            supplied_imdb_id
+                            and tracker_movie.imdb_id
+                            and tracker_movie.imdb_id.lower() != supplied_imdb_id
+                        )
+                        else None
+                    )
+                    consistency_conflict = check_tracker_movie_consistency(
+                        tracker_movie,
+                        query_title=query_title,
+                        query_year=query_year,
+                        nfo_runtime=nfo_runtime,
+                        audio_languages=audio_languages,
+                    )
+                    if id_mismatch is None and consistency_conflict is None and tracker_conflict is None:
+                        return TmdbLookupResult(
+                            movie=tracker_movie,
+                            tracker_conflict=None,
+                            trusted_for_cache=True,
+                        )
+                    conflict_msg = "; ".join(p for p in (id_mismatch, consistency_conflict) if p)
+                    if conflict_msg:
+                        logger.warning("Rejecting tracker-supplied TMDB candidate: %s", conflict_msg)
+                        tracker_conflict = (
+                            f"{tracker_conflict}; {conflict_msg}" if tracker_conflict else conflict_msg
+                        )
 
         # 3) Clean title + year search (with MediaInfo runtime/language tie-breaking)
         if query_title:
@@ -892,6 +1288,11 @@ class TmdbClient:
         tmdb_id: Optional[int] = None
         if ident.imdb_id:
             tmdb_id = self._find_tmdb_id_by_imdb(ident.imdb_id)
+            if ident.tmdb_id is not None and tmdb_id is not None and tmdb_id != ident.tmdb_id:
+                return None
+
+        if tmdb_id is None and ident.tmdb_id is not None:
+            tmdb_id = ident.tmdb_id
 
         if tmdb_id is None and ident.canonical_title:
             tmdb_id = self._search_tmdb_id(ident.canonical_title, ident.year)
