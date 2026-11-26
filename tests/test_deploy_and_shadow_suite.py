@@ -278,6 +278,20 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             sock.close()
 
+        # Codex PR #8 Round 1 P2: TIME_WAIT socket from a stopped service must NOT block rebind
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        tw_port = srv.getsockname()[1]
+        cli = socket.create_connection(("127.0.0.1", tw_port), timeout=2)
+        conn, _ = srv.accept()
+        # Server closes first -> leaves 127.0.0.1:tw_port in TIME_WAIT after client closes
+        conn.close()
+        srv.close()
+        cli.close()
+        self.assertFalse(is_port_listening(tw_port, ss_output="", probe_bind=True))
+
         # Non-loopback or shared-PID listener must be rejected by owned-by-pid
         self.assertFalse(
             is_port_owned_by_pid(

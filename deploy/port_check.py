@@ -58,9 +58,14 @@ def parse_ss_listening_ports(ss_output: str) -> set[int]:
 
 
 def can_bind_loopback(port: int) -> bool:
-    """Non-destructively verify `127.0.0.1:<port>` is bindable right now (zero TIME_WAIT created)."""
+    """
+    Non-destructively verify `127.0.0.1:<port>` has no active listener right now.
+    Enables SO_REUSEADDR (matching uvicorn) so TIME_WAIT sockets from a recently stopped
+    service do not falsely block redeployment, while active LISTEN sockets still fail EADDRINUSE.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", port))
         return True
     except OSError:
