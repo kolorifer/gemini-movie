@@ -516,13 +516,18 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
             meta_imdb: Optional[str] = None,
             meta_tmdb: Optional[int] = None,
         ) -> dict[str, Any]:
+            res = "2160p" if "2160p" in name else "1080p"
+            src = "UHD BluRay" if res == "2160p" else "BluRay"
             rel: dict[str, Any] = {
                 "external_id": ext_id,
                 "name": name,
                 "title": title,
                 "year": year,
                 "type": "movie",
-                "category": "Movies :: 4K",
+                "category": "Movies :: 4K" if res == "2160p" else "Movies :: Bluray",
+                "resolution": res,
+                "source": src,
+                "media_processing": "REMUX",
                 "download_url": f"https://shadow-tracker.invalid/dl/{ext_id}/{synthetic_passkey}/file.torrent",
                 "size": 50_000_000_000,
             }
@@ -530,7 +535,16 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                 rel["meta_imdb"] = meta_imdb
             if meta_tmdb is not None:
                 rel["meta_tmdb"] = meta_tmdb
-            return {"action": {"rejected": False}, "data": {"indexer": indexer, "release": rel}}
+            return {
+                "event": "action.rejected",
+                "data": {
+                    "indexer": indexer,
+                    "action": {"type": "RADARR"},
+                    "filter": {"id": 7, "name": "Movies Remux"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": rel,
+                },
+            }
 
         async with actions_app.router.lifespan_context(actions_app):
             async with intake_app.router.lifespan_context(intake_app):
@@ -751,7 +765,7 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                         json=_wh(
                             indexer="TorrentLeech",
                             ext_id="9004001",
-                            name="Already.Watched.2024.2160p.REMUX-GRP",
+                            name="Already.Watched.2024.2160p.UHD.BluRay.REMUX-GRP",
                             title="Already Watched",
                             year=2024,
                             meta_imdb="tt4004010",
@@ -769,7 +783,7 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                         json=_wh(
                             indexer="TorrentLeech",
                             ext_id="9004002",
-                            name="Monitored.Pending.2024.2160p.REMUX-GRP",
+                            name="Monitored.Pending.2024.2160p.UHD.BluRay.REMUX-GRP",
                             title="Monitored Pending",
                             year=2024,
                             meta_imdb="tt4004020",
@@ -789,7 +803,7 @@ async def run_shadow_suite(state_root: Path) -> ShadowSuiteResult:
                         json=_wh(
                             indexer="TorrentLeech",
                             ext_id="9004003",
-                            name="Already.Owned.2024.2160p.REMUX-GRP",
+                            name="Already.Owned.2024.2160p.UHD.BluRay.REMUX-GRP",
                             title="Already Owned",
                             year=2024,
                             meta_imdb="tt4004030",

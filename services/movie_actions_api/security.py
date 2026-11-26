@@ -145,3 +145,13 @@ def read_owner_private_regular_file(path: Path, *, max_bytes: int) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def fsync_directory(path: Path) -> None:
+    """Sync directory metadata so newly created entries and renames survive host crashes."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

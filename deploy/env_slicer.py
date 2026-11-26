@@ -34,6 +34,8 @@ INTAKE_ALLOWED_KEYS: tuple[str, ...] = (
     "TRIAGE_API_URL",
     "ACTIONS_API_URL",
     "SHADOW_REPLAY_ENABLED",
+    "MOVIE_INTEL_ALLOWED_FILTERS",
+    "MOVIE_INTEL_ALLOWED_FILTER_IDS",
 )
 
 ACTIONS_ALLOWED_KEYS: tuple[str, ...] = (
@@ -203,6 +205,12 @@ def atomic_write_env_file(target: Path, ordered_keys: tuple[str, ...], values: M
         os.close(fd)
         fd = None
         os.replace(str(tmp_path), str(target))
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        dir_fd = os.open(str(target.parent), dir_flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
         if fd is not None:
             try:

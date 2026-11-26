@@ -1555,9 +1555,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                             transport=httpx.ASGITransport(app=actions_app), base_url="http://actions.local"
                         ) as actions_c:
                             webhook_payload = {
-                                "action": {"rejected": False},
+                                "event": "action.rejected",
                                 "data": {
                                     "indexer": "TorrentLeech",
+                                    "action": {"type": "RADARR"},
+                                    "filter": {"id": 7, "name": "Movies Remux"},
+                                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
                                     "release": {
                                         "external_id": "999001",
                                         "name": "Integration.Cinema.2025.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
@@ -1565,6 +1568,9 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                                         "year": 2025,
                                         "type": "movie",
                                         "category": "Movies :: 4K",
+                                        "resolution": "2160p",
+                                        "source": "UHD BluRay",
+                                        "media_processing": "REMUX",
                                         "meta_imdb": "tt9009010",
                                         "meta_tmdb": 900901,
                                         "download_url": passkey_url,

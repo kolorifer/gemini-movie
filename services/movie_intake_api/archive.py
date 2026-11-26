@@ -14,6 +14,7 @@ from .security import (
     PrivateFileError,
     atomic_write_private_file,
     ensure_private_dir,
+    fsync_directory,
     read_owner_private_regular_file,
 )
 
@@ -87,11 +88,18 @@ def archive_raw_webhook(
     relpath = f"{year_part}/{month_part}/{day_part}/{filename}"
 
     try:
+        root_existed = archive_dir.exists()
         ensure_private_dir(archive_dir)
+        if not root_existed and archive_dir.parent.exists():
+            fsync_directory(archive_dir.parent)
         cur = archive_dir
         for part in (year_part, month_part, day_part):
+            parent_dir = cur
             cur = cur / part
+            existed = cur.exists()
             ensure_private_dir(cur)
+            if not existed:
+                fsync_directory(parent_dir)
         target = cur / filename
         atomic_write_private_file(target, raw_bytes)
     except Exception as exc:

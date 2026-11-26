@@ -1034,8 +1034,19 @@ class IntakeDB:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT consecutive_failures FROM tl_cooldown WHERE singleton_id = 1"
+                "SELECT cooldown_until, consecutive_failures FROM tl_cooldown WHERE singleton_id = 1"
             ).fetchone()
+            existing_until = (
+                parse_iso(str(row["cooldown_until"]))
+                if row and row["cooldown_until"]
+                else None
+            )
+            effective_until = (
+                existing_until
+                if existing_until is not None and existing_until > until
+                else until
+            )
+            effective_until_iso = utc_now_iso(effective_until)
             failures = (int(row["consecutive_failures"]) if row else 0) + 1
             conn.execute(
                 """
@@ -1047,10 +1058,10 @@ class IntakeDB:
                     last_reason = excluded.last_reason,
                     updated_at = excluded.updated_at
                 """,
-                (until_iso, failures, reason[:120], now_iso),
+                (effective_until_iso, failures, reason[:120], now_iso),
             )
             conn.execute("COMMIT")
-            return until_iso
+            return effective_until_iso
         except Exception:
             conn.execute("ROLLBACK")
             raise

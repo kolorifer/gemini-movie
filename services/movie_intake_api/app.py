@@ -221,7 +221,11 @@ def create_app(
             logger.error("Required raw archive persistence failed: %s", redact_secrets(str(exc), max_chars=160))
             raise HTTPException(status_code=503, detail="Archive persistence unavailable") from exc
 
-        classified = classify_webhook_payload(parsed)
+        classified = classify_webhook_payload(
+            parsed,
+            allowed_filter_names=cfg.allowed_filter_names,
+            allowed_filter_ids=cfg.allowed_filter_ids,
+        )
         if classified.classification != "movie_candidate":
             if classified.classification == "movie_category_type_conflict":
                 logger.warning(

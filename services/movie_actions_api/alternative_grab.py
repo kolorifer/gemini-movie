@@ -508,6 +508,12 @@ def write_alt_grab_receipt(state_dir: Path, external_id: str, receipt: Mapping[s
         os.close(fd)
         fd = None
         os.replace(str(tmp_path), str(target))
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        dir_fd = os.open(str(state_dir), dir_flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
         return target
     except Exception:
         if fd is not None:
