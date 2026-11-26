@@ -29,6 +29,38 @@ from scripts.run_shadow_verification import run_shadow_suite
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _pick_free_loopback_ports(count: int, *, exclude: set[int] | frozenset[int] = frozenset()) -> list[int]:
+    """Allocate `count` distinct currently-free loopback TCP ports not in `exclude`."""
+    picked: list[int] = []
+    held: list[socket.socket] = []
+    try:
+        for _ in range(max(count * 20, 50)):
+            if len(picked) == count:
+                break
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("127.0.0.1", 0))
+                port = int(sock.getsockname()[1])
+            except OSError:
+                sock.close()
+                continue
+            if port in exclude or port in picked:
+                sock.close()
+                continue
+            # Also skip if ss reports wildcard/IPv6 listener on the same port
+            if is_port_listening(port, probe_bind=False):
+                sock.close()
+                continue
+            held.append(sock)
+            picked.append(port)
+    finally:
+        for sock in held:
+            sock.close()
+    if len(picked) != count:
+        raise RuntimeError(f"Could not find {count} free loopback ports")
+    return picked
+
+
 class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
     def test_env_slicer_least_privilege_boundaries_escaping_and_symlink_guards(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -232,11 +264,12 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
                 "[Service]\nExecStart=/usr/bin/python3 -m uvicorn app:app --host 127.0.0.1 --port 40714\n",
                 encoding="utf-8",
             )
+            free_intake, free_actions = _pick_free_loopback_ports(2, exclude={40714, 40716})
             env = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": fake_home,
-                "PORT_INTAKE": "40720",
-                "PORT_ACTIONS": "40721",
+                "PORT_INTAKE": str(free_intake),
+                "PORT_ACTIONS": str(free_actions),
                 "PORT_TRIAGE": "40716",
             }
             dry = subprocess.run(
@@ -416,13 +449,16 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
             fake_bin = base / "bin"
             fake_bin.mkdir(mode=0o700)
 
-            # Mock `app-ports free` emitting active 40714 and 40716 ahead of free 40740 and 40741
+            synthetic_busy = set(range(20001, 20501)) | {40714, 40716}
+            free_intake, free_actions = _pick_free_loopback_ports(2, exclude=synthetic_busy)
+
+            # Mock `app-ports free` emitting active 40714 and 40716 ahead of free loopback ports
             app_ports_bin = fake_bin / "app-ports"
             app_ports_bin.write_text(
                 "#!/usr/bin/env bash\n"
                 "echo 'Unallocated ports for use'\n"
                 "echo '-------------------------'\n"
-                "printf '%s\\n' 40714 40716 40740 40741\n",
+                f"printf '%s\\n' 40714 40716 {free_intake} {free_actions}\n",
                 encoding="utf-8",
             )
             os.chmod(app_ports_bin, 0o700)
@@ -451,8 +487,8 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
                 text=True,
             )
             self.assertEqual(dry.returncode, 0, f"dry-run failed: {dry.stderr}\n{dry.stdout}")
-            self.assertIn("intake=127.0.0.1:40740", dry.stdout)
-            self.assertIn("actions=127.0.0.1:40741", dry.stdout)
+            self.assertIn(f"intake=127.0.0.1:{free_intake}", dry.stdout)
+            self.assertIn(f"actions=127.0.0.1:{free_actions}", dry.stdout)
 
             # Live bound socket passed as explicit override MUST fail fast
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -460,12 +496,15 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
                 sock.bind(("127.0.0.1", 0))
                 sock.listen(1)
                 busy_port = sock.getsockname()[1]
+                alt_actions, alt_triage = _pick_free_loopback_ports(
+                    2, exclude={busy_port, free_intake, free_actions}
+                )
                 env_busy = {
                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                     "HOME": str(fake_home),
                     "PORT_INTAKE": str(busy_port),
-                    "PORT_ACTIONS": "40741",
-                    "PORT_TRIAGE": "40716",
+                    "PORT_ACTIONS": str(alt_actions),
+                    "PORT_TRIAGE": str(alt_triage),
                 }
                 dry_busy = subprocess.run(
                     ["bash", str(suite_script), "--shadow", "--dry-run"],
