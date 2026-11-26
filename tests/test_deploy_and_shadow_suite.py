@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,12 @@ from deploy.env_slicer import (
     atomic_write_env_file,
     build_sliced_envs,
     read_owner_private_env,
+)
+from deploy.port_check import (
+    is_port_listening,
+    is_port_owned_by_pid,
+    parse_app_ports_output,
+    verify_health_payload,
 )
 from scripts.run_shadow_verification import run_shadow_suite
 
@@ -180,17 +187,24 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
 
         # Non-root Ultra.cc constraints: zero sudo invocation, zero Docker, loopback only, hardened systemd
         suite_text = suite_script.read_text(encoding="utf-8")
-        self.assertNotIn("docker ", suite_text.lower())
-        self.assertNotIn("0.0.0.0", suite_text)
-        self.assertNotIn("/tmp/", suite_text)
-        self.assertIn("UMask=0077", suite_text)
-        self.assertIn("NoNewPrivileges=true", suite_text)
-        self.assertIn("--host 127.0.0.1", suite_text)
-        self.assertIn("--no-access-log", suite_text)
-        self.assertIn("app-ports free", suite_text)
+        triage_text = triage_script.read_text(encoding="utf-8")
+        for text in (suite_text, triage_text):
+            self.assertNotIn("docker ", text.lower())
+            self.assertNotIn("0.0.0.0", text)
+            self.assertNotIn("/tmp/", text)
+            self.assertIn("UMask=0077", text)
+            self.assertIn("NoNewPrivileges=true", text)
+            self.assertIn("--host 127.0.0.1", text)
+            self.assertIn("--no-access-log", text)
+            self.assertIn("app-ports free", text)
+            self.assertIn("deploy/port_check.py", text)
+            self.assertIn("--max-time", text)
+            self.assertIn("--connect-timeout", text)
+            self.assertNotIn("enable --now", text)
+            # Zero piped ss|grep that can fail with SIGPIPE 141 under pipefail
+            self.assertNotIn("ss -tlnH 2>/dev/null |", text)
         self.assertIn('systemctl --user restart "$ACTIONS_SERVICE" "$INTAKE_SERVICE"', suite_text)
-        self.assertIn("--max-time", suite_text)
-        self.assertIn("--connect-timeout", suite_text)
+        self.assertIn('systemctl --user restart "$SERVICE_NAME"', triage_text)
         # Never stops or disables legacy movie-intel.service
         self.assertNotIn("disable movie-intel.service", suite_text)
         self.assertNotIn("stop movie-intel.service", suite_text)
@@ -240,6 +254,195 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("proxy_pass http://127.0.0.1:<PORT_ACTIONS>/action/;", nginx_text)
         self.assertNotIn("location ^~ /internal", nginx_text)
         self.assertNotIn("location ^~ /movie-intel/internal", nginx_text)
+
+    def test_port_check_sigpipe_safety_live_bind_pid_ownership_and_health_schema(self) -> None:
+        # 500-line ss output with occupied 40714 on line 1 (reproduces Ultra.cc SIGPIPE 141 case)
+        ss_500 = "\n".join(
+            ["LISTEN 0 128 127.0.0.1:40714 0.0.0.0:*"]
+            + [f"LISTEN 0 128 127.0.0.1:{20000 + i} 0.0.0.0:*" for i in range(500)]
+        )
+        self.assertTrue(is_port_listening(40714, ss_output=ss_500, probe_bind=False))
+        self.assertFalse(is_port_listening(40799, ss_output=ss_500, probe_bind=False))
+
+        # Live loopback socket bind probe & exclusive PID ownership check
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            bound_port = sock.getsockname()[1]
+            # Caught by bind probe even when ss output is empty
+            self.assertTrue(is_port_listening(bound_port, ss_output="", probe_bind=True))
+            # Live ss -tlnpH confirms current PID owns it, foreign PID does not
+            self.assertTrue(is_port_owned_by_pid(bound_port, os.getpid()))
+            self.assertFalse(is_port_owned_by_pid(bound_port, 999999))
+        finally:
+            sock.close()
+
+        # Codex PR #8 Round 1 P2: TIME_WAIT socket from a stopped service must NOT block rebind
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        tw_port = srv.getsockname()[1]
+        cli = socket.create_connection(("127.0.0.1", tw_port), timeout=2)
+        conn, _ = srv.accept()
+        # Server closes first -> leaves 127.0.0.1:tw_port in TIME_WAIT after client closes
+        conn.close()
+        srv.close()
+        cli.close()
+        self.assertFalse(is_port_listening(tw_port, ss_output="", probe_bind=True))
+
+        # Non-loopback or shared-PID listener must be rejected by owned-by-pid
+        self.assertFalse(
+            is_port_owned_by_pid(
+                40718,
+                1234,
+                ss_output='LISTEN 0 128 0.0.0.0:40718 0.0.0.0:* users:(("uvicorn",pid=1234,fd=6))\n',
+                allowed_pids={1234},
+            )
+        )
+        self.assertFalse(
+            is_port_owned_by_pid(
+                40718,
+                1234,
+                ss_output=(
+                    'LISTEN 0 128 127.0.0.1:40718 0.0.0.0:* users:(("uvicorn",pid=1234,fd=6))\n'
+                    'LISTEN 0 128 127.0.0.1:40718 0.0.0.0:* users:(("other",pid=9999,fd=7))\n'
+                ),
+                allowed_pids={1234},
+            )
+        )
+        self.assertTrue(
+            is_port_owned_by_pid(
+                40718,
+                1234,
+                ss_output='LISTEN 0 128 127.0.0.1:40718 0.0.0.0:* users:(("uvicorn",pid=1234,fd=6))\n',
+                allowed_pids={1234},
+            )
+        )
+
+        # Ultra.cc `app-ports free` banner parsing
+        banner = "Unallocated ports for use\n-------------------------\n40714\n40716\n40718\n40718\n"
+        self.assertEqual(parse_app_ports_output(banner), [40714, 40716, 40718])
+
+        # Strict /health schema verification rejects foreign service payloads (e.g. legacy movie-intel)
+        legacy_health = {"status": "ok"}
+        self.assertFalse(verify_health_payload(legacy_health, role="intake", expected_port=40714, expected_shadow=True)[0])
+        self.assertFalse(verify_health_payload(legacy_health, role="actions", expected_port=40714, expected_shadow=True)[0])
+        self.assertFalse(verify_health_payload(legacy_health, role="triage", expected_port=40716)[0])
+
+        valid_intake = {
+            "status": "ok",
+            "port": 40718,
+            "queued_releases": 0,
+            "in_flight_releases": 0,
+            "ambiguous_deliveries": 0,
+            "archive_dir_ok": True,
+            "webhook_configured": True,
+            "internal_auth_configured": True,
+            "shadow_replay_enabled": True,
+        }
+        self.assertTrue(verify_health_payload(valid_intake, role="intake", expected_port=40718, expected_shadow=True)[0])
+        self.assertFalse(verify_health_payload(valid_intake, role="intake", expected_port=40718, expected_shadow=False)[0])
+        self.assertFalse(verify_health_payload(valid_intake, role="intake", expected_port=40714, expected_shadow=True)[0])
+        self.assertFalse(verify_health_payload(valid_intake, role="actions", expected_port=40718, expected_shadow=True)[0])
+
+        valid_actions = {
+            "status": "ok",
+            "port": 40717,
+            "pending_ambiguous_deliveries": 0,
+            "pending_ambiguous_replies": 0,
+            "pending_ambiguous_radarr": 0,
+            "active_actions": 0,
+            "internal_auth_configured": True,
+            "shadow_replay_enabled": False,
+        }
+        self.assertTrue(verify_health_payload(valid_actions, role="actions", expected_port=40717, expected_shadow=False)[0])
+        self.assertFalse(verify_health_payload(valid_actions, role="actions", expected_port=40717, expected_shadow=True)[0])
+
+        valid_triage = {
+            "status": "ok",
+            "model": "gemini-4-hydrogen",
+            "port": 40716,
+            "cache_entries": 4,
+            "tmdb_enabled": True,
+            "auth_enabled": True,
+        }
+        self.assertTrue(verify_health_payload(valid_triage, role="triage", expected_port=40716)[0])
+        self.assertFalse(
+            verify_health_payload(dict(valid_triage, auth_enabled=False), role="triage", expected_port=40716)[0]
+        )
+
+    def test_deploy_suite_skips_occupied_port_under_500_line_ss_and_rejects_bound_override(self) -> None:
+        suite_script = REPO_ROOT / "deploy" / "deploy-suite-ultra.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            fake_home = base / "home"
+            fake_home.mkdir(mode=0o700)
+            fake_bin = base / "bin"
+            fake_bin.mkdir(mode=0o700)
+
+            # Mock `app-ports free` emitting active 40714 and 40716 ahead of free 40740 and 40741
+            app_ports_bin = fake_bin / "app-ports"
+            app_ports_bin.write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'Unallocated ports for use'\n"
+                "echo '-------------------------'\n"
+                "printf '%s\\n' 40714 40716 40740 40741\n",
+                encoding="utf-8",
+            )
+            os.chmod(app_ports_bin, 0o700)
+
+            # Mock `ss` emitting 500 lines with 40714 on line 1 (triggered SIGPIPE 141 before PR #7)
+            ss_bin = fake_bin / "ss"
+            ss_bin.write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'LISTEN 0 128 127.0.0.1:40714 0.0.0.0:*'\n"
+                "for i in $(seq 20001 20500); do\n"
+                "  echo \"LISTEN 0 128 127.0.0.1:${i} 0.0.0.0:*\"\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            os.chmod(ss_bin, 0o700)
+
+            env = {
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "HOME": str(fake_home),
+                "PORT_TRIAGE": "40716",
+            }
+            dry = subprocess.run(
+                ["bash", str(suite_script), "--shadow", "--dry-run"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(dry.returncode, 0, f"dry-run failed: {dry.stderr}\n{dry.stdout}")
+            self.assertIn("intake=127.0.0.1:40740", dry.stdout)
+            self.assertIn("actions=127.0.0.1:40741", dry.stdout)
+
+            # Live bound socket passed as explicit override MUST fail fast
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("127.0.0.1", 0))
+                sock.listen(1)
+                busy_port = sock.getsockname()[1]
+                env_busy = {
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": str(fake_home),
+                    "PORT_INTAKE": str(busy_port),
+                    "PORT_ACTIONS": "40741",
+                    "PORT_TRIAGE": "40716",
+                }
+                dry_busy = subprocess.run(
+                    ["bash", str(suite_script), "--shadow", "--dry-run"],
+                    env=env_busy,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(dry_busy.returncode, 0)
+                self.assertIn("already listening under another process", dry_busy.stderr)
+            finally:
+                sock.close()
 
     async def test_five_case_shadow_verification_runner_passes_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory(prefix="shadow-test-") as tmpdir:

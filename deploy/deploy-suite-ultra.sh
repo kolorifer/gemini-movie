@@ -63,7 +63,8 @@ for req in \
   "services/movie_intake_api/requirements.txt" \
   "services/movie_actions_api/app.py" \
   "services/movie_actions_api/requirements.txt" \
-  "deploy/env_slicer.py"; do
+  "deploy/env_slicer.py" \
+  "deploy/port_check.py"; do
   if [[ ! -f "$REPO_ROOT/$req" ]]; then
     echo "Error: Missing required repository file: $req" >&2
     exit 1
@@ -102,12 +103,24 @@ PYEOF
 
 port_listening() {
   local p="$1"
-  if command -v ss >/dev/null 2>&1; then
-    if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:.])${p}$"; then
-      return 0
-    fi
+  python3 "$REPO_ROOT/deploy/port_check.py" is-listening "$p"
+}
+
+port_owned_by_service() {
+  local p="$1"
+  local svc_name="$2"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
   fi
-  return 1
+  if ! systemctl --user is-active --quiet "$svc_name" 2>/dev/null; then
+    return 1
+  fi
+  local main_pid
+  main_pid="$(systemctl --user show -p MainPID --value "$svc_name" 2>/dev/null || true)"
+  if [[ ! "$main_pid" =~ ^[0-9]+$ ]] || (( main_pid <= 0 )); then
+    return 1
+  fi
+  python3 "$REPO_ROOT/deploy/port_check.py" owned-by-pid "$p" "$main_pid"
 }
 
 port_claimed_by_other_unit() {
@@ -143,21 +156,17 @@ if [[ -z "$PORT_TRIAGE" && ! -L "$TRIAGE_ENV" && -f "$TRIAGE_ENV" ]]; then
 fi
 PORT_TRIAGE="${PORT_TRIAGE:-40716}"
 
-REUSED_INTAKE_PORT=0
 if [[ -z "${PORT_INTAKE:-}" && ! -L "$INTAKE_APP_DIR/.env" && -f "$INTAKE_APP_DIR/.env" ]]; then
   EXISTING_INTAKE_PORT="$(read_existing_env_key "$INTAKE_APP_DIR/.env" "MOVIE_INTEL_PORT")"
   if [[ "$EXISTING_INTAKE_PORT" =~ ^[0-9]{4,5}$ ]]; then
     PORT_INTAKE="$EXISTING_INTAKE_PORT"
-    REUSED_INTAKE_PORT=1
   fi
 fi
 
-REUSED_ACTIONS_PORT=0
 if [[ -z "${PORT_ACTIONS:-}" && ! -L "$ACTIONS_APP_DIR/.env" && -f "$ACTIONS_APP_DIR/.env" ]]; then
   EXISTING_ACTIONS_PORT="$(read_existing_env_key "$ACTIONS_APP_DIR/.env" "ACTIONS_PORT")"
   if [[ "$EXISTING_ACTIONS_PORT" =~ ^[0-9]{4,5}$ ]]; then
     PORT_ACTIONS="$EXISTING_ACTIONS_PORT"
-    REUSED_ACTIONS_PORT=1
   fi
 fi
 
@@ -165,11 +174,12 @@ echo "[1/6] Selecting two distinct unassigned loopback ports..."
 FREE_PORTS=()
 if [[ -z "${PORT_INTAKE:-}" || -z "${PORT_ACTIONS:-}" ]]; then
   if command -v app-ports >/dev/null 2>&1; then
+    APP_PORTS_RAW="$(app-ports free 2>/dev/null || true)"
     while read -r candidate; do
       if [[ -n "$candidate" ]] && [[ "$candidate" != "$PORT_TRIAGE" ]] && ! port_in_use "$candidate"; then
         FREE_PORTS+=("$candidate")
       fi
-    done < <(app-ports free | grep -Eo '[0-9]{4,5}' || true)
+    done < <(python3 "$REPO_ROOT/deploy/port_check.py" parse-app-ports <<< "$APP_PORTS_RAW")
   elif [[ "$DRY_RUN" -eq 1 ]]; then
     FREE_PORTS=("40720" "40721")
   else
@@ -215,12 +225,12 @@ if port_claimed_by_other_unit "$PORT_ACTIONS" "$ACTIONS_SERVICE"; then
   echo "Error: PORT_ACTIONS ($PORT_ACTIONS) is already configured in another user systemd unit." >&2
   exit 1
 fi
-if [[ "$REUSED_INTAKE_PORT" -eq 0 ]] && port_listening "$PORT_INTAKE"; then
-  echo "Error: PORT_INTAKE ($PORT_INTAKE) is already listening on this host." >&2
+if port_listening "$PORT_INTAKE" && ! port_owned_by_service "$PORT_INTAKE" "$INTAKE_SERVICE"; then
+  echo "Error: PORT_INTAKE ($PORT_INTAKE) is already listening under another process on this host." >&2
   exit 1
 fi
-if [[ "$REUSED_ACTIONS_PORT" -eq 0 ]] && port_listening "$PORT_ACTIONS"; then
-  echo "Error: PORT_ACTIONS ($PORT_ACTIONS) is already listening on this host." >&2
+if port_listening "$PORT_ACTIONS" && ! port_owned_by_service "$PORT_ACTIONS" "$ACTIONS_SERVICE"; then
+  echo "Error: PORT_ACTIONS ($PORT_ACTIONS) is already listening under another process on this host." >&2
   exit 1
 fi
 echo "Selected loopback ports: intake=127.0.0.1:${PORT_INTAKE}, actions=127.0.0.1:${PORT_ACTIONS}, triage=127.0.0.1:${PORT_TRIAGE}"
@@ -381,21 +391,25 @@ systemctl --user restart "$ACTIONS_SERVICE" "$INTAKE_SERVICE"
 wait_for_health() {
   local svc_name="$1"
   local port="$2"
+  local role="$3"
   local attempt body
   for attempt in $(seq 1 15); do
-    if body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
-      printf '%s\n' "$body" | python3 -m json.tool
-      return 0
+    if port_owned_by_service "$port" "$svc_name"; then
+      if body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
+        if python3 "$REPO_ROOT/deploy/port_check.py" verify-health --role "$role" --port "$port" --shadow "$SHADOW_MODE" <<< "$body"; then
+          return 0
+        fi
+      fi
     fi
     sleep 1
   done
-  echo "Error: ${svc_name} did not pass loopback /health on 127.0.0.1:${port}. Inspect: journalctl --user -u ${svc_name} -n 50" >&2
+  echo "Error: ${svc_name} did not pass PID-verified loopback /health on 127.0.0.1:${port} (role=${role}, shadow=${SHADOW_MODE}). Inspect: journalctl --user -u ${svc_name} -n 50" >&2
   return 1
 }
 
-echo "[6/6] Running loopback health checks..."
-wait_for_health "$ACTIONS_SERVICE" "$PORT_ACTIONS"
-wait_for_health "$INTAKE_SERVICE" "$PORT_INTAKE"
+echo "[6/6] Running PID-verified loopback health checks..."
+wait_for_health "$ACTIONS_SERVICE" "$PORT_ACTIONS" "actions"
+wait_for_health "$INTAKE_SERVICE" "$PORT_INTAKE" "intake"
 
 echo ""
 echo "Deployment complete (legacy movie-intel.service left untouched)."
