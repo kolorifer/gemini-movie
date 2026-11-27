@@ -1291,7 +1291,7 @@ def compute_baseline_legacy_evidence_digest(raw_payload: dict[str, Any]) -> Opti
     category = _clean_str(release.get("category")) or _clean_str(data.get("category"))
     resolution = _clean_str(release.get("resolution"))
     source = _clean_str(release.get("source"))
-    media_processing = _clean_str(release.get("media_processing"))
+    media_processing = _clean_str(release.get("media_processing") or release.get("container"))
     hint_title = _clean_str(release.get("title"))
     hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
 

@@ -762,9 +762,19 @@ class IntakeDB:
                     latest_occ_row is not None
                     and str(latest_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
                 )
-                if classified.has_download_url:
-                    source_occ = occurrence_id
-                elif latest_is_ineligible_pre_upgrade and cur_source_occ == latest_occ_id:
+                cur_source_is_ineligible = False
+                if cur_source_occ == latest_occ_id:
+                    cur_source_is_ineligible = latest_is_ineligible_pre_upgrade
+                elif cur_source_occ:
+                    src_occ_row = conn.execute(
+                        "SELECT classification FROM occurrences WHERE occurrence_id = ?",
+                        (cur_source_occ,),
+                    ).fetchone()
+                    cur_source_is_ineligible = (
+                        src_occ_row is not None
+                        and str(src_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
+                    )
+                if classified.has_download_url or cur_source_is_ineligible:
                     source_occ = occurrence_id
                 else:
                     source_occ = cur_source_occ

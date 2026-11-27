@@ -2824,6 +2824,55 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertFalse(first.catalogue_identification.compatible, label)
                 self.assertFalse(second.cached, label)
 
+        # 5) Localized alias omitting the year numeral STILL resolves a genuine remastered
+        #    numeral-title film when catalogue titles corroborate both numeral and alias
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "db.sqlite")
+            test_db.init_db()
+            echo_1984 = TmdbMovie(
+                tmdb_id=44,
+                imdb_id="tt4444444",
+                canonical_title="Echo 1984",
+                year=2020,
+                director="Jane Cole",
+                runtime_minutes=103,
+                alternative_titles=("Dolina",),
+            )
+            client = TmdbClient(api_key="fixture")
+
+            def _search_echo(q_title: str, q_year: Optional[int] = None):
+                if q_title.lower() == "echo 1984" and (q_year is None or abs(q_year - 2020) <= 1):
+                    return [{"id": 44, "title": "Echo 1984", "original_title": "Echo 1984", "release_date": "2020-09-15", "popularity": 10}]
+                return []
+
+            client._search_results = _search_echo  # type: ignore[method-assign]
+            client._fetch_movie_details = lambda i: echo_1984  # type: ignore[method-assign]
+            client._find_tmdb_id_by_imdb = lambda i: 44  # type: ignore[method-assign]
+            req = EvaluateRequest(
+                raw_text="Echo.1984.2020.Remastered.1080p.BluRay.REMUX-Z",
+                hint_title="Dolina",
+                hint_year=2020,
+                torrent_info=TorrentInfo(runtime_minutes=103),
+            )
+            model_res = _sample_payload(
+                title="Echo 1984",
+                year=2020,
+                director="Jane Cole",
+                runtime_minutes=103,
+                imdb_id="tt4444444",
+                tmdb_id=44,
+            )
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", client),
+                patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+            ):
+                first = asyncio.run(main.evaluate(req))
+                second = asyncio.run(main.evaluate(req))
+            assert first.catalogue_identification is not None
+            self.assertTrue(first.catalogue_identification.compatible)
+            self.assertTrue(second.cached)
+
 
 if __name__ == "__main__":
     unittest.main()
