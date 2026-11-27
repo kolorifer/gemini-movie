@@ -530,21 +530,21 @@ def _evaluate_remux_quality_eligibility(
     if not meta_res:
         return False, "missing_metadata_resolution"
     if meta_res not in _ELIGIBLE_REMUX_RESOLUTIONS:
-        return False, f"ineligible_metadata_resolution:{meta_res}"
+        return False, "ineligible_metadata_resolution"
     if meta_res != name_res:
-        return False, f"resolution_mismatch:{name_res}_vs_{meta_res}"
+        return False, "resolution_mismatch"
 
     meta_src = re.sub(r"[\s._-]+", "", (source or "").strip().lower())
     if not meta_src:
         return False, "missing_metadata_source"
     if meta_src not in _ELIGIBLE_META_DISC_SOURCES:
-        return False, f"ineligible_metadata_source:{meta_src}"
+        return False, "ineligible_metadata_source"
 
     meta_proc = re.sub(r"[\s._-]+", "", (media_processing or "").strip().lower())
     if not meta_proc:
         return False, "missing_metadata_processing"
     if meta_proc not in _ELIGIBLE_META_REMUX_PROCESSING:
-        return False, f"ineligible_metadata_processing:{meta_proc}"
+        return False, "ineligible_metadata_processing"
 
     if name_res == "1080p" and ("uhd" in meta_src or "uhd" in token_set):
         return False, "uhd_source_incompatible_with_1080p_remux"
@@ -857,7 +857,7 @@ def classify_webhook_payload(
     if top_event not in _QUALIFYING_ACTION_EVENTS:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"non_qualifying_event:{top_event or 'missing'}",
+            diagnostic_note="non_qualifying_event" if top_event else "missing_event",
         )
 
     data = raw_payload.get("data")
@@ -901,7 +901,7 @@ def classify_webhook_payload(
     if not action_is_radarr:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"non_radarr_action:{redact_secrets(action_type_raw or 'missing', max_chars=40)}",
+            diagnostic_note="non_radarr_action" if action_type_raw else "missing_action_type",
             action_rejected=action_rejected,
             action_is_radarr=False,
             rejections=rejections,
@@ -913,7 +913,7 @@ def classify_webhook_payload(
     if not filter_valid or not filter_name or _normalize_filter_name(filter_name) not in allowed_names_norm:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"filter_mismatch:{redact_secrets(filter_name or 'missing', max_chars=80)}",
+            diagnostic_note="filter_mismatch" if filter_name else "missing_filter_name",
             action_rejected=action_rejected,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
@@ -922,7 +922,7 @@ def classify_webhook_payload(
     if allowed_filter_ids and (filter_id is None or filter_id not in allowed_filter_ids):
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"filter_id_mismatch:{filter_id if filter_id is not None else 'missing'}",
+            diagnostic_note="filter_id_mismatch" if filter_id is not None else "missing_filter_id",
             action_rejected=action_rejected,
             action_is_radarr=action_is_radarr,
             rejections=rejections,
@@ -948,11 +948,11 @@ def classify_webhook_payload(
     if has_non_movie_cat:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"non_movie_category:{redact_secrets(category, max_chars=80)}",
+            diagnostic_note="non_movie_category",
         )
 
     if has_movie_cat and (release_type in _CONFLICTING_RELEASE_TYPES or _EPISODIC_RELEASE_RE.search(exact_name)):
-        conflict_detail = release_type or "episodic_release_name"
+        conflict_detail = release_type if release_type in _CONFLICTING_RELEASE_TYPES else "episodic_release_name"
         return ClassifiedWebhook(
             classification="movie_category_type_conflict",
             diagnostic_note=f"movie_category_conflicting_release_type:{conflict_detail}",
@@ -972,7 +972,7 @@ def classify_webhook_payload(
     if not has_movie_cat and release_type not in _MOVIE_RELEASE_TYPES:
         return ClassifiedWebhook(
             classification="non_movie_archive_only",
-            diagnostic_note=f"unclassified_non_movie:cat={redact_secrets(category or 'none', max_chars=40)},type={release_type or 'none'}",
+            diagnostic_note="unclassified_non_movie",
         )
 
     resolution = _clean_str(release.get("resolution"))
@@ -1122,3 +1122,133 @@ def classify_webhook_payload(
         release_name_too_long=release_name_too_long,
         incoming_evidence_digest=incoming_digest,
     )
+
+
+def compute_legacy_occurrence_evidence_digest(raw_payload: dict[str, Any]) -> Optional[str]:
+    """
+    Recompute the current `incoming_evidence_digest` from a historical archived webhook JSON
+    without re-applying event/filter/quality allowlist gates (used during pre-upgrade migration
+    backfill so older pre-upgrade deliveries are recognized as superseded evidence on replay).
+    """
+    if not isinstance(raw_payload, dict):
+        return None
+    data = raw_payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    release = data.get("release")
+    if not isinstance(release, dict):
+        return None
+    exact_name = _clean_str(release.get("name")) or _clean_str(release.get("torrent_name"))
+    if not exact_name:
+        return None
+
+    top_event = (_clean_str(raw_payload.get("event")) or _clean_str(raw_payload.get("type")) or "").lower()
+    (
+        action_rejected,
+        action_is_radarr,
+        rejections,
+        _action_type_raw,
+        _result_status,
+        has_malformed_rejections,
+    ) = _extract_action_info(raw_payload, data, top_event=top_event)
+
+    indexer_raw = _extract_indexer_name(raw_payload, data, release)
+    external_id_raw = release.get("external_id")
+    if external_id_raw is None:
+        external_id_raw = release.get("torrent_id")
+    external_id_norm = str(external_id_raw).strip() if external_id_raw is not None else ""
+
+    category = _clean_str(release.get("category")) or _clean_str(data.get("category"))
+    resolution = _clean_str(release.get("resolution"))
+    source = _clean_str(release.get("source"))
+    media_processing = _clean_str(release.get("media_processing"))
+    hint_title = _clean_str(release.get("title"))
+    hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
+
+    raw_season = release.get("season")
+    raw_episode = release.get("episode")
+    has_season_or_episode = bool(
+        (isinstance(raw_season, int) and not isinstance(raw_season, bool) and raw_season > 0)
+        or (isinstance(raw_episode, int) and not isinstance(raw_episode, bool) and raw_episode > 0)
+        or (isinstance(raw_season, str) and raw_season.strip() not in ("", "0"))
+        or (isinstance(raw_episode, str) and raw_episode.strip() not in ("", "0"))
+        or _EPISODIC_RELEASE_RE.search(exact_name)
+    )
+
+    meta_imdb = _clean_imdb(release.get("meta_imdb") or release.get("imdb_id"))
+    meta_tmdb = _clean_int(release.get("meta_tmdb") or release.get("tmdb_id"), min_val=1)
+    dynamic_range = _clean_str_list(release.get("hdr") or release.get("dynamic_range"))
+    group = _clean_str(release.get("group"))
+    size_gb = _parse_size_gb(release)
+
+    freeleech: Optional[bool] = None
+    if "freeleech" in release:
+        freeleech = _clean_bool(release.get("freeleech"))
+    elif "is_freeleech" in release:
+        freeleech = _clean_bool(release.get("is_freeleech"))
+
+    first_download_url: Optional[str] = None
+    for container in (release, data, raw_payload):
+        for k in ("download_url", "downloadUrl", "torrent_url", "torrentUrl"):
+            val = container.get(k)
+            if isinstance(val, str) and val.strip():
+                first_download_url = val.strip()
+                break
+        if first_download_url:
+            break
+
+    has_canonical_tl_download_ref = bool(
+        first_download_url and is_canonical_tl_download_url(first_download_url, external_id_norm)
+    )
+
+    def _san_opt(val: Optional[str], limit: int) -> Optional[str]:
+        if not val:
+            return None
+        cleaned = redact_secrets(val, max_chars=limit)
+        return cleaned or None
+
+    release_name_too_long = len(exact_name) > MAX_ALT_GRAB_RELEASE_NAME_LEN
+    safe_indexer_raw = redact_secrets(indexer_raw, max_chars=80)
+    safe_indexer_norm = safe_indexer_raw.lower()
+    safe_external_id_norm = redact_secrets(external_id_norm, max_chars=80)
+    safe_exact_name = redact_secrets(exact_name, max_chars=512)
+    safe_hint_title = _san_opt(hint_title, 240)
+    safe_category = _san_opt(category, 120)
+    safe_resolution = _san_opt(resolution, 40)
+    safe_source = _san_opt(source, 60)
+    safe_dynamic_range = [
+        clean
+        for d in dynamic_range
+        for clean in (redact_secrets(d, max_chars=40),)
+        if clean
+    ]
+    safe_media_processing = _san_opt(media_processing, 60)
+    safe_group = _san_opt(group, 80)
+
+    digest_input = {
+        "indexer": safe_indexer_norm,
+        "external_id": safe_external_id_norm,
+        "exact_release_name": safe_exact_name,
+        "hint_title": safe_hint_title.lower() if safe_hint_title else None,
+        "hint_year": hint_year,
+        "category": safe_category.lower() if safe_category else None,
+        "meta_imdb": meta_imdb,
+        "meta_tmdb": meta_tmdb,
+        "resolution": safe_resolution.lower() if safe_resolution else None,
+        "source": safe_source.lower() if safe_source else None,
+        "dynamic_range": sorted({d.lower() for d in safe_dynamic_range}),
+        "media_processing": safe_media_processing.lower() if safe_media_processing else None,
+        "group": safe_group.lower() if safe_group else None,
+        "size_gb": size_gb,
+        "freeleech": freeleech,
+        "action_rejected": action_rejected,
+        "action_is_radarr": action_is_radarr,
+        "rejections": rejections,
+        "has_malformed_rejections": has_malformed_rejections,
+        "has_canonical_tl_download_ref": has_canonical_tl_download_ref,
+        "has_season_or_episode": has_season_or_episode,
+        "release_name_too_long": release_name_too_long,
+    }
+    return hashlib.sha256(
+        json.dumps(digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()

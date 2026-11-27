@@ -179,16 +179,20 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     except GeminiClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    pre_conflict_tmdb = None
-    if tmdb_client.enabled and (
-        tmdb_movie is None or not is_tmdb_compatible(result.identification, tmdb_movie)
-    ):
-        if tmdb_movie is not None and not is_tmdb_compatible(result.identification, tmdb_movie):
-            pre_conflict_tmdb = tmdb_movie
-        verified_candidate = await tmdb_client.verify_identification(result.identification)
-        tmdb_movie = verified_candidate if verified_candidate is not None else pre_conflict_tmdb
+    release_tmdb = lookup.movie
+    if release_tmdb is not None:
+        # Blocker 1: Never replace a release-grounded catalogue identity with a
+        # lookup of the model's competing suggestion. Keep both separate so any
+        # disagreement returns an explicit conflict and withholds trusted caching.
+        verified_result = apply_tmdb_verification(result, release_tmdb)
+    else:
+        verified_candidate = (
+            await tmdb_client.verify_identification(result.identification)
+            if tmdb_client.enabled
+            else None
+        )
+        verified_result = apply_tmdb_verification(result, verified_candidate)
 
-    verified_result = apply_tmdb_verification(result, tmdb_movie)
     result_dict = verified_result.model_dump()
 
     # Withhold caching when catalogue verification found an unresolved incompatibility

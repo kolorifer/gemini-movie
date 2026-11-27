@@ -4501,6 +4501,298 @@ Language : German
         self.assertIn("[truncated:", res_huge.error_redacted)
         self.assertNotIn("HUGE_SECRET_666", res_huge.error_redacted)
 
+    def test_pr18_blocker_3_pre_upgrade_schema_replay_preserves_correction(self) -> None:
+        """PR #18 Blocker 3: Replaying original A (exact or re-wrapped) after upgrading from legacy schema preserves correction B."""
+        import sqlite3
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cfg = _make_config(base)
+            cfg.intake_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            def _make_body(imdb_id: str, event_id: str) -> bytes:
+                return json.dumps(
+                    {
+                        "event": "action.rejected",
+                        "id": event_id,
+                        "data": {
+                            "indexer": "TorrentLeech",
+                            "action": {"type": "RADARR"},
+                            "filter": {"id": 7, "name": "Movies Remux"},
+                            "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                            "release": {
+                                "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                                "type": "movie",
+                                "title": "North Field",
+                                "year": 2021,
+                                "meta_imdb": imdb_id,
+                                "resolution": "1080p",
+                                "media_processing": "REMUX",
+                                "source": "BluRay",
+                                "external_id": "445001",
+                                "category": "Movies :: Bluray",
+                            },
+                        },
+                    }
+                ).encode("utf-8")
+
+            raw_a = _make_body("tt4440001", "event-tt4440001")
+            raw_b = _make_body("tt4440002", "event-tt4440002")
+            rec_a = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-a", raw_a)
+            rec_b = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-b", raw_b)
+
+            # Seed exact pre-upgrade baseline schema (06ee6078): occurrences has NO incoming_evidence_digest column
+            conn = sqlite3.connect(str(cfg.intake_db_path))
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE occurrences (
+                        occurrence_id            TEXT PRIMARY KEY,
+                        received_at              TEXT NOT NULL,
+                        archive_relpath          TEXT NOT NULL,
+                        archive_sha256           TEXT NOT NULL,
+                        payload_bytes            INTEGER NOT NULL,
+                        classification           TEXT NOT NULL,
+                        diagnostic_note          TEXT,
+                        release_id               TEXT
+                    );
+                    CREATE TABLE releases (
+                        release_id               TEXT PRIMARY KEY,
+                        indexer_norm             TEXT NOT NULL,
+                        external_id_norm         TEXT NOT NULL,
+                        exact_release_name       TEXT NOT NULL,
+                        first_occurrence_id      TEXT NOT NULL,
+                        latest_occurrence_id     TEXT NOT NULL,
+                        source_occurrence_id     TEXT NOT NULL,
+                        card_revision            INTEGER NOT NULL DEFAULT 0,
+                        state                    TEXT NOT NULL,
+                        pending_reprocess        INTEGER NOT NULL DEFAULT 0,
+                        incoming_evidence_digest TEXT NOT NULL,
+                        incoming_snapshot_json   TEXT NOT NULL,
+                        full_evidence_digest     TEXT,
+                        last_evaluated_digest    TEXT,
+                        tl_status                TEXT,
+                        tl_metadata_json         TEXT,
+                        verified_tmdb_id         INTEGER,
+                        verified_imdb_id         TEXT,
+                        verified_title           TEXT,
+                        verified_year            INTEGER,
+                        radarr_status_json       TEXT,
+                        evaluation_json          TEXT,
+                        ack_chat_id              TEXT,
+                        ack_message_id           INTEGER,
+                        ack_thread_id            INTEGER,
+                        ack_incoming_digest      TEXT,
+                        eval_reply_status        TEXT,
+                        pending_card_supersede_json TEXT,
+                        pending_eval_reply_json  TEXT,
+                        retry_count              INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at          TEXT NOT NULL,
+                        lease_owner              TEXT,
+                        lease_expires_at         TEXT,
+                        last_error_redacted      TEXT,
+                        created_at               TEXT NOT NULL,
+                        updated_at               TEXT NOT NULL,
+                        UNIQUE (indexer_norm, external_id_norm, exact_release_name)
+                    );
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'queued', 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "rel-legacy-1",
+                        "torrentleech",
+                        "445001",
+                        "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                        "occ-legacy-a",
+                        "occ-legacy-b",
+                        "occ-legacy-b",
+                        "legacy-v0-digest-of-b",
+                        json.dumps({"meta_imdb": "tt4440002", "exact_release_name": "North.Field.2021.1080p.BluRay.REMUX-GROUP"}),
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:01+00:00",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id
+                    ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-1')
+                    """,
+                    ("occ-legacy-a", "2026-11-26T00:00:00+00:00", rec_a.archive_relpath, rec_a.archive_sha256, rec_a.payload_bytes),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id
+                    ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-1')
+                    """,
+                    ("occ-legacy-b", "2026-11-26T00:00:01+00:00", rec_b.archive_relpath, rec_b.archive_sha256, rec_b.payload_bytes),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            os.chmod(cfg.intake_db_path, 0o600)
+
+            # Open migrated DB with normal candidate app and replay exact A, then re-wrapped A (new event.id)
+            db = IntakeDB(cfg.intake_db_path)
+            app = create_app(cfg, db=db, start_worker=False)
+            with TestClient(app) as client:
+                r_exact = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_a,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_exact.status_code, 200)
+                self.assertEqual(r_exact.json()["status"], "coalesced_duplicate")
+
+                row_after_exact = db.list_all_releases()[0]
+                self.assertEqual(json.loads(row_after_exact["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 3)
+
+                # Re-wrapped replay of A with a different event id (different archive_sha256, same evidence digest)
+                raw_a_rewrapped = _make_body("tt4440001", "event-tt4440001-rewrapped")
+                r_rewrapped = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_a_rewrapped,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_rewrapped.status_code, 200)
+                self.assertEqual(r_rewrapped.json()["status"], "coalesced_duplicate")
+
+                row_after_rewrap = db.list_all_releases()[0]
+                self.assertEqual(json.loads(row_after_rewrap["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 4)
+                self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), 4)
+
+    def test_pr18_blocker_5_rejected_webhook_never_copies_raw_fields_into_sqlite(self) -> None:
+        """PR #18 Blocker 5: Invalid metadata/filter/action/category rejection branches store fixed reason codes with zero raw field text in SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+            app = create_app(cfg, db=db, start_worker=False)
+
+            marker = "HARMLESS_PRIVATE_MARKER_7741"
+            base_release = {
+                "name": "Example.Film.2024.2160p.UHD.BluRay.REMUX-GROUP",
+                "type": "movie",
+                "title": "Example Film",
+                "year": 2024,
+                "category": "Movies :: 4K",
+                "external_id": "445009",
+                "resolution": "2160p",
+                "source": "UHD BluRay",
+                "media_processing": "REMUX",
+            }
+            cases = [
+                # Invalid source containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "source": f"WEB-{marker}"},
+                    },
+                },
+                # Invalid resolution containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "resolution": f"720p-{marker}"},
+                    },
+                },
+                # Invalid media_processing containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "media_processing": f"Encode-{marker}"},
+                    },
+                },
+                # Mismatched filter name containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": f"OtherFilter-{marker}"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": dict(base_release),
+                    },
+                },
+                # Non-Radarr action type containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": f"SONARR-{marker}"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": dict(base_release),
+                    },
+                },
+                # Unclassified category/type containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "type": f"custom-{marker}", "category": f"Other :: {marker}"},
+                    },
+                },
+            ]
+
+            with TestClient(app) as client:
+                for body in cases:
+                    raw = json.dumps(body).encode("utf-8")
+                    r = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    self.assertEqual(r.json()["status"], "archived_non_movie")
+
+            occs = db.list_all_occurrences()
+            self.assertEqual(len(occs), len(cases))
+            self.assertEqual(len(db.list_all_releases()), 0)
+            notes = [str(o.get("diagnostic_note") or "") for o in occs]
+            self.assertIn("ineligible_quality:ineligible_metadata_source", notes)
+            self.assertIn("ineligible_quality:ineligible_metadata_resolution", notes)
+            self.assertIn("ineligible_quality:ineligible_metadata_processing", notes)
+            self.assertIn("filter_mismatch", notes)
+            self.assertIn("non_radarr_action", notes)
+            self.assertIn("unclassified_non_movie", notes)
+            # Zero leakage of raw marker anywhere in SQLite occurrences!
+            for o in occs:
+                self.assertNotIn(marker, json.dumps(o))
+            # Raw archive still preserves exact incoming bytes
+            self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), len(cases))
+
 
 if __name__ == "__main__":
     unittest.main()

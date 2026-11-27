@@ -220,6 +220,67 @@ class TestDeployAndShadowSuite(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("PROD_INTERNAL_SECRET_MUST_NOT_LEAK", sh_intake_out.read_text(encoding="utf-8"))
             self.assertNotIn("PROD_INTERNAL_SECRET_MUST_NOT_LEAK", sh_actions_out.read_text(encoding="utf-8"))
 
+            # PR #18 Blocker 4: Custom autobrr filter name and ID must survive fresh install AND upgrade regeneration
+            custom_intake, custom_actions = build_sliced_envs(
+                home_dir=home,
+                port_intake=40720,
+                port_actions=40721,
+                port_triage=40716,
+                internal_api_secret="sec-filter-test",
+                legacy_env={},
+                existing_intake_env={},
+                existing_actions_env={},
+                override_env={
+                    "MOVIE_INTEL_ALLOWED_FILTERS": "Custom UHD Remux",
+                    "MOVIE_INTEL_ALLOWED_FILTER_IDS": "17",
+                },
+            )
+            self.assertEqual(custom_intake["MOVIE_INTEL_ALLOWED_FILTERS"], "Custom UHD Remux")
+            self.assertEqual(custom_intake["MOVIE_INTEL_ALLOWED_FILTER_IDS"], "17")
+            self.assertNotIn("MOVIE_INTEL_ALLOWED_FILTERS", custom_actions)
+            self.assertNotIn("MOVIE_INTEL_ALLOWED_FILTER_IDS", custom_actions)
+
+            # Write to .env, re-read on simulated upgrade regeneration (empty overrides), and verify ID 17 still enforced!
+            intake_env_file = base / "upgrade_out" / "intake.env"
+            actions_env_file = base / "upgrade_out" / "actions.env"
+            atomic_write_env_file(intake_env_file, INTAKE_ALLOWED_KEYS, custom_intake)
+            atomic_write_env_file(actions_env_file, ACTIONS_ALLOWED_KEYS, custom_actions)
+            parsed_existing_intake = read_owner_private_env(intake_env_file, required=True)
+            upgraded_intake, _ = build_sliced_envs(
+                home_dir=home,
+                port_intake=40720,
+                port_actions=40721,
+                port_triage=40716,
+                internal_api_secret="sec-filter-test",
+                legacy_env={},
+                existing_intake_env=parsed_existing_intake,
+                existing_actions_env={},
+                override_env={},
+            )
+            self.assertEqual(upgraded_intake["MOVIE_INTEL_ALLOWED_FILTERS"], "Custom UHD Remux")
+            self.assertEqual(upgraded_intake["MOVIE_INTEL_ALLOWED_FILTER_IDS"], "17")
+
+            from services.movie_intake_api.config import IntakeConfig
+
+            loaded_cfg = IntakeConfig.from_env(upgraded_intake)
+            self.assertEqual(loaded_cfg.allowed_filter_names, ("Custom UHD Remux",))
+            self.assertEqual(loaded_cfg.allowed_filter_ids, (17,))
+
+            # Invalid filter IDs must fail validation loudly
+            for bad_ids in ("0", "-5", "abc", "17,notanint"):
+                with self.assertRaises(EnvSecurityError):
+                    build_sliced_envs(
+                        home_dir=home,
+                        port_intake=40720,
+                        port_actions=40721,
+                        port_triage=40716,
+                        internal_api_secret="sec-filter-test",
+                        legacy_env={},
+                        existing_intake_env={},
+                        existing_actions_env={},
+                        override_env={"MOVIE_INTEL_ALLOWED_FILTER_IDS": bad_ids},
+                    )
+
     def test_deploy_scripts_and_nginx_security_invariants(self) -> None:
         suite_script = REPO_ROOT / "deploy" / "deploy-suite-ultra.sh"
         triage_script = REPO_ROOT / "deploy-ultra.sh"
