@@ -388,13 +388,19 @@ class MovieNotificationScope(unittest.TestCase):
         )
 
     def test_op2_tracker_retry_after_honors_multi_hour_deadlines(self) -> None:
-        """Op2: Numeric and HTTP-date Retry-After > 1h must not be clamped to 3600s."""
+        """Op2 & PR #18 Gap 4: Numeric and HTTP-date Retry-After (multi-hour and multi-day, e.g. 8 days) honored verbatim."""
         ref_now = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(parse_retry_after_seconds("7200", now=ref_now), 7200.0)
         self.assertEqual(parse_retry_after_seconds("14400", now=ref_now), 14400.0)
+        eight_days_sec = 8 * 24 * 3600
+        self.assertEqual(parse_retry_after_seconds(str(eight_days_sec), now=ref_now), float(eight_days_sec))
 
         two_hours_later = email.utils.format_datetime(ref_now + timedelta(hours=2), usegmt=True)
         self.assertAlmostEqual(parse_retry_after_seconds(two_hours_later, now=ref_now), 7200.0, delta=1.0)
+        eight_days_later = email.utils.format_datetime(ref_now + timedelta(days=8), usegmt=True)
+        self.assertAlmostEqual(
+            parse_retry_after_seconds(eight_days_later, now=ref_now), float(eight_days_sec), delta=1.0
+        )
 
         with tempfile.TemporaryDirectory() as scratch:
             db = IntakeDB(Path(scratch) / "intake.db")
@@ -450,7 +456,7 @@ class MovieNotificationScope(unittest.TestCase):
             self.assertEqual(call_count, 1)
 
     def test_op3_archive_durability_syncs_containing_directories(self) -> None:
-        """Op3: atomic_write_private_file and archive_raw_webhook fsync directories after rename/mkdir."""
+        """Op3 & PR #18 Gap 4: verify_archive_root, archive_raw_webhook (including post-failure retries), and atomic_write fsync parent dirs."""
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             archive_root = root / "webhook-archive"
@@ -458,17 +464,43 @@ class MovieNotificationScope(unittest.TestCase):
 
             from services.movie_intake_api import archive as archive_mod
             from services.movie_intake_api import security as sec_mod
+            from services.movie_intake_api.archive import ArchivePersistenceError, verify_archive_root
 
             orig_fsync_dir = sec_mod.fsync_directory
+            fail_once_path: list[Optional[Path]] = [None]
 
             def _spy_fsync_dir(path: Path) -> None:
-                synced_dirs.append(path.resolve())
+                resolved = path.resolve()
+                if fail_once_path[0] is not None and resolved == fail_once_path[0]:
+                    fail_once_path[0] = None
+                    raise OSError("Simulated transient dir fsync error")
+                synced_dirs.append(resolved)
                 orig_fsync_dir(path)
 
             raw = b'{"event":"release.new","data":{"invented":true}}'
             with mock.patch.object(sec_mod, "fsync_directory", side_effect=_spy_fsync_dir), mock.patch.object(
                 archive_mod, "fsync_directory", side_effect=_spy_fsync_dir
             ):
+                # 1) Startup root creation must fsync archive_root.parent AND archive_root!
+                self.assertTrue(verify_archive_root(archive_root))
+                self.assertIn(root.resolve(), synced_dirs)
+                self.assertIn(archive_root.resolve(), synced_dirs)
+
+                # 2) Simulate transient dir-fsync failure after creating 2026/11/26 -> retry MUST STILL sync parent chain!
+                synced_dirs.clear()
+                month_dir = (archive_root / "2026" / "11").resolve()
+                fail_once_path[0] = month_dir
+                with self.assertRaises(ArchivePersistenceError):
+                    archive_raw_webhook(
+                        archive_root,
+                        "occ-op3-fail-1",
+                        raw,
+                        received_at=datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc),
+                    )
+                self.assertNotIn(month_dir, synced_dirs)
+
+                # Subsequent write into already-created 2026/11/26 MUST still fsync root parent, root, year, month, and day!
+                synced_dirs.clear()
                 receipt = archive_raw_webhook(
                     archive_root,
                     "occ-op3-test-1",
@@ -477,9 +509,11 @@ class MovieNotificationScope(unittest.TestCase):
                 )
                 target_file = (archive_root / receipt.archive_relpath).resolve()
                 self.assertEqual(target_file.read_bytes(), raw)
-                # Must have fsynced the leaf day directory AFTER atomic rename AND the newly created date parent dirs
-                self.assertIn(target_file.parent, synced_dirs)
+                self.assertIn(root.resolve(), synced_dirs)
                 self.assertIn(archive_root.resolve(), synced_dirs)
+                self.assertIn((archive_root / "2026").resolve(), synced_dirs)
+                self.assertIn(month_dir, synced_dirs)
+                self.assertIn(target_file.parent, synced_dirs)
 
                 synced_dirs.clear()
                 other_target = root / "private-state" / "sample.bin"

@@ -212,7 +212,7 @@ def parse_mediainfo_file_signals(nfo_text: Optional[str]) -> tuple[Optional[int]
     return file_runtime, audio_langs[:6]
 
 
-MAX_TRACKER_RETRY_AFTER_SECONDS = 7 * 24 * 3600  # 7-day defensive ceiling; honors multi-hour tracker instructions
+MAX_TRACKER_RETRY_AFTER_SECONDS = 365 * 24 * 3600  # 365-day overflow ceiling; honors multi-hour and multi-day tracker instructions verbatim
 
 
 def parse_retry_after_seconds(

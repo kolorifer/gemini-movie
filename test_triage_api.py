@@ -56,6 +56,13 @@ def _sample_payload(
             metacritic=91,
             imdb=7.3,
             letterboxd=4.1,
+            sources={
+                "rotten_tomatoes_critics": "rottentomatoes.com",
+                "rotten_tomatoes_audience": "rottentomatoes.com",
+                "metacritic": "metacritic.com",
+                "imdb": "imdb.com",
+                "letterboxd": "letterboxd.com",
+            },
             missing_sources=[],
         ),
         recognition=Recognition(
@@ -981,6 +988,48 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                         "2099-01-01T00:00:00+00:00",
                     ),
                 )
+                # Also seed an unversioned legacy row with an out-of-range rating (must miss without ValidationError)
+                bad_legacy = json.loads(json.dumps(legacy_payload))
+                bad_legacy["ratings"]["imdb"] = 11.4
+                bad_legacy["ratings"]["sources"] = {}
+                conn.execute(
+                    """
+                    INSERT INTO evaluations (
+                        raw_text_normalized, release_key, raw_text_original,
+                        imdb_id, canonical_title, year, verdict, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy bad score 1984",
+                        "legacy bad score 1984",
+                        "Legacy Bad Score 1984",
+                        "tt0088118",
+                        "Legacy Bad Score",
+                        1984,
+                        "WATCH",
+                        json.dumps(bad_legacy),
+                        "2099-01-01T00:00:00+00:00",
+                    ),
+                )
+                # Seed a pre-upgrade feedback table row (no tmdb_id column) to verify feedback preservation
+                conn.execute(
+                    """
+                    CREATE TABLE feedback (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        imdb_id TEXT,
+                        title TEXT NOT NULL,
+                        decision TEXT NOT NULL,
+                        note TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO feedback (imdb_id, title, decision, note, created_at)
+                    VALUES ('tt0088117', 'Silent Night, Deadly Night', 'WATCH', 'watched', '2026-11-25T00:00:00+00:00')
+                    """
+                )
 
             db = TriageDB(db_file)
             db.init_db()
@@ -989,7 +1038,17 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(db_file.stat().st_mode), 0o600)
 
-            # Migrated row is readable with empty evidence_key, and blocked across remake years
+            # PR #18 Gap 1: Unversioned pre-upgrade evaluation rows MUST cleanly miss cache (never serving
+            # unvalidated/unsourced ratings or crashing on out-of-range scores), while feedback is preserved!
+            self.assertIsNone(db.get_cached_evaluation("Silent Night Deadly Night 1984"))
+            self.assertIsNone(db.get_cached_evaluation("Legacy Bad Score 1984"))
+            preserved_fb = db.get_recent_feedback(10)
+            self.assertEqual(len(preserved_fb), 1)
+            self.assertEqual(preserved_fb[0]["imdb_id"], "tt0088117")
+            self.assertEqual(preserved_fb[0]["decision"], "WATCH")
+
+            # Newly saved v2 row hits cache cleanly and stays blocked across remake years
+            db.save_evaluation("Silent Night Deadly Night 1984", legacy_payload)
             hit = db.get_cached_evaluation("Silent Night Deadly Night 1984")
             self.assertIsNotNone(hit)
             cross_year_miss = db.get_cached_evaluation(
@@ -1478,7 +1537,7 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 self.assertEqual(r3.total_feedback, 2)
 
     def test_issue_13_6d_rating_range_bounds_and_grounding_source_verification(self) -> None:
-        """Issue #13 §6d: Enforce numeric rating ranges and strip ungrounded ratings while retaining verified sources."""
+        """Issue #13 §6d & PR #18 Gap 3: Enforce numeric rating bounds and strict film/metric/value grounding attribution."""
         import json
         from types import SimpleNamespace
         from pydantic import ValidationError
@@ -1498,21 +1557,41 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 Ratings(**bad_kwargs)  # type: ignore[arg-type]
 
-        # 2) Out-of-range and ungrounded ratings become None (unknown); grounded ratings retain supporting source
+        # 2) Out-of-range, ungrounded, and third-party interview mentions become None (unknown);
+        #    only ratings backed by authoritative domain + actual film + metric + value are retained.
+        ident = {"canonical_title": "Example Film", "year": 2024, "imdb_id": "tt1234567"}
         raw_ratings = {
-            "rotten_tomatoes_critics": 94,       # grounded (rottentomatoes.com) -> kept
+            "rotten_tomatoes_critics": 94,       # grounded (rottentomatoes.com + film + Tomatometer 94%) -> kept
             "rotten_tomatoes_audience": 115,     # out of range -> None
             "metacritic": 88,                    # in range but NO metacritic grounding chunk -> None
-            "imdb": 8.1,                         # grounded (imdb.com) -> kept
+            "imdb": 8.1,                         # grounded (imdb.com/title/tt1234567 + IMDb 8.1/10) -> kept
             "letterboxd": 6.2,                   # out of range (>5.0) -> None
             "missing_sources": [],
         }
         grounding = [
-            {"domain": "rottentomatoes.com", "title": "Example Film | Rotten Tomatoes"},
-            {"domain": "imdb.com", "title": "Example Film (2024) - IMDb"},
-            {"domain": "en.wikipedia.org", "title": "Example Film - Wikipedia"},
+            {
+                "domain": "rottentomatoes.com",
+                "path": "/m/example_film",
+                "title": "Example Film | Rotten Tomatoes",
+                "snippet": "Example Film (2024): 94% Tomatometer critics rating",
+                "supported_segments": ['"rotten_tomatoes_critics": 94'],
+            },
+            {
+                "domain": "imdb.com",
+                "path": "/title/tt1234567/",
+                "title": "Example Film (2024) - IMDb",
+                "snippet": "IMDb rating 8.1/10",
+                "supported_segments": ['"imdb": 8.1'],
+            },
+            {
+                "domain": "en.wikipedia.org",
+                "path": "/wiki/Example_Film",
+                "title": "Example Film - Wikipedia",
+                "snippet": "",
+                "supported_segments": [],
+            },
         ]
-        cleaned = validate_and_ground_ratings(raw_ratings, grounding_sources=grounding)
+        cleaned = validate_and_ground_ratings(raw_ratings, grounding_sources=grounding, identification=ident)
         self.assertEqual(cleaned["rotten_tomatoes_critics"], 94)
         self.assertIsNone(cleaned["rotten_tomatoes_audience"])
         self.assertIsNone(cleaned["metacritic"])
@@ -1526,7 +1605,42 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         self.assertIn("Metacritic", cleaned["missing_sources"])
         self.assertIn("Letterboxd", cleaned["missing_sources"])
 
-        # 3) End-to-end GeminiTriageClient._call_sync strips ungrounded ratings when grounding_metadata is empty
+        # 2b) PR #18 Gap 3 negative cases:
+        #     - Unrelated third-party interview mentioning IMDb credits cannot retain invented 9.2 score!
+        #     - Authoritative imdb.com page WITHOUT score evidence (or wrong film tt ID) cannot retain 9.2!
+        weak_grounding = [
+            {
+                "domain": "filminterviews.example",
+                "path": "/director-interview",
+                "title": "Director Interview on IMDb Credits and Example Film",
+                "snippet": "Discussing IMDb credits and career highlights (9.2 out of 10 excitement).",
+                "supported_segments": ['"imdb": 9.2'],
+            },
+            {
+                "domain": "imdb.com",
+                "path": "/title/tt1234567/",
+                "title": "Example Film (2024) - IMDb",
+                "snippet": "Directed by Elena Vance. Full cast and crew.",
+                "supported_segments": [],
+            },
+            {
+                "domain": "imdb.com",
+                "path": "/title/tt9999999/",
+                "title": "Other Film (2024) - IMDb",
+                "snippet": "IMDb rating 9.2/10",
+                "supported_segments": ['"imdb": 9.2'],
+            },
+        ]
+        cleaned_weak = validate_and_ground_ratings(
+            {"imdb": 9.2, "missing_sources": []},
+            grounding_sources=weak_grounding,
+            identification=ident,
+        )
+        self.assertIsNone(cleaned_weak["imdb"])
+        self.assertEqual(cleaned_weak["sources"], {})
+        self.assertIn("IMDb", cleaned_weak["missing_sources"])
+
+        # 3) End-to-end GeminiTriageClient._call_sync enforces per-metric grounding_supports
         fake_payload_json = json.dumps(
             {
                 "identification": {
@@ -1568,8 +1682,20 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                                     uri="https://www.rottentomatoes.com/m/example_film",
                                     title="Example Film - Rotten Tomatoes",
                                 )
+                            ),
+                            SimpleNamespace(
+                                web=SimpleNamespace(
+                                    uri="https://interviews.example/elena-vance-imdb-credits",
+                                    title="Elena Vance Interview on IMDb Credits",
+                                )
+                            ),
+                        ],
+                        grounding_supports=[
+                            SimpleNamespace(
+                                segment=SimpleNamespace(text='"rotten_tomatoes_critics": 92'),
+                                grounding_chunk_indices=[0],
                             )
-                        ]
+                        ],
                     )
                 )
             ],
@@ -1580,17 +1706,16 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         gclient = GeminiTriageClient(api_key="dummy-test-key")
         with patch.object(gclient, "_get_client", return_value=fake_sdk):
             parsed = gclient._call_sync(EvaluateRequest(raw_text="Example.Film.2024"), "sys")
+            # Critics 92 is backed by rottentomatoes.com/m/example_film + grounding_supports -> kept
             self.assertEqual(parsed.ratings.rotten_tomatoes_critics, 92)
-            self.assertEqual(parsed.ratings.rotten_tomatoes_audience, 85)
+            # Audience 85 was NOT grounded in grounding_supports or snippet -> stripped to None!
+            self.assertIsNone(parsed.ratings.rotten_tomatoes_audience)
             self.assertIsNone(parsed.ratings.metacritic)
             self.assertIsNone(parsed.ratings.imdb)
             self.assertIsNone(parsed.ratings.letterboxd)
             self.assertEqual(
                 parsed.ratings.sources,
-                {
-                    "rotten_tomatoes_critics": "rottentomatoes.com",
-                    "rotten_tomatoes_audience": "rottentomatoes.com",
-                },
+                {"rotten_tomatoes_critics": "rottentomatoes.com"},
             )
 
     def test_issue_13_5a_every_outbound_prompt_field_redacts_secret_markers(self) -> None:
@@ -1673,6 +1798,128 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             "The Secret Life of Walter Mitty",
         )
         self.assertEqual(sanitize_tracker_text("Cookie's Fortune"), "Cookie's Fortune")
+
+    def test_pr18_blocker_1_model_suggestion_cannot_replace_release_identity_or_poison_cache(self) -> None:
+        """PR #18 Blocker 1: Release-grounded film A vs competing model film B returns conflict and never caches B."""
+        import main
+        from schemas import TorrentInfo
+
+        request = EvaluateRequest(
+            raw_text="North.Field.2021.1080p.BluRay.REMUX-GROUP",
+            hint_title="North Field",
+            hint_year=2021,
+            torrent_info=TorrentInfo(tmdb_id=445001, imdb_id="tt4440001"),
+        )
+        film_a = TmdbMovie(
+            tmdb_id=445001,
+            canonical_title="North Field",
+            original_title="North Field",
+            year=2021,
+            imdb_id="tt4440001",
+            director="Alex Green",
+        )
+        film_b = TmdbMovie(
+            tmdb_id=445002,
+            canonical_title="Empty View",
+            original_title="Empty View",
+            year=2021,
+            imdb_id="tt4440002",
+            director="Alex May",
+        )
+        model_b = _sample_payload(
+            title=film_b.canonical_title,
+            year=2021,
+            director=film_b.director or "",
+            tmdb_id=film_b.tmdb_id,
+            imdb_id=film_b.imdb_id,
+        )
+        catalogue = TmdbClient(api_key="fixture")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            mock_eval = AsyncMock(return_value=model_b)
+            with (
+                patch.object(
+                    catalogue,
+                    "_find_tmdb_id_by_imdb",
+                    side_effect={film_a.imdb_id: film_a.tmdb_id, film_b.imdb_id: film_b.tmdb_id}.get,
+                ),
+                patch.object(
+                    catalogue,
+                    "_fetch_movie_details",
+                    side_effect={film_a.tmdb_id: film_a, film_b.tmdb_id: film_b}.get,
+                ),
+                patch.object(catalogue, "_search_results", return_value=[]),
+                patch.object(main, "tmdb_client", catalogue),
+                patch.object(main, "db", test_db),
+                patch.object(main.gemini_client, "evaluate", new=mock_eval),
+            ):
+                first = asyncio.run(main.evaluate(request))
+                second = asyncio.run(main.evaluate(request))
+
+            self.assertFalse(first.cached)
+            self.assertIsNotNone(first.catalogue_identification)
+            assert first.catalogue_identification is not None
+            self.assertEqual(first.catalogue_identification.tmdb_id, 445001)
+            self.assertEqual(first.catalogue_identification.imdb_id, "tt4440001")
+            self.assertFalse(first.catalogue_identification.compatible)
+            self.assertIsNotNone(first.catalogue_identification.conflict_reason)
+            self.assertIsNotNone(first.model_identification)
+            assert first.model_identification is not None
+            self.assertEqual(first.model_identification.tmdb_id, 445002)
+            self.assertEqual(first.identification.match_confidence, "low")
+
+            # Repeat request MUST NOT serve competing film B as cached or compatible!
+            self.assertFalse(second.cached)
+            self.assertIsNotNone(second.catalogue_identification)
+            assert second.catalogue_identification is not None
+            self.assertFalse(second.catalogue_identification.compatible)
+            self.assertEqual(second.catalogue_identification.tmdb_id, 445001)
+            self.assertEqual(mock_eval.await_count, 2)
+            self.assertEqual(test_db.get_cache_entries_count(), 0)
+
+    def test_pr18_gap_2_feedback_partial_id_updates_preserve_verified_links(self) -> None:
+        """PR #18 Gap 2: Partial TMDb-only then IMDb-only updates keep one unified row preserving both IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+
+            cnt1 = test_db.add_feedback(
+                imdb_id="tt4450010",
+                tmdb_id=445001,
+                title="North Field",
+                decision="WATCH",
+                note="watched",
+            )
+            self.assertEqual(cnt1, 1)
+
+            cnt2 = test_db.add_feedback(
+                imdb_id=None,
+                tmdb_id=445001,
+                title="North Field",
+                decision="SKIP",
+                note="watched",
+            )
+            self.assertEqual(cnt2, 1)
+            rows2 = test_db.get_recent_feedback(10)
+            self.assertEqual(len(rows2), 1)
+            self.assertEqual(rows2[0]["imdb_id"], "tt4450010")
+            self.assertEqual(rows2[0]["tmdb_id"], 445001)
+            self.assertEqual(rows2[0]["decision"], "SKIP")
+
+            cnt3 = test_db.add_feedback(
+                imdb_id="tt4450010",
+                tmdb_id=None,
+                title="North Field",
+                decision="WATCH",
+                note="watched",
+            )
+            self.assertEqual(cnt3, 1)
+            rows3 = test_db.get_recent_feedback(10)
+            self.assertEqual(len(rows3), 1)
+            self.assertEqual(rows3[0]["imdb_id"], "tt4450010")
+            self.assertEqual(rows3[0]["tmdb_id"], 445001)
+            self.assertEqual(rows3[0]["decision"], "WATCH")
 
 
 if __name__ == "__main__":

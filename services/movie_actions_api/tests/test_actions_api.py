@@ -925,7 +925,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     # --- 5c: HTTP 200 rejected push (approved=false, rejected=true) ---
                     r_card5c = await client.post(
                         "/internal/deliver/card",
-                        json=_verified_card_payload(release_id="rel-5c", tmdb_id=600502, title="Rejected Push"),
+                        json=_verified_card_payload(
+                            release_id="rel-5c",
+                            tmdb_id=600502,
+                            imdb_id="tt6005020",
+                            title="Rejected Push",
+                        ),
                         headers=headers,
                     )
                     self.assertEqual(r_card5c.status_code, 200)
@@ -1180,19 +1185,40 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         bound_rejection_class=None,
                         expires_at=expires_future,
                     ),
+                ],
+            )
+            db.finish_card_delivery_success(
+                "rel-crash-1",
+                card_revision=1,
+                delivery_kind="actionable_grab",
+                ack_chat_id="-100",
+                ack_message_id=9001,
+                ack_thread_id=20,
+                used_poster=False,
+                is_edit=False,
+            )
+            db.begin_card_delivery(
+                release_id="rel-crash-watched",
+                card_revision=1,
+                delivery_kind="actionable_grab",
+                target_chat_id="-100",
+                target_thread_id=20,
+                process_instance_id=dead_proc,
+                lease_expires_at=future_lease,
+                new_actions=[
                     NewActionRecord(
                         action_id=act_watched_id,
                         token_sha256=hash_token(tok_watched),
-                        release_id="rel-crash-1",
+                        release_id="rel-crash-watched",
                         card_revision=1,
-                        source_occurrence_id="occ-1",
+                        source_occurrence_id="occ-w",
                         action_type="watched_good",
-                        completion_group="watched:rel-crash-1:800101",
-                        bound_tmdb_id=800101,
-                        bound_imdb_id="tt8001010",
-                        bound_title="Crash Grab",
+                        completion_group="watched:rel-crash-watched:800102",
+                        bound_tmdb_id=800102,
+                        bound_imdb_id="tt8001020",
+                        bound_title="Crash Watched",
                         bound_year=2025,
-                        bound_release_name="Crash.Grab.2025.2160p.REMUX-GRP",
+                        bound_release_name="Crash.Watched.2025.2160p.REMUX-GRP",
                         bound_existing_movie_id=None,
                         bound_existing_file_id=None,
                         bound_existing_file_quality=None,
@@ -1202,11 +1228,11 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             db.finish_card_delivery_success(
-                "rel-crash-1",
+                "rel-crash-watched",
                 card_revision=1,
                 delivery_kind="actionable_grab",
                 ack_chat_id="-100",
-                ack_message_id=9001,
+                ack_message_id=9002,
                 ack_thread_id=20,
                 used_poster=False,
                 is_edit=False,
@@ -1225,13 +1251,13 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ok_p)
             ok_w, _, _ = db.begin_write_attempt(
                 action_id=act_watched_id,
-                completion_group="watched:rel-crash-1:800101",
+                completion_group="watched:rel-crash-watched:800102",
                 phase="radarr_watched",
                 process_instance_id=dead_proc,
                 lease_expires_at=future_lease,
-                request_fingerprint='{"tmdb_id":800101}',
+                request_fingerprint='{"tmdb_id":800102}',
                 allowed_action_statuses=frozenset({"active"}),
-                radarr_movie_id=501,
+                radarr_movie_id=502,
             )
             self.assertTrue(ok_w)
 
@@ -1298,6 +1324,14 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 "id": 501,
                 "tmdbId": 800101,
                 "imdbId": "tt8001010",
+                "monitored": True,
+                "hasFile": False,
+                "tags": [],
+            }
+            radarr.movies[502] = {
+                "id": 502,
+                "tmdbId": 800102,
+                "imdbId": "tt8001020",
                 "monitored": False,
                 "hasFile": False,
                 "tags": [7],
@@ -3472,6 +3506,187 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         self.assertIn(b"FINAL_TAIL_TOKEN_888", tg_nt.sent_documents[0]["content_bytes"])
                         self.assertNotIn(b"LONG_SECRET_222", tg_nt.sent_documents[0]["content_bytes"])
                         self.assertIsNone(tg_nt.sent_documents[0]["thread_id"])
+
+    async def test_pr18_blocker_2_all_five_unsafe_push_races_and_sidecar_disappearance(self) -> None:
+        """PR #18 Blocker 2 & Gap 5: All five unsafe push scenarios yield 0 pushes & 0 grab feedback, reverse Watched-during-push blocked, and WAL sidecar disappearance handled."""
+        async def _run_scenario(mode: str) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = self._make_config(tmpdir)
+                radarr = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=tg,
+                    radarr_client=radarr,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with app.router.lifespan_context(app), httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    headers = {"X-Internal-Token": cfg.internal_api_secret}
+                    payload = _verified_card_payload(poster_path=None)
+                    init_r = await client.post("/internal/deliver/card", headers=headers, json=payload)
+                    init_r.raise_for_status()
+                    tokens = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+                    form = {"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"}
+
+                    async def _post(btn: str) -> httpx.Response:
+                        return await client.post(f"/action/{tokens[btn]}", data=form)
+
+                    out: dict[str, Any] = {"mode": mode}
+                    row = {
+                        "id": 101,
+                        "tmdbId": payload["verified_tmdb_id"],
+                        "imdbId": payload["verified_imdb_id"],
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    if mode == "ambiguous_phase1":
+                        radarr.add_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        out["first_http"] = (await _post("add_grab")).status_code
+                        radarr.movies[101] = {
+                            **row,
+                            "imdbId": "tt9999111",
+                            "tags": [7],
+                            "monitored": False,
+                            "hasFile": True,
+                        }
+                        out["reconcile_http"] = (await _post("add_grab")).status_code
+                    elif mode == "conflicting_tmdb":
+                        row["tmdbId"] += 1
+                        radarr.movies[101] = row
+                        out["grab_http"] = (await _post("add_grab")).status_code
+                    elif mode == "positive_file_id":
+                        row["movieFileId"] = 111
+                        radarr.movies[101] = row
+                        out["grab_http"] = (await _post("add_grab")).status_code
+                    elif mode == "watched_during_push":
+                        # Reverse direction: Add & Grab already in radarr_release_push -> Watched MUST be blocked (409)
+                        radarr.movies[101] = row
+                        entered, resume = asyncio.Event(), asyncio.Event()
+                        orig_push = radarr.push_release
+
+                        async def _hold_push(body: dict[str, Any]) -> RadarrWriteResult:
+                            entered.set()
+                            await resume.wait()
+                            return await orig_push(body)
+
+                        radarr.push_release = _hold_push  # type: ignore[method-assign]
+                        grab_task = asyncio.create_task(_post("add_grab"))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 5)
+                            out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                        finally:
+                            resume.set()
+                            out["grab_http"] = (await asyncio.wait_for(grab_task, 5)).status_code
+                    else:
+                        entered, resume = asyncio.Event(), asyncio.Event()
+                        orig_add = radarr.add_movie
+
+                        async def _hold_add(body: dict[str, Any]) -> RadarrWriteResult:
+                            res = await orig_add(body)
+                            entered.set()
+                            await resume.wait()
+                            return res
+
+                        radarr.add_movie = _hold_add  # type: ignore[method-assign]
+                        grab_task = asyncio.create_task(_post("add_grab"))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 5)
+                            if mode == "watched_during_grab":
+                                out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                            else:
+                                ret_r = await asyncio.wait_for(
+                                    client.post(
+                                        "/internal/deliver/card",
+                                        headers=headers,
+                                        json={**payload, "delivery_kind": "retired", "card_revision": 2},
+                                    ),
+                                    5,
+                                )
+                                out["retirement_http"] = ret_r.status_code
+                                out["retirement_status"] = ret_r.json().get("status")
+                                out["stored_revision"] = app.state.db.get_delivery(payload["release_id"])["card_revision"]
+                        finally:
+                            resume.set()
+                            out["grab_http"] = (await asyncio.wait_for(grab_task, 5)).status_code
+
+                    out["add_attempts"] = len(radarr.add_calls)
+                    out["push_attempts"] = len(radarr.push_calls)
+                    out["feedback"] = [c.get("decision") for c in fb.calls]
+                    return out
+
+        r1 = await _run_scenario("ambiguous_phase1")
+        self.assertEqual(r1["first_http"], 503)
+        self.assertEqual(r1["reconcile_http"], 409)
+        self.assertEqual(r1["push_attempts"], 0)
+        self.assertEqual(r1["feedback"], [])
+
+        r2 = await _run_scenario("watched_during_grab")
+        self.assertEqual(r2["watched_http"], 200)
+        self.assertEqual(r2["grab_http"], 409)
+        self.assertEqual(r2["push_attempts"], 0)
+        self.assertEqual(r2["feedback"], ["skip"])
+
+        r3 = await _run_scenario("retired_during_grab")
+        self.assertEqual(r3["retirement_http"], 200)
+        self.assertEqual(r3["retirement_status"], "delivered")
+        self.assertEqual(r3["stored_revision"], 2)
+        self.assertEqual(r3["grab_http"], 410)
+        self.assertEqual(r3["push_attempts"], 0)
+        self.assertEqual(r3["feedback"], [])
+
+        r4 = await _run_scenario("conflicting_tmdb")
+        self.assertEqual(r4["grab_http"], 409)
+        self.assertEqual(r4["add_attempts"], 0)
+        self.assertEqual(r4["push_attempts"], 0)
+        self.assertEqual(r4["feedback"], [])
+
+        r5 = await _run_scenario("positive_file_id")
+        self.assertEqual(r5["grab_http"], 409)
+        self.assertEqual(r5["add_attempts"], 0)
+        self.assertEqual(r5["push_attempts"], 0)
+        self.assertEqual(r5["feedback"], [])
+
+        # Reverse direction: watched_bad blocked with 409 while radarr_release_push is active
+        r6 = await _run_scenario("watched_during_push")
+        self.assertEqual(r6["watched_http"], 409)
+        self.assertEqual(r6["grab_http"], 200)
+        self.assertEqual(r6["push_attempts"], 1)
+        self.assertEqual(r6["feedback"], ["watch"])
+
+        # Gap 5: SQLite -wal/-shm sidecar vanishing concurrently during lstat or chmod must not crash
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_sc = self._make_config(tmpdir)
+            db_sc = ActionsDB(cfg_sc.actions_db_path)
+            db_sc.init_db()
+            wal_path = Path(f"{cfg_sc.actions_db_path}-wal")
+            wal_path.write_bytes(b"")
+            os.chmod(wal_path, 0o644)
+
+            orig_lstat = os.lstat
+            orig_chmod = os.chmod
+
+            def _vanish_on_wal_lstat(path: str, *args: Any, **kwargs: Any) -> Any:
+                if path == str(wal_path):
+                    raise FileNotFoundError(path)
+                return orig_lstat(path, *args, **kwargs)
+
+            with mock.patch("services.movie_actions_api.db.os.lstat", side_effect=_vanish_on_wal_lstat):
+                db_sc._ensure_private_db_files()
+
+            def _vanish_on_wal_chmod(path: str, mode: int, *args: Any, **kwargs: Any) -> None:
+                if path == str(wal_path):
+                    raise FileNotFoundError(path)
+                orig_chmod(path, mode, *args, **kwargs)
+
+            with mock.patch("services.movie_actions_api.db.os.chmod", side_effect=_vanish_on_wal_chmod):
+                db_sc._ensure_private_db_files()
 
 
 if __name__ == "__main__":

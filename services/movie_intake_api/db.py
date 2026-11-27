@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import sqlite3
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,8 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .archive import ArchiveReceipt
-from .classifier import ClassifiedWebhook
+from .archive import ArchiveIntegrityError, ArchiveReceipt, read_verified_archive_json
+from .classifier import ClassifiedWebhook, compute_legacy_occurrence_evidence_digest
 from .security import PrivateFileError, ensure_private_dir
 
 
@@ -79,8 +80,16 @@ class IntakeDB:
         ensure_private_dir(self.db_path.parent)
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.db_path}{suffix}")
-            if os.path.islink(str(candidate)):
+            try:
+                st = os.lstat(str(candidate))
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
                 raise PrivateFileError(f"Refusing symlinked database file: {candidate}")
+            if not stat.S_ISREG(st.st_mode):
+                raise PrivateFileError(f"SQLite path is not a regular file: {candidate}")
+            if st.st_uid != os.getuid():
+                raise PrivateFileError(f"SQLite file not owned by current user: {candidate}")
         try:
             fd = os.open(
                 str(self.db_path),
@@ -95,12 +104,20 @@ class IntakeDB:
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.db_path}{suffix}")
             try:
-                if candidate.exists() and not os.path.islink(str(candidate)):
-                    st = os.lstat(str(candidate))
-                    if st.st_uid == os.getuid():
-                        os.chmod(str(candidate), 0o600)
+                st = os.lstat(str(candidate))
+            except FileNotFoundError:
+                continue
             except OSError:
-                pass
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_uid == os.getuid() and (st.st_mode & 0o077) != 0:
+                try:
+                    os.chmod(str(candidate), 0o600)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_private_db_paths()
@@ -213,27 +230,16 @@ class IntakeDB:
                 }
                 if "incoming_evidence_digest" not in existing_occ_cols:
                     conn.execute("ALTER TABLE occurrences ADD COLUMN incoming_evidence_digest TEXT;")
-                    conn.execute(
-                        """
-                        UPDATE occurrences
-                        SET incoming_evidence_digest = (
-                            SELECT r.incoming_evidence_digest
-                            FROM releases r
-                            WHERE r.release_id = occurrences.release_id
-                        )
-                        WHERE release_id IS NOT NULL
-                          AND incoming_evidence_digest IS NULL
-                          AND occurrence_id = (
-                              SELECT r.latest_occurrence_id
-                              FROM releases r
-                              WHERE r.release_id = occurrences.release_id
-                          )
-                        """
-                    )
                 conn.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_occurrences_release_digest
                         ON occurrences(release_id, incoming_evidence_digest);
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_occurrences_release_sha256
+                        ON occurrences(release_id, archive_sha256);
                     """
                 )
                 conn.execute("COMMIT")
@@ -243,6 +249,79 @@ class IntakeDB:
         finally:
             conn.close()
         self._harden_db_files()
+
+    def backfill_legacy_occurrence_digests(self, archive_dir: Path) -> int:
+        """
+        PR #18 Blocker 3: Recompute `occurrences.incoming_evidence_digest` from verified
+        archived payloads for any pre-upgrade movie occurrences whose digest is NULL,
+        and sync `releases.incoming_evidence_digest` for the release's `latest_occurrence_id`
+        so exact and re-wrapped replays after an upgrade can never revert an earlier correction.
+        """
+        conn = self._connect()
+        try:
+            pending = conn.execute(
+                """
+                SELECT o.occurrence_id, o.release_id, o.archive_relpath, o.archive_sha256,
+                       r.latest_occurrence_id
+                FROM occurrences o
+                JOIN releases r ON r.release_id = o.release_id
+                WHERE o.release_id IS NOT NULL
+                  AND o.incoming_evidence_digest IS NULL
+                ORDER BY o.received_at ASC, o.occurrence_id ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not pending:
+            return 0
+
+        updates: list[tuple[str, str, str, bool]] = []
+        for row in pending:
+            occ_id = str(row["occurrence_id"])
+            rel_id = str(row["release_id"])
+            relpath = str(row["archive_relpath"])
+            expected_sha = str(row["archive_sha256"])
+            is_latest = occ_id == str(row["latest_occurrence_id"])
+            try:
+                raw_payload = read_verified_archive_json(archive_dir, relpath, expected_sha)
+            except (ArchiveIntegrityError, PrivateFileError, OSError, ValueError):
+                continue
+            digest = compute_legacy_occurrence_evidence_digest(raw_payload)
+            if digest:
+                updates.append((digest, occ_id, rel_id, is_latest))
+
+        if not updates:
+            return 0
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for digest, occ_id, rel_id, is_latest in updates:
+                conn.execute(
+                    """
+                    UPDATE occurrences
+                    SET incoming_evidence_digest = ?
+                    WHERE occurrence_id = ? AND incoming_evidence_digest IS NULL
+                    """,
+                    (digest, occ_id),
+                )
+                if is_latest:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET incoming_evidence_digest = ?
+                        WHERE release_id = ? AND latest_occurrence_id = ?
+                        """,
+                        (digest, rel_id, occ_id),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return len(updates)
 
     def record_non_movie_occurrence(
         self,
@@ -304,7 +383,8 @@ class IntakeDB:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 """
-                SELECT release_id, state, card_revision, incoming_evidence_digest, source_occurrence_id
+                SELECT release_id, state, card_revision, incoming_evidence_digest,
+                       latest_occurrence_id, source_occurrence_id
                 FROM releases
                 WHERE indexer_norm = ? AND external_id_norm = ? AND exact_release_name = ?
                 """,
@@ -349,27 +429,43 @@ class IntakeDB:
                 cur_state = str(existing["state"])
                 card_revision = int(existing["card_revision"])
                 cur_digest = str(existing["incoming_evidence_digest"])
+                latest_occ_id = str(existing["latest_occurrence_id"])
                 source_occ = (
                     occurrence_id
                     if classified.has_download_url
                     else str(existing["source_occurrence_id"])
                 )
 
-                seen_prior_digest = (
-                    cur_digest != classified.incoming_evidence_digest
+                latest_occ_row = conn.execute(
+                    "SELECT archive_sha256 FROM occurrences WHERE occurrence_id = ?",
+                    (latest_occ_id,),
+                ).fetchone()
+                is_exact_latest_replay = (
+                    cur_digest == classified.incoming_evidence_digest
+                    or (
+                        latest_occ_row is not None
+                        and str(latest_occ_row["archive_sha256"]) == receipt.archive_sha256
+                    )
+                )
+
+                seen_prior_occurrence = (
+                    not is_exact_latest_replay
                     and conn.execute(
                         """
                         SELECT 1 FROM occurrences
                         WHERE release_id = ?
-                          AND incoming_evidence_digest = ?
+                          AND (
+                              incoming_evidence_digest = ?
+                              OR archive_sha256 = ?
+                          )
                         LIMIT 1
                         """,
-                        (release_id, classified.incoming_evidence_digest),
+                        (release_id, classified.incoming_evidence_digest, receipt.archive_sha256),
                     ).fetchone()
                     is not None
                 )
 
-                if cur_digest == classified.incoming_evidence_digest:
+                if is_exact_latest_replay:
                     # Exact duplicate (concurrent burst or late duplicate): attach occurrence
                     # without re-queuing, while preserving/upgrading source_occurrence_id if
                     # this delivery supplies a usable download URL.
@@ -384,8 +480,9 @@ class IntakeDB:
                         (occurrence_id, source_occ, received_at_iso, release_id),
                     )
                     result_status = "coalesced_duplicate"
-                elif seen_prior_digest:
-                    # Issue #13 §4a: Replayed older superseded evidence (old A -> corrected B -> repeated A).
+                elif seen_prior_occurrence:
+                    # Issue #13 §4a & PR #18 Blocker 3: Replayed older superseded evidence
+                    # (old A -> corrected B -> repeated A, including across schema upgrades).
                     # Archive the replay occurrence, preserve newer correction B intact (never roll back
                     # incoming_evidence_digest, incoming_snapshot_json, or source_occurrence_id).
                     conn.execute(

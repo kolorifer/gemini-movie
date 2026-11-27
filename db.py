@@ -4,12 +4,21 @@ import json
 import os
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "triage.db"
+EVALUATION_CACHE_VERSION = 2
+_CACHE_RATING_KEYS = (
+    "rotten_tomatoes_critics",
+    "rotten_tomatoes_audience",
+    "metacritic",
+    "imdb",
+    "letterboxd",
+)
 
 IMDB_ID_RE = re.compile(r"\b(tt\d{7,10})\b", re.IGNORECASE)
 YEAR_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
@@ -611,7 +620,11 @@ class TriageDB:
             pass
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.db_path}{suffix}")
-            if candidate.is_symlink():
+            try:
+                st = os.lstat(str(candidate))
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
                 raise RuntimeError(f"Refusing to open symlinked database path: {candidate}")
         try:
             fd = os.open(
@@ -627,12 +640,20 @@ class TriageDB:
         for suffix in ("", "-wal", "-shm"):
             target = Path(f"{self.db_path}{suffix}")
             try:
-                if target.exists() and not target.is_symlink():
-                    st = target.stat()
-                    if st.st_uid == os.getuid():
-                        os.chmod(target, 0o600)
+                st = os.lstat(str(target))
+            except FileNotFoundError:
+                continue
             except OSError:
-                pass
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_uid == os.getuid() and (st.st_mode & 0o077) != 0:
+                try:
+                    os.chmod(str(target), 0o600)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_private_permissions()
@@ -654,6 +675,7 @@ class TriageDB:
                     quality_key TEXT NOT NULL DEFAULT '',
                     edition_key TEXT NOT NULL DEFAULT '',
                     evidence_key TEXT NOT NULL DEFAULT '',
+                    cache_version INTEGER NOT NULL DEFAULT 1,
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
                     canonical_title TEXT NOT NULL,
@@ -704,6 +726,10 @@ class TriageDB:
             if "evidence_key" not in eval_cols:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN evidence_key TEXT NOT NULL DEFAULT ''"
+                )
+            if "cache_version" not in eval_cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 1"
                 )
             fb_cols = {
                 row["name"]
@@ -756,6 +782,33 @@ class TriageDB:
             )
         self._harden_db_file_permissions()
 
+    @staticmethod
+    def _validate_cached_payload(raw_json: str) -> Optional[dict[str, Any]]:
+        """Revalidate cached JSON against current schema, identity compatibility, and rating sources."""
+        from pydantic import ValidationError
+        from schemas import EvaluationPayload
+
+        try:
+            parsed = json.loads(raw_json)
+            validated = EvaluationPayload.model_validate(parsed)
+        except (ValueError, TypeError, ValidationError):
+            return None
+
+        if (
+            validated.catalogue_identification is not None
+            and not validated.catalogue_identification.compatible
+        ):
+            return None
+
+        sources = validated.ratings.sources or {}
+        for key in _CACHE_RATING_KEYS:
+            if getattr(validated.ratings, key, None) is not None:
+                src = sources.get(key)
+                if not isinstance(src, str) or not src.strip():
+                    return None
+
+        return validated.model_dump()
+
     def get_cached_evaluation(
         self,
         raw_text: str,
@@ -791,11 +844,16 @@ class TriageDB:
                 """
                 SELECT response_json, year
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
+                WHERE raw_text_normalized = ?
+                  AND quality_key = ?
+                  AND edition_key = ?
+                  AND evidence_key = ?
+                  AND cache_version = ?
+                  AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, q_key, ed_key, ev_key, cutoff),
+                (norm_raw, q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
@@ -803,11 +861,16 @@ class TriageDB:
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                      AND cache_version = ?
+                      AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), q_key, ed_key, ev_key, cutoff),
+                    (imdb_id.lower(), q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
                 ).fetchone()
                 if candidate is not None:
                     cached_year = int(candidate["year"])
@@ -819,17 +882,22 @@ class TriageDB:
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE release_key = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE release_key = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                      AND cache_version = ?
+                      AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, q_key, ed_key, ev_key, cutoff),
+                    (rel_key, q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
                 ).fetchone()
 
         if row is None:
             return None
 
-        return json.loads(row["response_json"])
+        return self._validate_cached_payload(str(row["response_json"]))
 
     def save_evaluation(
         self,
@@ -888,6 +956,7 @@ class TriageDB:
                     quality_key,
                     edition_key,
                     evidence_key,
+                    cache_version,
                     raw_text_original,
                     imdb_id,
                     canonical_title,
@@ -895,7 +964,7 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
@@ -903,6 +972,7 @@ class TriageDB:
                     q_key,
                     ed_key,
                     ev_key,
+                    EVALUATION_CACHE_VERSION,
                     raw_text,
                     imdb_id,
                     canonical_title,
@@ -920,8 +990,8 @@ class TriageDB:
         )
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM evaluations WHERE created_at >= ?",
-                (cutoff,),
+                "SELECT COUNT(*) AS cnt FROM evaluations WHERE cache_version = ? AND created_at >= ?",
+                (EVALUATION_CACHE_VERSION, cutoff),
             ).fetchone()
             return int(row["cnt"]) if row else 0
 
@@ -969,6 +1039,31 @@ class TriageDB:
         clean_decision = decision.strip().upper()
         clean_note = note.strip() if note and note.strip() else None
         with self._connect() as conn:
+            # Preserve existing verified ID links across partial updates (TMDb-only or IMDb-only)
+            # so updating via one ID never drops the other verified ID and duplicates feedback rows.
+            if clean_imdb and clean_tmdb is None:
+                linked_tmdb = conn.execute(
+                    """
+                    SELECT DISTINCT tmdb_id FROM feedback
+                    WHERE imdb_id IS NOT NULL AND lower(imdb_id) = ? AND tmdb_id IS NOT NULL
+                    ORDER BY id DESC
+                    """,
+                    (clean_imdb,),
+                ).fetchall()
+                if len(linked_tmdb) == 1:
+                    clean_tmdb = int(linked_tmdb[0]["tmdb_id"])
+            elif clean_tmdb is not None and clean_imdb is None:
+                linked_imdb = conn.execute(
+                    """
+                    SELECT DISTINCT lower(imdb_id) AS imdb_id FROM feedback
+                    WHERE tmdb_id = ? AND imdb_id IS NOT NULL AND trim(imdb_id) != ''
+                    ORDER BY id DESC
+                    """,
+                    (clean_tmdb,),
+                ).fetchall()
+                if len(linked_imdb) == 1:
+                    clean_imdb = str(linked_imdb[0]["imdb_id"])
+
             if clean_imdb and clean_tmdb is not None:
                 conn.execute(
                     """
