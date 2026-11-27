@@ -2982,6 +2982,211 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         _assess("remake without numeral, year only", [remake], remake, False, year=2022, tracker=remake.tmdb_id)
         _assess("same remake, parsed title hint contains original year", [remake], remake, False, hint="Granite Bay 1994", year=2022, tracker=remake.tmdb_id)
 
+    def test_pr18_r8_interrupted_catalogue_comparison_withholds_trust_until_recovery(self) -> None:
+        """
+        PR #18 Round 8 P1 (Triage):
+          When comparing plausible catalogue readings of an ambiguous release filename, a temporary
+          TMDB timeout/error (on search #1, search #2, or the outer pre-lookup call) MUST preserve
+          the incomplete outcome through fallback verification, withholding compatibility and
+          caching until all plausible alternatives are compared after recovery (or independent
+          evidence resolves the identity).
+        """
+        import main
+        from schemas import TorrentInfo
+
+        films_both = [
+            TmdbMovie(
+                tmdb_id=31,
+                imdb_id="tt0000031",
+                canonical_title="Granite Bay",
+                year=1994,
+                director="Jane Cole",
+                runtime_minutes=103,
+            ),
+            TmdbMovie(
+                tmdb_id=32,
+                imdb_id="tt0000032",
+                canonical_title="Granite Bay 1994",
+                year=2022,
+                director="Jane Cole",
+                runtime_minutes=103,
+            ),
+        ]
+        release = "Granite.Bay.1994.2022.Remastered.1080p.BluRay.REMUX-Z"
+
+        # 1) Dual-film catalogue: no interruption, 2nd search timeout, 1st search timeout
+        for mode, fail_on_call in (("complete", None), ("second_timeout", 2), ("first_timeout", 1)):
+            queries: list[tuple[str, Optional[int]]] = []
+
+            def _search(title: str, year: Optional[int] = None, _fail=fail_on_call, _q=queries):
+                _q.append((title, year))
+                if _fail is not None and len(_q) == _fail:
+                    raise TimeoutError("invented temporary outage")
+                return [
+                    {
+                        "id": m.tmdb_id,
+                        "title": m.canonical_title,
+                        "original_title": m.canonical_title,
+                        "release_date": f"{m.year}-01-01",
+                        "popularity": 10,
+                    }
+                    for m in films_both
+                    if (title.lower(), year) == (m.canonical_title.lower(), m.year)
+                ]
+
+            client = TmdbClient(api_key="fixture")
+            client._search_results = _search  # type: ignore[method-assign]
+            client._fetch_movie_details = {m.tmdb_id: m for m in films_both}.__getitem__  # type: ignore[method-assign]
+            client._find_tmdb_id_by_imdb = {m.imdb_id: m.tmdb_id for m in films_both}.get  # type: ignore[method-assign]
+            req = EvaluateRequest(raw_text=release, torrent_info=TorrentInfo(runtime_minutes=103))
+            m0 = films_both[0]
+            model = AsyncMock(
+                return_value=_sample_payload(
+                    title=m0.canonical_title,
+                    year=m0.year or 1994,
+                    runtime_minutes=103,
+                    director="Jane Cole",
+                    imdb_id=m0.imdb_id or "tt0000031",
+                    tmdb_id=m0.tmdb_id,
+                )
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "triage.db")
+                test_db.init_db()
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", model),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    before_repeat = len(queries)
+                    repeat = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                assert repeat.catalogue_identification is not None
+                self.assertFalse(first.catalogue_identification.compatible, mode)
+                self.assertFalse(repeat.cached, mode)
+                self.assertFalse(repeat.catalogue_identification.compatible, mode)
+                self.assertGreaterEqual(len(queries) - before_repeat, 2, mode)
+
+        # 2) Outer pre-lookup failure (e.g. unexpected RuntimeError / asyncio.TimeoutError) with secret-like text
+        #    MUST withhold compatibility/caching AND never leak raw exception text into response
+        queries_outer: list[tuple[str, Optional[int]]] = []
+        outer_failed = False
+
+        def _search_outer(title: str, year: Optional[int] = None):
+            queries_outer.append((title, year))
+            return [
+                {
+                    "id": m.tmdb_id,
+                    "title": m.canonical_title,
+                    "original_title": m.canonical_title,
+                    "release_date": f"{m.year}-01-01",
+                    "popularity": 10,
+                }
+                for m in films_both
+                if (title.lower(), year) == (m.canonical_title.lower(), m.year)
+            ]
+
+        client_outer = TmdbClient(api_key="0123456789abcdef0123456789abcdef")
+        client_outer._search_results = _search_outer  # type: ignore[method-assign]
+        client_outer._fetch_movie_details = {m.tmdb_id: m for m in films_both}.__getitem__  # type: ignore[method-assign]
+        client_outer._find_tmdb_id_by_imdb = {m.imdb_id: m.tmdb_id for m in films_both}.get  # type: ignore[method-assign]
+        real_sync = client_outer._lookup_with_diagnostics_sync
+
+        def _flaky_sync(r: EvaluateRequest):
+            nonlocal outer_failed
+            if not outer_failed:
+                outer_failed = True
+                raise RuntimeError("https://api.themoviedb.org/3/search/movie?api_key=0123456789abcdef0123456789abcdef")
+            return real_sync(r)
+
+        client_outer._lookup_with_diagnostics_sync = _flaky_sync  # type: ignore[method-assign]
+        req_outer = EvaluateRequest(raw_text=release, torrent_info=TorrentInfo(runtime_minutes=103))
+        m0 = films_both[0]
+        model_outer = AsyncMock(
+            return_value=_sample_payload(
+                title=m0.canonical_title,
+                year=m0.year or 1994,
+                runtime_minutes=103,
+                director="Jane Cole",
+                imdb_id=m0.imdb_id or "tt0000031",
+                tmdb_id=m0.tmdb_id,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", client_outer),
+                patch.object(main.gemini_client, "evaluate", model_outer),
+            ):
+                first = asyncio.run(main.evaluate(req_outer))
+                repeat = asyncio.run(main.evaluate(req_outer))
+            assert first.catalogue_identification is not None
+            assert repeat.catalogue_identification is not None
+            self.assertFalse(first.catalogue_identification.compatible)
+            self.assertNotIn("0123456789abcdef0123456789abcdef", first.model_dump_json())
+            self.assertFalse(repeat.cached)
+            self.assertFalse(repeat.catalogue_identification.compatible)
+            self.assertEqual(len(queries_outer), 2)
+
+        # 3) Positive recovery control: single-film catalogue recovers cleanly after transient 2nd-search timeout
+        single_film = [films_both[0]]
+        queries_single: list[tuple[str, Optional[int]]] = []
+
+        def _search_single(title: str, year: Optional[int] = None):
+            queries_single.append((title, year))
+            if len(queries_single) == 2:
+                raise TimeoutError("invented temporary outage")
+            return [
+                {
+                    "id": m.tmdb_id,
+                    "title": m.canonical_title,
+                    "original_title": m.canonical_title,
+                    "release_date": f"{m.year}-01-01",
+                    "popularity": 10,
+                }
+                for m in single_film
+                if (title.lower(), year) == (m.canonical_title.lower(), m.year)
+            ]
+
+        client_single = TmdbClient(api_key="fixture")
+        client_single._search_results = _search_single  # type: ignore[method-assign]
+        client_single._fetch_movie_details = {m.tmdb_id: m for m in single_film}.__getitem__  # type: ignore[method-assign]
+        client_single._find_tmdb_id_by_imdb = {m.imdb_id: m.tmdb_id for m in single_film}.get  # type: ignore[method-assign]
+        req_single = EvaluateRequest(raw_text=release, torrent_info=TorrentInfo(runtime_minutes=103))
+        model_single = AsyncMock(
+            return_value=_sample_payload(
+                title=m0.canonical_title,
+                year=m0.year or 1994,
+                runtime_minutes=103,
+                director="Jane Cole",
+                imdb_id=m0.imdb_id or "tt0000031",
+                tmdb_id=m0.tmdb_id,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", client_single),
+                patch.object(main.gemini_client, "evaluate", model_single),
+            ):
+                first = asyncio.run(main.evaluate(req_single))
+                second = asyncio.run(main.evaluate(req_single))
+                third = asyncio.run(main.evaluate(req_single))
+            assert first.catalogue_identification is not None
+            assert second.catalogue_identification is not None
+            assert third.catalogue_identification is not None
+            self.assertFalse(first.catalogue_identification.compatible)
+            self.assertFalse(second.cached)
+            self.assertTrue(second.catalogue_identification.compatible)
+            self.assertTrue(third.cached)
+            self.assertTrue(third.catalogue_identification.compatible)
+            self.assertEqual(len(queries_single), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

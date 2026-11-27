@@ -793,6 +793,7 @@ class TmdbLookupResult:
     movie: Optional[TmdbMovie] = None
     tracker_conflict: Optional[str] = None
     trusted_for_cache: bool = False
+    lookup_incomplete_reason: Optional[str] = None
 
 
 def check_tracker_movie_consistency(
@@ -1528,26 +1529,50 @@ class TmdbClient:
 
         # 3) Clean title + year search (with MediaInfo runtime/language tie-breaking)
         search_queries: list[tuple[Optional[str], Optional[int]]] = []
-        primary_search_title = raw_title or query_title
-        if primary_search_title:
-            search_queries.append((primary_search_title, query_year))
         if len(raw_candidates) > 1:
             for cand_title, cand_year in raw_candidates:
+                if (
+                    request.hint_year is not None
+                    and cand_year is not None
+                    and abs(cand_year - request.hint_year) > 1
+                ):
+                    continue
                 if cand_title and (cand_title, cand_year) not in search_queries:
                     search_queries.append((cand_title, cand_year))
+            if not search_queries:
+                primary_search_title = raw_title or query_title
+                if primary_search_title:
+                    search_queries.append((primary_search_title, query_year))
+        else:
+            primary_search_title = raw_title or query_title
+            if primary_search_title:
+                search_queries.append((primary_search_title, query_year))
 
         consistent_matches: list[TmdbMovie] = []
         seen_consistent_ids: set[int] = set()
         search_conflicts: list[str] = []
+        search_errors: list[str] = []
         for search_title, search_year in search_queries:
             if not search_title:
                 continue
-            searched = self._search_tmdb_movie(
-                search_title,
-                search_year,
-                nfo_runtime=nfo_runtime,
-                audio_languages=audio_languages,
-            )
+            try:
+                searched = self._search_tmdb_movie(
+                    search_title,
+                    search_year,
+                    nfo_runtime=nfo_runtime,
+                    audio_languages=audio_languages,
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as exc:
+                logger.warning(
+                    "TMDB catalogue search interrupted for '%s' (%s): %s",
+                    sanitize_tracker_text(search_title, max_chars=120),
+                    search_year,
+                    sanitize_tracker_text(str(exc), max_chars=240),
+                )
+                search_errors.append(
+                    "TMDB catalogue search interrupted before all plausible candidates were compared"
+                )
+                continue
             if searched is not None:
                 # PR #18 Round 5 Finding 1: Apply the exact same release-evidence consistency
                 # check to the title-search candidate so title search can never re-approve or
@@ -1567,16 +1592,6 @@ class TmdbClient:
                 else:
                     search_conflicts.append(search_conflict)
 
-        if len(consistent_matches) == 1:
-            # Single unambiguous consistent search result (can resolve a mistaken tracker ID
-            # when a different film matches all release evidence). Still run Gemini when
-            # tracker_conflict was present instead of serving from alias cache.
-            return TmdbLookupResult(
-                movie=consistent_matches[0],
-                tracker_conflict=tracker_conflict,
-                trusted_for_cache=tracker_conflict is None,
-            )
-
         if len(consistent_matches) > 1:
             # PR #18 Round 7 Finding 2: Multiple distinct catalogue films independently fit
             # plausible readings of an ambiguous release filename with no deciding evidence.
@@ -1593,6 +1608,33 @@ class TmdbClient:
                 f"{tracker_conflict}; {ambiguity_msg}"
                 if tracker_conflict and ambiguity_msg not in tracker_conflict
                 else (tracker_conflict or ambiguity_msg)
+            )
+        elif search_errors:
+            # PR #18 Round 8 P1: At least one plausible catalogue query was interrupted before
+            # comparison finished. Preserve the incomplete state so fallback verification
+            # cannot mark a partial match compatible or cache it.
+            if deferred_year_conflict and (
+                not tracker_conflict or deferred_year_conflict not in tracker_conflict
+            ):
+                tracker_conflict = (
+                    f"{tracker_conflict}; {deferred_year_conflict}"
+                    if tracker_conflict
+                    else deferred_year_conflict
+                )
+            return TmdbLookupResult(
+                movie=None,
+                tracker_conflict=tracker_conflict,
+                trusted_for_cache=False,
+                lookup_incomplete_reason=search_errors[0],
+            )
+        elif len(consistent_matches) == 1:
+            # Single unambiguous consistent search result (can resolve a mistaken tracker ID
+            # when a different film matches all release evidence). Still run Gemini when
+            # tracker_conflict was present instead of serving from alias cache.
+            return TmdbLookupResult(
+                movie=consistent_matches[0],
+                tracker_conflict=tracker_conflict,
+                trusted_for_cache=tracker_conflict is None,
             )
         elif search_conflicts:
             first_conflict = search_conflicts[0]
@@ -1657,13 +1699,23 @@ class TmdbClient:
                 "TMDB pre-lookup failed (falling back to Gemini-only): %s",
                 sanitize_tracker_text(str(exc), max_chars=240),
             )
-            return TmdbLookupResult()
+            return TmdbLookupResult(
+                movie=None,
+                tracker_conflict=None,
+                trusted_for_cache=False,
+                lookup_incomplete_reason="TMDB catalogue pre-lookup interrupted before comparison completed",
+            )
         except Exception as exc:
             logger.warning(
                 "Unexpected TMDB pre-lookup error: %s",
                 sanitize_tracker_text(str(exc), max_chars=240),
             )
-            return TmdbLookupResult()
+            return TmdbLookupResult(
+                movie=None,
+                tracker_conflict=None,
+                trusted_for_cache=False,
+                lookup_incomplete_reason="TMDB catalogue pre-lookup interrupted before comparison completed",
+            )
 
     async def lookup_from_request(self, request: EvaluateRequest) -> Optional[TmdbMovie]:
         result = await self.lookup_with_diagnostics(request)
