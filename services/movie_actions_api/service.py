@@ -1946,28 +1946,51 @@ class ActionsService:
             )
         needs_feedback = _feedback_spec_for_action(str(action["action_type"])) is not None
 
-        # On reconciliation: if desired state ALREADY satisfied (watched tag + unmonitored), seal cleanly!
-        if is_reconciliation and existing is not None:
-            m_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
-            if watched_tag_id in m_tags and existing.get("monitored") is False:
-                sealed = await asyncio.to_thread(
-                    self.db.seal_reconciled_attempt,
-                    attempt_id=existing_ambiguous_attempt_id,
-                    action_id=str(action["action_id"]),
-                    radarr_movie_id=int(existing["id"]),
-                    outcome_summary="reconciled_watched_state_verified",
-                    needs_feedback=needs_feedback,
-                )
-                refreshed = await asyncio.to_thread(
-                    self.db.get_action_group_readonly, str(action["token_sha256"])
-                )
-                done_sib = next(
-                    (a for a in refreshed.group_actions if a["status"] in ("completed_all", "completed_radarr")),
-                    refreshed.action or action,
-                )
-                if sealed and needs_feedback and done_sib["status"] == "completed_radarr":
-                    done_sib = await self._run_isolated_feedback(done_sib)
-                return self._render_completion_html(done_sib, action)
+        # On reconciliation: ALWAYS fetch the single authoritative movie record by ID AFTER all
+        # concurrent lookup reads (TMDb, IMDb, tags) have finished before sealing recovery, so a
+        # concurrent Radarr edit occurring while any lookup was pending cannot cause false completion.
+        if is_reconciliation and existing is not None and isinstance(existing.get("id"), int) and not isinstance(existing.get("id"), bool):
+            auth_rec = await self.radarr.get_movie_by_id(int(existing["id"]))
+            if not auth_rec.ok or not isinstance(auth_rec.data, dict):
+                if auth_rec.status_code == 404:
+                    existing = None
+                else:
+                    return HtmlResponseData(
+                        status_code=503,
+                        html=render_simple_status_page(
+                            title="Radarr Authoritative Read Failed",
+                            badge="ambiguous_radarr",
+                            message="Could not confirm current Radarr movie state during reconciliation; retry safely.",
+                            tone="warn",
+                            post_button_label="Re-check Radarr Status & Reconcile",
+                            hidden_fields={"confirm": "1", "reconcile": "1"},
+                        ),
+                    )
+            else:
+                existing = dict(auth_rec.data)
+                id_err = self._check_radarr_existing_movie_identity(action=action, existing=existing)
+                if id_err is not None:
+                    return id_err
+                m_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
+                if watched_tag_id in m_tags and existing.get("monitored") is False:
+                    sealed = await asyncio.to_thread(
+                        self.db.seal_reconciled_attempt,
+                        attempt_id=existing_ambiguous_attempt_id,
+                        action_id=str(action["action_id"]),
+                        radarr_movie_id=int(existing["id"]),
+                        outcome_summary="reconciled_watched_state_verified",
+                        needs_feedback=needs_feedback,
+                    )
+                    refreshed = await asyncio.to_thread(
+                        self.db.get_action_group_readonly, str(action["token_sha256"])
+                    )
+                    done_sib = next(
+                        (a for a in refreshed.group_actions if a["status"] in ("completed_all", "completed_radarr")),
+                        refreshed.action or action,
+                    )
+                    if sealed and needs_feedback and done_sib["status"] == "completed_radarr":
+                        done_sib = await self._run_isolated_feedback(done_sib)
+                    return self._render_completion_html(done_sib, action)
 
         selected_root: Optional[str] = None
         selected_profile: Optional[int] = None
@@ -2123,9 +2146,11 @@ class ActionsService:
                 movie_id = int(existing["id"])
                 existing_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
                 if watched_tag_id not in existing_tags or existing.get("monitored") is not False:
-                    updated_payload = dict(existing)
-                    updated_payload["monitored"] = False
-                    updated_payload["tags"] = list(dict.fromkeys([*existing_tags, watched_tag_id]))
+                    updated_payload = {
+                        "monitored": False,
+                        "tags": [watched_tag_id],
+                        "applyTags": "add",
+                    }
                     put_res = await self.radarr.update_movie(movie_id, updated_payload)
                     if put_res.outcome != "ok":
                         next_act_status = (
@@ -2202,11 +2227,13 @@ class ActionsService:
                 )
         else:
             movie_id = int(existing["id"])
-            existing_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
-            # Preserve ALL existing fields, existing files, and existing tags
-            updated_payload = dict(existing)
-            updated_payload["monitored"] = False
-            updated_payload["tags"] = list(dict.fromkeys([*existing_tags, watched_tag_id]))
+            # Update ONLY monitoring and additive watched tag (Radarr v3 PUT /api/v3/movie/editor)
+            # so concurrent edits to qualityProfileId, unrelated tags, or files are never clobbered.
+            updated_payload = {
+                "monitored": False,
+                "tags": [watched_tag_id],
+                "applyTags": "add",
+            }
             put_res = await self.radarr.update_movie(movie_id, updated_payload)
             if put_res.outcome in ("failed_not_transmitted", "failed_client"):
                 restore_status = "ambiguous_radarr" if is_reconciliation else "active"

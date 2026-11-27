@@ -474,7 +474,23 @@ class RadarrClient:
     async def update_movie(self, movie_id: int, payload: dict[str, Any]) -> RadarrWriteResult:
         if not self.base_url or not self.api_key:
             return RadarrWriteResult(outcome="failed_not_transmitted", error_redacted="radarr_not_configured")
-        url = f"{self.base_url}/api/v3/movie/{movie_id}"
+        is_partial_editor = payload.get("applyTags") == "add"
+        if is_partial_editor:
+            url = f"{self.base_url}/api/v3/movie/editor"
+            wire_body: dict[str, Any] = {
+                "movieIds": [int(movie_id)],
+                "applyTags": "add",
+            }
+            if "monitored" in payload:
+                wire_body["monitored"] = bool(payload["monitored"])
+            if "tags" in payload and isinstance(payload["tags"], list):
+                wire_body["tags"] = [
+                    int(t) for t in payload["tags"] if isinstance(t, int) and not isinstance(t, bool)
+                ]
+        else:
+            url = f"{self.base_url}/api/v3/movie/{movie_id}"
+            wire_body = payload
+
         owns_client = self._external_client is None
         client = (
             self._external_client
@@ -482,7 +498,7 @@ class RadarrClient:
             else httpx.AsyncClient(follow_redirects=False, timeout=self.timeout_seconds)
         )
         try:
-            resp = await client.put(url, json=payload, headers=self._headers())
+            resp = await client.put(url, json=wire_body, headers=self._headers())
         except httpx.ConnectError:
             return RadarrWriteResult(outcome="failed_not_transmitted", error_redacted="radarr_connect_error")
         except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPError) as exc:
@@ -501,6 +517,18 @@ class RadarrClient:
                 return RadarrWriteResult(outcome="ambiguous", status_code=resp.status_code, error_redacted="radarr_put_invalid_json")
             if isinstance(data, dict):
                 return RadarrWriteResult(outcome="ok", data=data, status_code=resp.status_code)
+            if is_partial_editor and isinstance(data, list):
+                matched = next(
+                    (m for m in data if isinstance(m, dict) and m.get("id") == movie_id),
+                    None,
+                )
+                if matched is not None:
+                    return RadarrWriteResult(outcome="ok", data=matched, status_code=resp.status_code)
+                return RadarrWriteResult(
+                    outcome="ambiguous",
+                    status_code=resp.status_code,
+                    error_redacted="radarr_editor_movie_id_missing",
+                )
             return RadarrWriteResult(outcome="ambiguous", status_code=resp.status_code, error_redacted="radarr_put_non_dict")
 
         if 400 <= resp.status_code < 500:
@@ -925,6 +953,18 @@ class ShadowStubRadarrClient(RadarrClient):
         self.update_calls.append({"movie_id": movie_id, "payload": dict(payload)})
         if movie_id not in self.movies:
             return RadarrWriteResult(outcome="failed_client", status_code=404, error_redacted="radarr_http_404")
+        if payload.get("applyTags") == "add":
+            # Mirror Radarr v3 PUT /api/v3/movie/editor: mutate ONLY monitored and additively
+            # append tags while preserving unrelated concurrent edits (e.g. qualityProfileId, extra tags).
+            updated = dict(self.movies[movie_id])
+            if "monitored" in payload:
+                updated["monitored"] = bool(payload["monitored"])
+            cur_tags = updated.get("tags") if isinstance(updated.get("tags"), list) else []
+            add_tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+            updated["tags"] = list(dict.fromkeys([*cur_tags, *add_tags]))
+            updated["id"] = movie_id
+            self.movies[movie_id] = updated
+            return RadarrWriteResult(outcome="ok", data=dict(updated), status_code=200)
         updated = dict(payload)
         updated["id"] = movie_id
         self.movies[movie_id] = updated

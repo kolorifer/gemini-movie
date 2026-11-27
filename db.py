@@ -558,6 +558,74 @@ def extract_imdb_id(*texts: Optional[str]) -> Optional[str]:
     return None
 
 
+_DATED_EDITION_YEAR_MARKERS = frozenset(
+    {
+        "restoration",
+        "restored",
+        "remaster",
+        "remastered",
+        "reissue",
+        "reissued",
+        "rerelease",
+        "re-release",
+        "master",
+        "mastered",
+        "transfer",
+        "scan",
+        "anniversary",
+        "criterion",
+        "print",
+    }
+)
+_DATED_EDITION_YEAR_PREFIXES = frozenset(
+    {"2k", "4k", "8k", "uhd", "hd", "new", "newly", "digital"}
+)
+
+
+def _is_dated_edition_year(tokens: list[str], idx: int) -> bool:
+    """
+    Return True when a 4-digit year token at `tokens[idx]` labels a restoration/remaster/reissue
+    edition (e.g. '2022.Restoration', '2022.4K.Restoration', '2022.Remastered') rather than the
+    film's own release year.
+    """
+    if idx < 0 or idx >= len(tokens):
+        return False
+    if not YEAR_RE.match(tokens[idx].lower()):
+        return False
+    if idx + 1 < len(tokens):
+        nxt = tokens[idx + 1].lower().strip("'’")
+        if nxt in _DATED_EDITION_YEAR_MARKERS:
+            return True
+        if nxt in _DATED_EDITION_YEAR_PREFIXES and idx + 2 < len(tokens):
+            nxt2 = tokens[idx + 2].lower().strip("'’")
+            if nxt2 in _DATED_EDITION_YEAR_MARKERS:
+                return True
+    return False
+
+
+def is_title_numeral_token(tokens: list[str], idx: int, *, max_release_year: int) -> bool:
+    """
+    Return True when a 4-digit year-like token at `tokens[idx]` is part of the movie title
+    (e.g. '2049' in 'Road.2049.2017.1080p.BluRay.REMUX' or '1984' in 'Wonder.Woman.1984.2020')
+    rather than the release year itself. Does NOT treat a release year followed by a labeled
+    restoration/remaster year (e.g. 'Granite.Bay.1994.2022.Restoration') as a title numeral.
+    """
+    low = tokens[idx].lower()
+    if not YEAR_RE.match(low):
+        return False
+    if idx == 0:
+        return True
+    if int(low) > max_release_year:
+        return True
+    if (
+        idx + 1 < len(tokens)
+        and YEAR_RE.match(tokens[idx + 1].lower())
+        and not _is_dated_edition_year(tokens, idx + 1)
+    ):
+        return True
+    return False
+
+
 def normalize_release_key(
     raw_text: str,
     hint_title: Optional[str] = None,
@@ -580,11 +648,7 @@ def normalize_release_key(
     for idx, token in enumerate(tokens):
         low = token.lower()
         if YEAR_RE.match(low):
-            if (
-                idx == 0
-                or (idx + 1 < len(tokens) and YEAR_RE.match(tokens[idx + 1].lower()))
-                or int(low) > max_release_year
-            ):
+            if is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
                 title_tokens.append(low)
                 continue
             detected_year = int(low)

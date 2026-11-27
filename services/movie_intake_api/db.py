@@ -479,11 +479,24 @@ class IntakeDB:
                 ORDER BY created_at ASC, release_id ASC
                 """
             ).fetchall()
+            # PR #18 Round 5 Finding 3: Also scan never-evaluated, never-delivered releases
+            # previously suppressed as `pre_upgrade_ineligible_scope` (e.g. while an archive was
+            # temporarily unavailable during migration) so restoring the archive + restart
+            # automatically recovers the unsent eligible notification once.
+            suppressed_unsent = conn.execute(
+                """
+                SELECT release_id
+                FROM releases
+                WHERE state = 'suppressed'
+                  AND suppression_reason = 'pre_upgrade_ineligible_scope'
+                  AND card_revision = 0
+                  AND last_evaluated_digest IS NULL
+                  AND ack_message_id IS NULL
+                ORDER BY created_at ASC, release_id ASC
+                """
+            ).fetchall()
         finally:
             conn.close()
-
-        if not actionable:
-            return 0
 
         to_suppress: list[tuple[str, str, Optional[str], bool]] = []
         for row in actionable:
@@ -508,7 +521,19 @@ class IntakeDB:
                     preserve_retire_supersede = False
             to_suppress.append((rel_id, latest_occ_id, reason, preserve_retire_supersede))
 
-        if not to_suppress:
+        to_requeue: list[str] = []
+        for row in suppressed_unsent:
+            rel_id = str(row["release_id"])
+            eligible, _reason = self.is_release_currently_eligible(
+                rel_id,
+                archive_dir,
+                allowed_filter_names=allowed_filter_names,
+                allowed_filter_ids=allowed_filter_ids,
+            )
+            if eligible:
+                to_requeue.append(rel_id)
+
+        if not to_suppress and not to_requeue:
             return 0
 
         now_iso = utc_now_iso()
@@ -557,6 +582,27 @@ class IntakeDB:
                         """,
                         (now_iso, rel_id),
                     )
+            for rel_id in to_requeue:
+                conn.execute(
+                    """
+                    UPDATE releases
+                    SET state = 'queued',
+                        suppression_reason = NULL,
+                        pending_reprocess = 0,
+                        retry_count = 0,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE release_id = ?
+                      AND state = 'suppressed'
+                      AND suppression_reason = 'pre_upgrade_ineligible_scope'
+                      AND card_revision = 0
+                      AND last_evaluated_digest IS NULL
+                      AND ack_message_id IS NULL
+                    """,
+                    (now_iso, now_iso, rel_id),
+                )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -628,7 +674,8 @@ class IntakeDB:
             existing = conn.execute(
                 """
                 SELECT release_id, state, suppression_reason, card_revision,
-                       incoming_evidence_digest, latest_occurrence_id, source_occurrence_id
+                       incoming_evidence_digest, latest_occurrence_id, source_occurrence_id,
+                       last_evaluated_digest, ack_message_id
                 FROM releases
                 WHERE indexer_norm = ? AND external_id_norm = ? AND exact_release_name = ?
                 """,
@@ -676,6 +723,11 @@ class IntakeDB:
                 cur_digest = str(existing["incoming_evidence_digest"])
                 latest_occ_id = str(existing["latest_occurrence_id"])
                 cur_source_occ = str(existing["source_occurrence_id"])
+                never_processed = (
+                    card_revision == 0
+                    and existing["last_evaluated_digest"] is None
+                    and existing["ack_message_id"] is None
+                )
                 latest_occ_row = conn.execute(
                     "SELECT classification, archive_sha256, incoming_evidence_digest FROM occurrences WHERE occurrence_id = ?",
                     (latest_occ_id,),
@@ -691,15 +743,24 @@ class IntakeDB:
                 else:
                     source_occ = cur_source_occ
 
-                # PR #18 Round 4 Findings 3 & 4:
-                # 1. Never bypass proven eligible (`movie_candidate`) history or missing-archive
-                #    ordering guards when waking a suppressed release, and never relabel prior
-                #    `movie_candidate` records.
+                # PR #18 Round 4 Findings 3 & 4 + Round 5 Finding 3:
+                # 1. Never bypass proven eligible (`movie_candidate`) history for superseded
+                #    identities (`cur_digest != incoming`) or missing-archive ordering guards,
+                #    and never relabel prior `movie_candidate` records.
                 # 2. Only treat `latest_occurrence_id` as an exact duplicate when it was NOT an
-                #    intact pre-upgrade excluded delivery (`pre_upgrade_ineligible_scope`), so a
-                #    genuinely new qualifying delivery (both card_revision==0 and card_revision>=1)
-                #    can wake/reassess once while exact replays of earlier allowed occurrences or
-                #    releases with unverified missing archives stay protected.
+                #    intact pre-upgrade excluded delivery (`pre_upgrade_ineligible_scope`).
+                # 3. If a never-evaluated, never-delivered release was suppressed ONLY because an
+                #    excluded filter's duplicate of the SAME current identity (`cur_digest == incoming`)
+                #    became `latest_occurrence_id` before upgrade, allow a fresh qualifying delivery
+                #    to wake and process it once without re-triggering on any subsequent duplicate.
+                retrying_unsent_pre_upgrade_duplicate = (
+                    latest_is_ineligible_pre_upgrade
+                    and cur_state == "suppressed"
+                    and cur_suppression_reason == "pre_upgrade_ineligible_scope"
+                    and never_processed
+                    and cur_digest == classified.incoming_evidence_digest
+                )
+
                 is_exact_latest_replay = (
                     not latest_is_ineligible_pre_upgrade
                     and (
@@ -713,6 +774,7 @@ class IntakeDB:
 
                 seen_prior_occurrence = (
                     not is_exact_latest_replay
+                    and not retrying_unsent_pre_upgrade_duplicate
                     and conn.execute(
                         """
                         SELECT 1 FROM occurrences

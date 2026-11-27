@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from db import RELEASE_STOP_TOKENS, YEAR_RE, extract_imdb_id
+from db import RELEASE_STOP_TOKENS, YEAR_RE, extract_imdb_id, is_title_numeral_token
 from schemas import (
     CatalogueIdentification,
     EvaluateRequest,
@@ -183,28 +183,11 @@ def _parse_year(release_date: Optional[str]) -> Optional[int]:
     return None
 
 
-def _is_title_numeral_token(tokens: list[str], idx: int, *, max_release_year: int) -> bool:
-    """
-    Return True when a 4-digit year-like token at `tokens[idx]` is part of the movie title
-    (e.g. '2049' in 'Echo.2049.2017.1080p.BluRay.REMUX' or '1984' in 'Wonder.Woman.1984.2020')
-    rather than the release year itself.
-    """
-    low = tokens[idx].lower()
-    if not YEAR_RE.match(low):
-        return False
-    if idx == 0:
-        return True
-    if idx + 1 < len(tokens) and YEAR_RE.match(tokens[idx + 1].lower()):
-        return True
-    if int(low) > max_release_year:
-        return True
-    return False
-
-
 def extract_filename_tmdb_query(raw_text: str) -> tuple[Optional[str], Optional[int]]:
     """
     Extract (title, year) strictly from the release string alone (independent of upstream hints).
-    Preserves hyphenated titles (e.g. Spider-Man) and title-ending numerals (e.g. Echo 2049 2017).
+    Preserves hyphenated titles (e.g. Spider-Man), title-ending numerals (e.g. Road 2049 2017),
+    and release years followed by dated restoration labels (e.g. Granite Bay 1994 2022 Restoration).
     """
     cleaned = re.sub(r"\[redacted\]", " ", sanitize_tracker_text(raw_text, max_chars=512), flags=re.IGNORECASE).strip()
     has_release_markers = "." in cleaned or any(
@@ -224,7 +207,7 @@ def extract_filename_tmdb_query(raw_text: str) -> tuple[Optional[str], Optional[
     for idx, token in enumerate(tokens):
         low = token.lower()
         if YEAR_RE.match(low):
-            if _is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
+            if is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
                 title_tokens.append(token)
                 continue
             detected_year = int(low)
@@ -1481,12 +1464,31 @@ class TmdbClient:
                 audio_languages=audio_languages,
             )
             if searched is not None:
-                # If a tracker/hint conflict occurred, still run Gemini with the conflict warning
-                # rather than silently serving a cached entry without disambiguation.
-                return TmdbLookupResult(
-                    movie=searched,
-                    tracker_conflict=tracker_conflict,
-                    trusted_for_cache=tracker_conflict is None,
+                # PR #18 Round 5 Finding 1: Apply the exact same release-evidence consistency
+                # check to the title-search candidate so title search can never re-approve or
+                # cache a catalogue record already contradicted by MediaInfo runtime/year/title.
+                search_conflict = check_release_evidence_consistency(
+                    searched,
+                    raw_text=request.raw_text,
+                    hint_title=request.hint_title,
+                    hint_year=request.hint_year,
+                    nfo_runtime=nfo_runtime,
+                    audio_languages=audio_languages,
+                )
+                if search_conflict is None:
+                    # Genuinely consistent search result (can resolve a mistaken tracker ID
+                    # when a different film matches all release evidence). Still run Gemini
+                    # when tracker_conflict was present instead of serving from alias cache.
+                    return TmdbLookupResult(
+                        movie=searched,
+                        tracker_conflict=tracker_conflict,
+                        trusted_for_cache=tracker_conflict is None,
+                    )
+                logger.warning("Rejecting inconsistent TMDB search candidate: %s", search_conflict)
+                tracker_conflict = (
+                    f"{tracker_conflict}; {search_conflict}"
+                    if tracker_conflict and search_conflict not in tracker_conflict
+                    else (tracker_conflict or search_conflict)
                 )
 
         return TmdbLookupResult(
