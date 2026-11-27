@@ -26,7 +26,10 @@ from tmdb_client import (
     TmdbClient,
     apply_tmdb_verification,
     apply_unresolved_conflict_result,
+    check_tracker_movie_consistency,
     compute_evidence_key,
+    extract_nfo_runtime_minutes,
+    extract_tmdb_query,
     format_torrent_info_for_prompt,
     is_tmdb_compatible,
 )
@@ -206,12 +209,42 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             if tmdb_client.enabled
             else None
         )
-        verified_result = apply_tmdb_verification(result, verified_candidate)
+        # Round 3 Finding 3: Cross-check any late model-proposed catalogue record
+        # against the original release evidence (title, year, MediaInfo runtime/audio)
+        # before declaring compatibility or writing to cache.
+        late_release_conflict: Optional[str] = None
+        if verified_candidate is not None:
+            query_title, query_year = extract_tmdb_query(
+                payload.raw_text,
+                hint_title=payload.hint_title,
+                hint_year=payload.hint_year,
+            )
+            nfo_runtime = (
+                tinfo.runtime_minutes or extract_nfo_runtime_minutes(tinfo.nfo_text)
+                if tinfo is not None
+                else None
+            )
+            audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
+            late_release_conflict = check_tracker_movie_consistency(
+                verified_candidate,
+                query_title=query_title,
+                query_year=query_year,
+                nfo_runtime=nfo_runtime,
+                audio_languages=audio_languages,
+            )
+        if late_release_conflict is not None:
+            verified_result = apply_unresolved_conflict_result(
+                result,
+                conflict_reason=late_release_conflict,
+                candidate_tmdb=verified_candidate,
+            )
+        else:
+            verified_result = apply_tmdb_verification(result, verified_candidate)
 
     result_dict = verified_result.model_dump()
 
     # Withhold caching when catalogue verification found an unresolved incompatibility
-    # or when a tracker conflict could not be resolved against release evidence.
+    # or when a tracker/release conflict could not be resolved against release evidence.
     has_catalogue_conflict = bool(
         (
             verified_result.catalogue_identification is not None
@@ -219,7 +252,39 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         )
         or (release_tmdb is None and bool(lookup.tracker_conflict))
     )
-    if not has_catalogue_conflict:
+    if has_catalogue_conflict:
+        # Round 3 Finding 4: Invalidate any previously cached compatible entries reachable
+        # for this release (including applicable IMDb aliases) so the contradiction persists
+        # on subsequent ordinary reads.
+        conflict_imdbs: list[str] = []
+        for cand_imdb in (
+            tinfo.imdb_id if tinfo is not None else None,
+            release_tmdb.imdb_id if release_tmdb is not None else None,
+            verified_result.identification.imdb_id,
+            (
+                verified_result.catalogue_identification.imdb_id
+                if verified_result.catalogue_identification is not None
+                else None
+            ),
+        ):
+            if cand_imdb and cand_imdb not in conflict_imdbs:
+                conflict_imdbs.append(cand_imdb)
+        await asyncio.to_thread(
+            db.invalidate_evaluations,
+            payload.raw_text,
+            hint_title=payload.hint_title,
+            hint_year=(
+                payload.hint_year
+                if payload.hint_year is not None
+                else (release_tmdb.year if release_tmdb is not None else None)
+            ),
+            extra_context=payload.extra_context,
+            quality_key=release_quality.cache_key,
+            edition_key=release_quality.edition_key,
+            evidence_key=evidence_key,
+            imdb_ids=conflict_imdbs,
+        )
+    else:
         await asyncio.to_thread(
             db.save_evaluation,
             payload.raw_text,

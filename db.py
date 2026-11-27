@@ -989,6 +989,101 @@ class TriageDB:
             )
         self._harden_db_file_permissions()
 
+    def invalidate_evaluations(
+        self,
+        raw_text: str,
+        *,
+        hint_title: Optional[str] = None,
+        hint_year: Optional[int] = None,
+        extra_context: Optional[str] = None,
+        quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
+        evidence_key: str = "",
+        imdb_ids: Optional[list[str]] = None,
+    ) -> int:
+        """
+        PR #18 Round 3 Finding 4: Invalidate previously cached evaluations reachable for
+        this release (exact raw text, release_key, and applicable IMDb aliases) whenever a
+        refresh or re-evaluation establishes a catalogue/identity contradiction.
+        """
+        norm_raw = normalize_raw_text(raw_text)
+        rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
+        ev_key = (evidence_key or "").strip()
+
+        clean_imdbs: list[str] = []
+        extracted = extract_imdb_id(raw_text, extra_context)
+        if extracted:
+            clean_imdbs.append(extracted.lower())
+        for raw_id in imdb_ids or []:
+            if isinstance(raw_id, str) and raw_id.strip():
+                low = raw_id.strip().lower()
+                if low not in clean_imdbs:
+                    clean_imdbs.append(low)
+
+        query_year: Optional[int] = hint_year
+        if query_year is None and rel_key:
+            tail = rel_key.rsplit(" ", 1)[-1]
+            if YEAR_RE.match(tail):
+                query_year = int(tail)
+
+        deleted = 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM evaluations
+                WHERE raw_text_normalized = ?
+                  AND quality_key = ?
+                  AND edition_key = ?
+                  AND evidence_key = ?
+                """,
+                (norm_raw, q_key, ed_key, ev_key),
+            )
+            deleted += cur.rowcount
+
+            if rel_key:
+                cur = conn.execute(
+                    """
+                    DELETE FROM evaluations
+                    WHERE release_key = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                    """,
+                    (rel_key, q_key, ed_key, ev_key),
+                )
+                deleted += cur.rowcount
+
+            for imdb in clean_imdbs:
+                if query_year is not None:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM evaluations
+                        WHERE lower(imdb_id) = ?
+                          AND quality_key = ?
+                          AND edition_key = ?
+                          AND evidence_key = ?
+                          AND ABS(year - ?) <= 1
+                        """,
+                        (imdb, q_key, ed_key, ev_key, query_year),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM evaluations
+                        WHERE lower(imdb_id) = ?
+                          AND quality_key = ?
+                          AND edition_key = ?
+                          AND evidence_key = ?
+                        """,
+                        (imdb, q_key, ed_key, ev_key),
+                    )
+                deleted += cur.rowcount
+        self._harden_db_file_permissions()
+        return deleted
+
     def get_cache_entries_count(self, ttl_hours: int = 72) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
             timespec="seconds"

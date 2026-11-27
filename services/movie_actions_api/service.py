@@ -120,6 +120,93 @@ def _find_watched_tag_id(tags: list[dict[str, Any]]) -> Optional[int]:
     return None
 
 
+def _movie_has_file_evidence(movie: dict[str, Any]) -> bool:
+    """Return True if a Radarr movie dict has any evidence of owning a file on disk."""
+    movie_file_obj = movie.get("movieFile")
+    has_movie_file_obj = isinstance(movie_file_obj, dict) and bool(
+        (
+            isinstance(movie_file_obj.get("id"), int)
+            and not isinstance(movie_file_obj.get("id"), bool)
+            and movie_file_obj["id"] > 0
+        )
+        or str(movie_file_obj.get("relativePath") or "").strip()
+        or str(movie_file_obj.get("path") or "").strip()
+    )
+    size_on_disk = movie.get("sizeOnDisk")
+    has_size_on_disk = (
+        isinstance(size_on_disk, (int, float))
+        and not isinstance(size_on_disk, bool)
+        and size_on_disk > 0
+    )
+    return bool(
+        movie.get("hasFile")
+        or _extract_file_id(movie) is not None
+        or has_movie_file_obj
+        or has_size_on_disk
+    )
+
+
+def _reconcile_radarr_row_snapshots(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    conservative_for_grab: bool = True,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """
+    PR #18 Round 3 Finding 1: Reconcile two observations of the same Radarr movie row ID
+    returned by separate TMDb and IMDb lookups.
+      - Always reject identity drift (conflicting tmdbId or imdbId across observations).
+      - When `conservative_for_grab=True` (card-prep status & Add & Grab confirmation),
+        merge monotonically so if EITHER observation shows file ownership, a watched tag,
+        or unmonitored status, the merged snapshot preserves that ineligibility.
+      - When `conservative_for_grab=False` (Watched mutation), retain the fresher `second`
+        snapshot so any required PUT update is never skipped.
+    """
+    tmdb_1 = first.get("tmdbId")
+    tmdb_2 = second.get("tmdbId")
+    if (
+        isinstance(tmdb_1, int)
+        and not isinstance(tmdb_1, bool)
+        and isinstance(tmdb_2, int)
+        and not isinstance(tmdb_2, bool)
+        and tmdb_1 != tmdb_2
+    ):
+        return None, "radarr_snapshot_tmdb_drift"
+
+    imdb_1 = str(first.get("imdbId") or "").strip().lower()
+    imdb_2 = str(second.get("imdbId") or "").strip().lower()
+    if imdb_1 and imdb_2 and imdb_1 != imdb_2:
+        return None, "radarr_snapshot_imdb_drift"
+
+    if not conservative_for_grab:
+        merged = dict(second)
+        if not imdb_2 and imdb_1:
+            merged["imdbId"] = first.get("imdbId")
+        return merged, None
+
+    merged = dict(second)
+    if not imdb_2 and imdb_1:
+        merged["imdbId"] = first.get("imdbId")
+
+    tags_1 = [t for t in (first.get("tags") or []) if isinstance(t, int) and not isinstance(t, bool)] if isinstance(first.get("tags"), list) else []
+    tags_2 = [t for t in (second.get("tags") or []) if isinstance(t, int) and not isinstance(t, bool)] if isinstance(second.get("tags"), list) else []
+    merged["tags"] = list(dict.fromkeys([*tags_1, *tags_2]))
+    merged["monitored"] = bool(first.get("monitored", False)) and bool(second.get("monitored", False))
+
+    first_has_file = _movie_has_file_evidence(first)
+    second_has_file = _movie_has_file_evidence(second)
+    if first_has_file or second_has_file:
+        src = second if second_has_file else first
+        merged["hasFile"] = bool(first.get("hasFile")) or bool(second.get("hasFile"))
+        if src.get("movieFileId") is not None:
+            merged["movieFileId"] = src.get("movieFileId")
+        if isinstance(src.get("movieFile"), dict):
+            merged["movieFile"] = src.get("movieFile")
+        if src.get("sizeOnDisk") is not None:
+            merged["sizeOnDisk"] = src.get("sizeOnDisk")
+    return merged, None
+
+
 def _feedback_spec_for_action(action_type: str) -> Optional[tuple[str, str]]:
     """Return (decision, note) for action types that post to movie-triage-api /feedback."""
     if action_type == "add_grab":
@@ -201,6 +288,25 @@ class ActionsService:
         deduped: dict[Any, dict[str, Any]] = {}
         fallback_idx = 0
 
+        def _merge_candidate_row(row_obj: dict[str, Any]) -> Optional[str]:
+            nonlocal fallback_idx
+            mid = row_obj.get("id")
+            key = ("id", int(mid)) if isinstance(mid, int) and not isinstance(mid, bool) else ("idx", fallback_idx)
+            if key[0] == "idx":
+                fallback_idx += 1
+            if key not in deduped:
+                deduped[key] = row_obj
+                return None
+            reconciled, drift = _reconcile_radarr_row_snapshots(
+                deduped[key],
+                row_obj,
+                conservative_for_grab=True,
+            )
+            if drift is not None or reconciled is None:
+                return drift or "radarr_snapshot_drift"
+            deduped[key] = reconciled
+            return None
+
         if tmdb_id is not None:
             m_res = await self.radarr.get_movies_by_tmdb(tmdb_id)
             if not m_res.ok:
@@ -212,16 +318,18 @@ class ActionsService:
             for m in m_res.data:
                 if not isinstance(m, dict):
                     continue
-                mid = m.get("id")
-                key = ("id", int(mid)) if isinstance(mid, int) and not isinstance(mid, bool) else ("idx", fallback_idx)
-                if key[0] == "idx":
-                    fallback_idx += 1
-                if key not in deduped:
-                    deduped[key] = m
+                drift = _merge_candidate_row(m)
+                if drift is not None:
+                    return {
+                        "status": "ambiguous",
+                        "alternative_grab_configured": self.alternative_grab_configured,
+                        "detail": drift,
+                    }
 
         if clean_imdb:
             # Always cross-check imdbId (even when tmdb_id matched) so duplicate library
-            # rows sharing the same IMDb across distinct TMDb IDs are flagged as ambiguous.
+            # rows sharing the same IMDb across distinct TMDb IDs are flagged as ambiguous,
+            # and same-row state changes between lookups are conservatively reconciled.
             i_res = await self.radarr.get_movies_by_imdb(clean_imdb)
             if not i_res.ok:
                 return {
@@ -232,12 +340,13 @@ class ActionsService:
             for m in i_res.data:
                 if not isinstance(m, dict):
                     continue
-                mid = m.get("id")
-                key = ("id", int(mid)) if isinstance(mid, int) and not isinstance(mid, bool) else ("idx", fallback_idx)
-                if key[0] == "idx":
-                    fallback_idx += 1
-                if key not in deduped:
-                    deduped[key] = m
+                drift = _merge_candidate_row(m)
+                if drift is not None:
+                    return {
+                        "status": "ambiguous",
+                        "alternative_grab_configured": self.alternative_grab_configured,
+                        "detail": drift,
+                    }
 
         matches = list(deduped.values())
         if len(matches) > 1:
@@ -294,19 +403,7 @@ class ActionsService:
         has_watched = watched_tag_id is not None and watched_tag_id in movie_tags
         monitored = bool(matched_movie.get("monitored", False))
         file_id = _extract_file_id(matched_movie)
-        movie_file_obj = matched_movie.get("movieFile")
-        has_movie_file_obj = isinstance(movie_file_obj, dict) and bool(
-            (isinstance(movie_file_obj.get("id"), int) and not isinstance(movie_file_obj.get("id"), bool) and movie_file_obj["id"] > 0)
-            or str(movie_file_obj.get("relativePath") or "").strip()
-            or str(movie_file_obj.get("path") or "").strip()
-        )
-        size_on_disk = matched_movie.get("sizeOnDisk")
-        has_size_on_disk = (
-            isinstance(size_on_disk, (int, float))
-            and not isinstance(size_on_disk, bool)
-            and size_on_disk > 0
-        )
-        has_file = bool(matched_movie.get("hasFile", False)) or file_id is not None or has_movie_file_obj or has_size_on_disk
+        has_file = _movie_has_file_evidence(matched_movie)
         existing_quality = _extract_existing_quality(matched_movie)
 
         if has_watched and not monitored:
@@ -2468,6 +2565,7 @@ class ActionsService:
 
         deduped: dict[Any, dict[str, Any]] = {}
         fallback_idx = 0
+        conservative = mutation_label != "Watched"
         for batch in (
             movies_tmdb_res.data or [],
             (movies_imdb_res.data or []) if movies_imdb_res is not None else [],
@@ -2481,6 +2579,27 @@ class ActionsService:
                     fallback_idx += 1
                 if key not in deduped:
                     deduped[key] = m
+                else:
+                    reconciled, drift = _reconcile_radarr_row_snapshots(
+                        deduped[key],
+                        m,
+                        conservative_for_grab=conservative,
+                    )
+                    if drift is not None or reconciled is None:
+                        return (
+                            None,
+                            None,
+                            HtmlResponseData(
+                                status_code=409,
+                                html=render_simple_status_page(
+                                    title="Ambiguous Radarr Match",
+                                    badge="ambiguous",
+                                    message=f"Radarr movie identity changed across concurrent TMDB/IMDb lookups ({drift}); refusing {mutation_label}.",
+                                    tone="err",
+                                ),
+                            ),
+                        )
+                    deduped[key] = reconciled
 
         matches = list(deduped.values())
         if len(matches) > 1:
@@ -2525,25 +2644,7 @@ class ActionsService:
         if id_err is not None:
             return id_err
 
-        movie_file_obj = existing.get("movieFile")
-        has_movie_file_obj = isinstance(movie_file_obj, dict) and bool(
-            (isinstance(movie_file_obj.get("id"), int) and not isinstance(movie_file_obj.get("id"), bool) and movie_file_obj["id"] > 0)
-            or str(movie_file_obj.get("relativePath") or "").strip()
-            or str(movie_file_obj.get("path") or "").strip()
-        )
-        size_on_disk = existing.get("sizeOnDisk")
-        has_size_on_disk = (
-            isinstance(size_on_disk, (int, float))
-            and not isinstance(size_on_disk, bool)
-            and size_on_disk > 0
-        )
-        has_file = (
-            bool(existing.get("hasFile"))
-            or _extract_file_id(existing) is not None
-            or has_movie_file_obj
-            or has_size_on_disk
-        )
-        if has_file:
+        if _movie_has_file_evidence(existing):
             return HtmlResponseData(
                 status_code=409,
                 html=render_simple_status_page(
