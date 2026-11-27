@@ -3870,6 +3870,159 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(status_obj.status, expected_status)
                     self.assertEqual(mode, expected_mode)
 
+    async def test_pr18_r3_finding_1_radarr_two_lookup_snapshot_reconciliation(self) -> None:
+        """
+        PR #18 Round 3 Finding 1: Reconcile TMDb and IMDb observations of the same Radarr row
+        monotonically at both card preparation (/internal/radarr/status) and final grab
+        confirmation, while retaining normal absent/monitored positive controls.
+        """
+        from types import SimpleNamespace
+        from services.movie_intake_api.worker import IntakeWorker
+
+        async def _run_case(case: str) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=tg,
+                    radarr_client=rad,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(base_url="http://test", transport=httpx.ASGITransport(app=app)) as client,
+                ):
+                    hdr = {"X-Internal-Token": cfg.internal_api_secret}
+                    payload = _verified_card_payload(poster_path=None)
+                    tmdb_id = payload["verified_tmdb_id"]
+                    imdb_id = payload["verified_imdb_id"]
+                    row = {
+                        "id": 77,
+                        "tmdbId": tmdb_id,
+                        "imdbId": imdb_id,
+                        "hasFile": False,
+                        "monitored": True,
+                        "tags": [],
+                    }
+                    if case != "normal_absent":
+                        rad.movies[77] = dict(row)
+                    if case == "known_file_at_delivery":
+                        rad.movies[77]["movieFileId"] = 88
+                    if case == "duplicated_imdb_at_delivery":
+                        rad.movies[78] = {**row, "id": 78, "tmdbId": tmdb_id + 1}
+
+                    orig_tmdb = rad.get_movies_by_tmdb
+                    orig_imdb = rad.get_movies_by_imdb
+                    old_row_read = asyncio.Event()
+                    read_no = 0
+                    armed = case in ("owned_on_second_read_at_delivery", "identity_drift_on_second_read_at_delivery")
+                    triggered = False
+
+                    async def _first_snapshot(movie_id: int) -> RadarrResult:
+                        nonlocal read_no
+                        res = await orig_tmdb(movie_id)
+                        if armed:
+                            read_no += 1
+                            if case != "watched_on_second_read_at_final_push" or read_no == 2:
+                                old_row_read.set()
+                        return res
+
+                    async def _second_snapshot(movie_imdb: str) -> RadarrResult:
+                        nonlocal triggered
+                        if armed and not triggered and old_row_read.is_set():
+                            if case == "owned_on_second_read_at_delivery":
+                                rad.movies[77].update({"hasFile": True, "movieFileId": 88})
+                            elif case == "watched_on_second_read_at_final_push":
+                                rad.movies[77].update({"tags": [7], "monitored": False})
+                            elif case == "identity_drift_on_second_read_at_delivery":
+                                rad.movies[77].update({"tmdbId": tmdb_id + 500})
+                            triggered = True
+                        return await orig_imdb(movie_imdb)
+
+                    rad.get_movies_by_tmdb = _first_snapshot  # type: ignore[method-assign]
+                    rad.get_movies_by_imdb = _second_snapshot  # type: ignore[method-assign]
+
+                    r = await client.get(
+                        "/internal/radarr/status",
+                        headers=hdr,
+                        params={"tmdb_id": tmdb_id, "imdb_id": imdb_id},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    status = r.json()
+                    decision = IntakeWorker._decide_radarr_outcome(
+                        None,  # type: ignore[arg-type]
+                        radarr=SimpleNamespace(**status),
+                        alt_grab_eligible=False,
+                        alt_grab_rejection_class=None,
+                    )[0]
+                    out: dict[str, Any] = {
+                        "case": case,
+                        "radarr_status": status["status"],
+                        "intake_decision": decision,
+                    }
+                    if decision == "actionable_grab":
+                        card = await client.post("/internal/deliver/card", headers=hdr, json=payload)
+                        self.assertEqual(card.status_code, 200)
+                        token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["add_grab"]
+                        if case == "watched_on_second_read_at_final_push":
+                            armed = True
+                        grab = await client.post(
+                            "/action/" + token,
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        out["grab_http"] = grab.status_code
+                    out.update(
+                        triggered=triggered,
+                        radarr_adds=len(rad.add_calls),
+                        pushes=len(rad.push_calls),
+                        feedback=[c.get("decision") for c in fb.calls],
+                    )
+                    return out
+
+        for case in ("normal_existing", "normal_absent"):
+            res = await _run_case(case)
+            self.assertEqual(res["intake_decision"], "actionable_grab", res)
+            self.assertEqual(res["grab_http"], 200, res)
+            self.assertEqual(res["pushes"], 1, res)
+            self.assertEqual(res["feedback"], ["watch"], res)
+
+        r_known = await _run_case("known_file_at_delivery")
+        self.assertEqual(r_known["radarr_status"], "owned_file")
+        self.assertEqual(r_known["intake_decision"], "suppress")
+        self.assertEqual(r_known["pushes"], 0)
+        self.assertEqual(r_known["feedback"], [])
+
+        r_dup = await _run_case("duplicated_imdb_at_delivery")
+        self.assertEqual(r_dup["radarr_status"], "ambiguous")
+        self.assertEqual(r_dup["intake_decision"], "evidence_review")
+        self.assertEqual(r_dup["pushes"], 0)
+        self.assertEqual(r_dup["feedback"], [])
+
+        r_owned2 = await _run_case("owned_on_second_read_at_delivery")
+        self.assertTrue(r_owned2["triggered"])
+        self.assertEqual(r_owned2["radarr_status"], "owned_file")
+        self.assertEqual(r_owned2["intake_decision"], "suppress")
+        self.assertEqual(r_owned2["pushes"], 0)
+        self.assertEqual(r_owned2["feedback"], [])
+
+        r_drift = await _run_case("identity_drift_on_second_read_at_delivery")
+        self.assertTrue(r_drift["triggered"])
+        self.assertEqual(r_drift["radarr_status"], "ambiguous")
+        self.assertEqual(r_drift["intake_decision"], "evidence_review")
+        self.assertEqual(r_drift["pushes"], 0)
+        self.assertEqual(r_drift["feedback"], [])
+
+        r_watch2 = await _run_case("watched_on_second_read_at_final_push")
+        self.assertTrue(r_watch2["triggered"])
+        self.assertEqual(r_watch2["intake_decision"], "actionable_grab")
+        self.assertEqual(r_watch2["grab_http"], 409)
+        self.assertEqual(r_watch2["pushes"], 0)
+        self.assertEqual(r_watch2["feedback"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

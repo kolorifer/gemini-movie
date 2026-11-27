@@ -432,13 +432,23 @@ def _numeric_matches_target(num_str: str, value: int | float, *, is_int: bool) -
     return abs(parsed - float(value)) < 1e-6
 
 
+_REVIEW_COUNT_PHRASE_RE = re.compile(
+    r"(?<![%\d.])\b\d{1,6}(?:,\d{3})*\s+(?:(?:verified|top|all|total|certified)\s+)?"
+    r"(?:(?:critic|critics|audience|user|users|viewer|viewers|member|members)\s+)?"
+    r"(?:reviews?|ratings|votes?|responses?|submissions?|people)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_clause_metric_bindings(clause: str) -> list[tuple[str, str]]:
     """
     Bind each metric cue in a single clause to its directly associated numeric value
-    so swapped scores (e.g. 'Tomatometer of 42% and Popcornmeter of 89%') never cross-validate.
+    so swapped scores (e.g. 'Tomatometer of 42% and Popcornmeter of 89%') and review
+    counts (e.g. 'based on 74 critic reviews') never cross-validate as ratings.
     """
     cleaned = re.sub(r"\btt\d{7,10}\b", " ", clause, flags=re.IGNORECASE)
     cleaned = _PAREN_YEAR_RE.sub(" ", cleaned)
+    cleaned = _REVIEW_COUNT_PHRASE_RE.sub(" ", cleaned)
 
     cue_events: list[tuple[int, int, str]] = []
     for metric_key, pattern in _METRIC_CUE_PATTERNS:
@@ -467,11 +477,12 @@ def _extract_clause_metric_bindings(clause: str) -> list[tuple[str, str]]:
         # Skip overlaps with cue spans
         if any(cs <= m.start() < ce for cs, ce, _ in filtered_cues):
             continue
+        has_pct = "%" in suffix
         if suffix and ("/10" in suffix.replace(" ", "") or "out of 10" in re.sub(r"\s+", " ", suffix)):
             direct_bindings.append(("imdb", num_str))
         elif suffix and ("/5" in suffix.replace(" ", "") or "out of 5" in re.sub(r"\s+", " ", suffix)):
             direct_bindings.append(("letterboxd", num_str))
-        events.append((m.start(), "num", num_str))
+        events.append((m.start(), "num", (num_str, has_pct)))
 
     events.sort(key=lambda item: item[0])
     used_nums: set[int] = set()
@@ -480,14 +491,20 @@ def _extract_clause_metric_bindings(clause: str) -> list[tuple[str, str]]:
     for idx, (_pos, kind, payload) in enumerate(events):
         if kind != "cue":
             continue
-        # Prefer immediately following unused number (e.g. 'Tomatometer of 42%', 'IMDb 7.5/10')
+        cue_key = str(payload)
+        # Prefer immediately following unused number (e.g. 'Tomatometer of 42%', 'IMDb 7.5/10', '"rotten_tomatoes_critics": 94')
         if idx + 1 < len(events) and events[idx + 1][1] == "num" and (idx + 1) not in used_nums:
+            num_str, _has_pct = events[idx + 1][2]
             used_nums.add(idx + 1)
-            bindings.append((str(payload), str(events[idx + 1][2])))
-        # Otherwise accept immediately preceding unused number (e.g. '42% Tomatometer', '89% audience')
+            bindings.append((cue_key, str(num_str)))
+        # Otherwise accept immediately preceding unused number (e.g. '42% Tomatometer', '89% audience'),
+        # requiring an explicit '%' suffix for Rotten Tomatoes percentage metrics so counts never bind.
         elif idx - 1 >= 0 and events[idx - 1][1] == "num" and (idx - 1) not in used_nums:
+            num_str, has_pct = events[idx - 1][2]
+            if cue_key in ("rotten_tomatoes_critics", "rotten_tomatoes_audience") and not has_pct:
+                continue
             used_nums.add(idx - 1)
-            bindings.append((str(payload), str(events[idx - 1][2])))
+            bindings.append((cue_key, str(num_str)))
 
     return bindings
 

@@ -2132,6 +2132,229 @@ class TestTmdbAndEvaluate(unittest.TestCase):
         )
         self.assertIn("The Secret Life of Walter Mitty", clean_prompt)
 
+    def test_pr18_r3_findings_3_4_and_5_late_remake_cache_invalidation_and_review_count(self) -> None:
+        """
+        PR #18 Round 3 Findings 3, 4, and 5 (Triage):
+          - Finding 3: Late model verification checks the candidate TMDb record against
+            original release evidence (year/runtime/title), rejecting a 2024/125m remake for
+            a 2012/96m release while accepting and caching a genuinely matching 2012/96m film.
+          - Finding 4: A forced refresh that establishes a catalogue contradiction invalidates
+            earlier reachable cached compatible entries (exact + IMDb alias) while preserving
+            unrelated movies/years.
+          - Finding 5: RT percentage attribution accepts '82%' while rejecting review counts
+            such as '74 critic reviews' or '1,250 verified audience ratings'.
+        """
+        from google.genai import types as sdk
+        import main
+        from gemini_client import extract_grounding_sources, validate_and_ground_ratings
+        from schemas import TorrentInfo
+
+        # 1) Finding 5: Review count vs percentage attribution
+        ident = {"canonical_title": "Crystal Harbor", "year": 2012, "imdb_id": "tt1111111"}
+
+        def _grounded(segment: str, ratings: dict[str, int | float], site: str = "rt") -> dict[str, object]:
+            if site == "rt":
+                web = {"uri": "https://www.rottentomatoes.com/m/crystal_harbor_2012", "title": "Crystal Harbor (2012)"}
+            else:
+                web = {
+                    "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/fixture",
+                    "domain": "imdb.com",
+                    "title": "Crystal Harbor (2012)",
+                }
+            resp = sdk.GenerateContentResponse(
+                candidates=[
+                    {
+                        "grounding_metadata": {
+                            "grounding_chunks": [{"web": web}],
+                            "grounding_supports": [
+                                {"segment": {"text": segment}, "grounding_chunk_indices": [0]}
+                            ],
+                        }
+                    }
+                ]
+            )
+            return validate_and_ground_ratings(
+                ratings,
+                grounding_sources=extract_grounding_sources(resp),
+                identification=ident,
+            )
+
+        rt_seg = "Crystal Harbor has a Tomatometer of 82% based on 74 critic reviews."
+        res_82 = _grounded(rt_seg, {"rotten_tomatoes_critics": 82})
+        self.assertEqual(res_82["rotten_tomatoes_critics"], 82)
+        self.assertEqual(res_82["sources"], {"rotten_tomatoes_critics": "rottentomatoes.com"})
+
+        res_74 = _grounded(rt_seg, {"rotten_tomatoes_critics": 74})
+        self.assertIsNone(res_74["rotten_tomatoes_critics"])
+        self.assertEqual(res_74["sources"], {})
+
+        aud_seg = "Crystal Harbor has a Popcornmeter of 88% across 1,250 verified audience ratings."
+        self.assertEqual(_grounded(aud_seg, {"rotten_tomatoes_audience": 88})["rotten_tomatoes_audience"], 88)
+        self.assertIsNone(_grounded(aud_seg, {"rotten_tomatoes_audience": 1250})["rotten_tomatoes_audience"])
+
+        imdb_pos = _grounded("Crystal Harbor: IMDb rating 7.4/10.", {"imdb": 7.4}, site="imdb")
+        self.assertEqual(imdb_pos["imdb"], 7.4)
+        self.assertEqual(imdb_pos["sources"], {"imdb": "imdb.com"})
+
+        # 2) Finding 3: Late verification against original release evidence (all 4 controls/cases)
+        original = TmdbMovie(
+            tmdb_id=31,
+            imdb_id="tt1111111",
+            canonical_title="Crystal Harbor",
+            year=2012,
+            director="Anna Linn",
+            runtime_minutes=96,
+        )
+        remake = TmdbMovie(
+            tmdb_id=95,
+            imdb_id="tt7777777",
+            canonical_title="Crystal Harbor",
+            year=2024,
+            director="Julie Quinn",
+            runtime_minutes=125,
+        )
+        for kind in ("conflicting-pair", "anchored-contradiction", "late-correct", "late-remake"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "triage.db")
+                test_db.init_db()
+                proposed = original if kind == "late-correct" else remake
+                model_res = _sample_payload(
+                    title=proposed.canonical_title,
+                    year=proposed.year,
+                    director=proposed.director,
+                    imdb_id=proposed.imdb_id,
+                    tmdb_id=proposed.tmdb_id,
+                    runtime_minutes=proposed.runtime_minutes,
+                )
+                rel_tinfo: dict[str, object] = {"runtime_minutes": 96}
+                if kind == "conflicting-pair":
+                    rel_tinfo.update({"tmdb_id": 95, "imdb_id": "tt1111111"})
+                req = EvaluateRequest(
+                    raw_text="Crystal.Harbor.2012.1080p.BluRay.REMUX-FIXTURE",
+                    hint_title="Crystal Harbor",
+                    hint_year=2012,
+                    torrent_info=TorrentInfo(**rel_tinfo),  # type: ignore[arg-type]
+                )
+                client = TmdbClient(api_key="invented")
+                client._fetch_movie_details = lambda i: {31: original, 95: remake}[i]  # type: ignore[method-assign]
+                client._find_tmdb_id_by_imdb = lambda i: {"tt1111111": 31, "tt7777777": 95}.get(i)  # type: ignore[method-assign]
+                client._search_tmdb_movie = (  # type: ignore[method-assign]
+                    (lambda *args, **kwargs: original) if kind == "anchored-contradiction" else (lambda *args, **kwargs: None)
+                )
+                client.lookup_with_diagnostics = AsyncMock(wraps=client.lookup_with_diagnostics)  # type: ignore[method-assign]
+
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+                ):
+                    one = asyncio.run(main.evaluate(req))
+                    two = asyncio.run(main.evaluate(req))
+
+                assert one.catalogue_identification is not None
+                assert two.catalogue_identification is not None
+                if kind == "late-correct":
+                    self.assertTrue(one.catalogue_identification.compatible, kind)
+                    self.assertTrue(two.cached, kind)
+                    self.assertEqual(two.identification.year, 2012, kind)
+                    self.assertEqual(client.lookup_with_diagnostics.await_count, 1, kind)
+                else:
+                    self.assertFalse(one.catalogue_identification.compatible, kind)
+                    self.assertFalse(two.catalogue_identification.compatible, kind)
+                    self.assertFalse(two.cached, kind)
+                    self.assertEqual(client.lookup_with_diagnostics.await_count, 2, kind)
+                    self.assertEqual(test_db.get_cache_entries_count(), 0, kind)
+
+        # 3) Finding 4: Refresh contradiction invalidates stale compatible cache (exact + alias)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            req = EvaluateRequest(
+                raw_text="Crystal.Harbor.2012.1080p.BluRay.REMUX-FIXTURE",
+                hint_title="Crystal Harbor",
+                hint_year=2012,
+                torrent_info=TorrentInfo(imdb_id="tt1111111", tmdb_id=31, runtime_minutes=96),
+            )
+            alias_req = EvaluateRequest(
+                raw_text="Le.Port.De.Cristal.2012.1080p.BluRay.REMUX-FIXTURE",
+                hint_title="Le Port De Cristal",
+                hint_year=2012,
+                torrent_info=TorrentInfo(imdb_id="tt1111111", tmdb_id=31, runtime_minutes=96),
+            )
+            unrelated_2024_req = EvaluateRequest(
+                raw_text="Crystal.Harbor.2024.1080p.BluRay.REMUX-FIXTURE",
+                hint_title="Crystal Harbor",
+                hint_year=2024,
+                torrent_info=TorrentInfo(imdb_id="tt7777777", tmdb_id=95, runtime_minutes=125),
+            )
+            other = TmdbMovie(
+                tmdb_id=95,
+                imdb_id="tt1111111",
+                canonical_title="Alternate Harbor",
+                year=2024,
+                director="Julie Quinn",
+                runtime_minutes=125,
+            )
+            updated = False
+            client = TmdbClient(api_key="invented")
+            client._fetch_movie_details = lambda i: {31: original, 95: other if updated else remake}[i]  # type: ignore[method-assign]
+            client._find_tmdb_id_by_imdb = lambda i: (95 if updated else 31) if i == "tt1111111" else 95  # type: ignore[method-assign]
+            client._search_tmdb_movie = lambda *args, **kwargs: None  # type: ignore[method-assign]
+            client.lookup_with_diagnostics = AsyncMock(wraps=client.lookup_with_diagnostics)  # type: ignore[method-assign]
+
+            orig_eval = _sample_payload(
+                title="Crystal Harbor",
+                year=2012,
+                director="Anna Linn",
+                imdb_id="tt1111111",
+                tmdb_id=31,
+                runtime_minutes=96,
+            )
+            remake_eval = _sample_payload(
+                title="Crystal Harbor",
+                year=2024,
+                director="Julie Quinn",
+                imdb_id="tt7777777",
+                tmdb_id=95,
+                runtime_minutes=125,
+            )
+
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", client),
+                patch.object(
+                    main.gemini_client,
+                    "evaluate",
+                    new=AsyncMock(side_effect=lambda payload, *a, **kw: remake_eval if payload.hint_year == 2024 else orig_eval),
+                ),
+            ):
+                # Populate both the 2012 film and an unrelated 2024 film cleanly
+                one = asyncio.run(main.evaluate(req))
+                unrelated = asyncio.run(main.evaluate(unrelated_2024_req))
+                self.assertFalse(one.cached)
+                assert one.catalogue_identification is not None
+                self.assertTrue(one.catalogue_identification.compatible)
+                self.assertFalse(unrelated.cached)
+
+                # Catalogue flips to contradiction; forced refresh must invalidate stale 2012 entry
+                updated = True
+                two = asyncio.run(main.evaluate(req.model_copy(update={"force_refresh": True})))
+                three = asyncio.run(main.evaluate(req))
+                four_alias = asyncio.run(main.evaluate(alias_req))
+                # Unrelated 2024 entry stays intact and cached
+                unrelated_again = asyncio.run(main.evaluate(unrelated_2024_req))
+
+            assert two.catalogue_identification is not None
+            assert three.catalogue_identification is not None
+            assert four_alias.catalogue_identification is not None
+            self.assertFalse(two.cached)
+            self.assertFalse(two.catalogue_identification.compatible)
+            self.assertFalse(three.cached)
+            self.assertFalse(three.catalogue_identification.compatible)
+            self.assertFalse(four_alias.cached)
+            self.assertFalse(four_alias.catalogue_identification.compatible)
+            self.assertTrue(unrelated_again.cached)
+
 
 if __name__ == "__main__":
     unittest.main()
