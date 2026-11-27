@@ -877,13 +877,47 @@ class IntakeWorker:
         return True
 
     async def _process_claimed_release(self, row: dict[str, Any]) -> None:
+        release_id = str(row["release_id"])
+        expected_digest = str(row["incoming_evidence_digest"])
+
+        # PR #18 Round 2 Blocker 1: Re-check actionable rows against archived webhook
+        # payloads and configured notification scope BEFORE draining pending follow-ups
+        # or calling any external service (tracker, evaluator, or Telegram/Actions).
+        scope_eligible, _scope_reason = await asyncio.to_thread(
+            self.db.is_release_currently_eligible,
+            release_id,
+            self.config.webhook_archive_dir,
+            allowed_filter_names=self.config.allowed_filter_names,
+            allowed_filter_ids=self.config.allowed_filter_ids,
+        )
+        if not scope_eligible:
+            allow_retire_supersede = False
+            raw_sup_pre = row.get("pending_card_supersede_json")
+            if row.get("ack_message_id") is not None and isinstance(raw_sup_pre, str) and raw_sup_pre.strip():
+                try:
+                    sup_obj = json.loads(raw_sup_pre)
+                    if isinstance(sup_obj, dict) and sup_obj.get("delivery_kind") in ("retired", "evidence_review"):
+                        allow_retire_supersede = True
+                except ValueError:
+                    allow_retire_supersede = False
+            if not allow_retire_supersede:
+                await asyncio.to_thread(
+                    self.db.finalize_release,
+                    release_id,
+                    worker_id=self.worker_id,
+                    state="suppressed",
+                    expected_incoming_digest=expected_digest,
+                    suppression_reason="pre_upgrade_ineligible_scope",
+                    pending_card_supersede=None,
+                    pending_eval_reply=None,
+                )
+                return
+
         # First drain any persisted post-card follow-ups (conflict supersession or eval reply)
         if await self._process_pending_followups(row):
             return
 
-        release_id = str(row["release_id"])
         source_occurrence_id = str(row["source_occurrence_id"])
-        expected_digest = str(row["incoming_evidence_digest"])
         prev_card_revision = int(row["card_revision"] or 0)
         prev_last_eval_digest = row.get("last_evaluated_digest")
         prev_last_card_digest = row.get("last_card_digest")

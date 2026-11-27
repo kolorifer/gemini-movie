@@ -672,14 +672,18 @@ class ActionsDB:
                             eval_reply_status=str(row["eval_reply_status"] or "pending"),
                         )
 
-                    # Higher card_revision edit:
+                    # Higher card_revision edit (PR #18 Blocker 2 & Round 2 Blocker 3a):
                     # - `retired` NEVER reopens actions (0 minted buttons); always proceed with the edit,
                     #   persist card_revision/delivery_kind='retired', and supersede active tokens so any
                     #   in-flight pre-push Phase 1 (radarr_add_movie) immediately sees the retirement.
-                    # - `evidence_review` blocks only if an irreversible push/watched/qbit write already started/completed.
-                    # - `verified_proposal` / `alternative_grab` blocks if ANY non-skip action is attempting/ambiguous/completed.
+                    # - `evidence_review`, `verified_proposal`, and `alternative_grab` lock ONLY if an
+                    #   irreversible write (`completed_radarr`, `completed_all`, or a push/watched/qbit
+                    #   attempt in attempting/ambiguous/succeeded) has already started or completed.
+                    #   An in-flight pre-push Phase 1 (`radarr_add_movie`) MUST NOT block a verified
+                    #   correction: we persist the new revision immediately so Phase 1 aborts before
+                    #   issuing any release push for the stale identity.
                     locked_row = None
-                    if delivery_kind == "evidence_review":
+                    if delivery_kind != "retired":
                         locked_row = conn.execute(
                             """
                             SELECT a.action_id, a.status
@@ -699,20 +703,9 @@ class ActionsDB:
                             """,
                             (release_id,),
                         ).fetchone()
-                    elif delivery_kind != "retired":
-                        locked_row = conn.execute(
-                            """
-                            SELECT action_id, status FROM actions
-                            WHERE release_id = ?
-                              AND action_type != 'skip'
-                              AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
-                            LIMIT 1
-                            """,
-                            (release_id,),
-                        ).fetchone()
 
                     if locked_row is not None:
-                        # Never overwrite or reopen a release whose irreversible Radarr write is in-flight/completed.
+                        # Never overwrite or reopen a release whose irreversible Radarr/qBit write is in-flight/completed.
                         # If a conflict downgrade arrived anyway, still supersede any unclicked active tokens.
                         if delivery_kind == "evidence_review":
                             conn.execute(
@@ -753,34 +746,22 @@ class ActionsDB:
                         )
 
                     minted_ids = self._insert_actions_locked(conn, new_actions, now_iso=now_iso)
-                    if delivery_kind in ("retired", "evidence_review"):
-                        # Persist the new revision & retirement/downgrade kind immediately BEFORE
-                        # calling Telegram so concurrent pre-push eligibility checks see it atomically.
-                        conn.execute(
-                            """
-                            UPDATE deliveries
-                            SET card_revision = ?,
-                                delivery_kind = ?,
-                                status = 'sending',
-                                process_instance_id = ?,
-                                lease_expires_at = ?,
-                                updated_at = ?
-                            WHERE release_id = ?
-                            """,
-                            (card_revision, delivery_kind, process_instance_id, lease_expires_at, now_iso, release_id),
-                        )
-                    else:
-                        conn.execute(
-                            """
-                            UPDATE deliveries
-                            SET status = 'sending',
-                                process_instance_id = ?,
-                                lease_expires_at = ?,
-                                updated_at = ?
-                            WHERE release_id = ?
-                            """,
-                            (process_instance_id, lease_expires_at, now_iso, release_id),
-                        )
+                    # Persist the higher card_revision & delivery_kind immediately BEFORE
+                    # calling Telegram so any concurrent pre-push eligibility check sees the
+                    # correction/retirement/downgrade atomically and invalidates stale pushes.
+                    conn.execute(
+                        """
+                        UPDATE deliveries
+                        SET card_revision = ?,
+                            delivery_kind = ?,
+                            status = 'sending',
+                            process_instance_id = ?,
+                            lease_expires_at = ?,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (card_revision, delivery_kind, process_instance_id, lease_expires_at, now_iso, release_id),
+                    )
                     conn.execute("COMMIT;")
                     return CardDeliveryPlan(
                         mode="edit",

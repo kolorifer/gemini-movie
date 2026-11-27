@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .archive import ArchiveIntegrityError, ArchiveReceipt, read_verified_archive_json
-from .classifier import ClassifiedWebhook, compute_legacy_occurrence_evidence_digest
+from .classifier import (
+    DEFAULT_ALLOWED_FILTER_NAMES,
+    ClassifiedWebhook,
+    _evaluate_remux_quality_eligibility,
+    classify_webhook_payload,
+    compute_legacy_occurrence_evidence_digest,
+)
 from .security import PrivateFileError, ensure_private_dir
 
 
@@ -323,6 +329,196 @@ class IntakeDB:
             conn.close()
         return len(updates)
 
+    def is_release_currently_eligible(
+        self,
+        release_id: str,
+        archive_dir: Path,
+        *,
+        allowed_filter_names: tuple[str, ...] = DEFAULT_ALLOWED_FILTER_NAMES,
+        allowed_filter_ids: tuple[int, ...] = (),
+    ) -> tuple[bool, Optional[str]]:
+        """
+        PR #18 Round 2 Blocker 1: Re-check an actionable release's archived webhook
+        payload(s) against current notification scope rules (qualifying Radarr action
+        event, allowed autobrr filter name/ID, movie category/type, and 1080p/2160p
+        Blu-ray REMUX) before running any external work or pending follow-ups.
+        """
+        conn = self._connect()
+        try:
+            rel = conn.execute(
+                """
+                SELECT release_id, latest_occurrence_id, source_occurrence_id,
+                       incoming_evidence_digest, incoming_snapshot_json
+                FROM releases
+                WHERE release_id = ?
+                """,
+                (release_id,),
+            ).fetchone()
+            if rel is None:
+                return True, None
+            occ_rows = conn.execute(
+                """
+                SELECT occurrence_id, archive_relpath, archive_sha256
+                FROM occurrences
+                WHERE release_id = ?
+                ORDER BY
+                    CASE
+                        WHEN occurrence_id = ? THEN 0
+                        WHEN occurrence_id = ? THEN 1
+                        ELSE 2
+                    END,
+                    received_at DESC,
+                    occurrence_id DESC
+                """,
+                (release_id, str(rel["latest_occurrence_id"]), str(rel["source_occurrence_id"])),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        verified_any = False
+        last_ineligible_reason: Optional[str] = None
+        for occ in occ_rows:
+            relpath = str(occ["archive_relpath"] or "")
+            expected_sha = str(occ["archive_sha256"] or "")
+            if not relpath or not expected_sha:
+                continue
+            try:
+                raw_payload = read_verified_archive_json(archive_dir, relpath, expected_sha)
+            except (ArchiveIntegrityError, PrivateFileError, OSError, ValueError):
+                continue
+            verified_any = True
+            reclassified = classify_webhook_payload(
+                raw_payload,
+                allowed_filter_names=allowed_filter_names,
+                allowed_filter_ids=allowed_filter_ids,
+            )
+            if reclassified.classification == "movie_candidate":
+                return True, None
+            last_ineligible_reason = reclassified.diagnostic_note or "pre_upgrade_ineligible_scope"
+
+        if verified_any:
+            return False, last_ineligible_reason or "pre_upgrade_ineligible_scope"
+
+        # Fallback when archived payloads are unavailable: validate persisted snapshot fields
+        raw_snap = rel["incoming_snapshot_json"]
+        if isinstance(raw_snap, str) and raw_snap.strip():
+            try:
+                snap = json.loads(raw_snap)
+            except ValueError:
+                snap = None
+            if isinstance(snap, dict) and str(snap.get("exact_release_name") or "").strip():
+                classified = ClassifiedWebhook.from_sanitized_snapshot(
+                    snap,
+                    str(rel["incoming_evidence_digest"] or ""),
+                )
+                if not classified.action_is_radarr or not classified.action_rejected:
+                    return False, "pre_upgrade_ineligible_action"
+                q_ok, q_reason = _evaluate_remux_quality_eligibility(
+                    exact_name=classified.exact_release_name,
+                    resolution=classified.resolution,
+                    source=classified.source,
+                    media_processing=classified.media_processing,
+                )
+                if not q_ok:
+                    return False, f"pre_upgrade_ineligible_quality:{q_reason}"
+
+        return True, None
+
+    def recheck_pre_upgrade_actionable_releases(
+        self,
+        archive_dir: Path,
+        *,
+        allowed_filter_names: tuple[str, ...] = DEFAULT_ALLOWED_FILTER_NAMES,
+        allowed_filter_ids: tuple[int, ...] = (),
+    ) -> int:
+        """
+        PR #18 Round 2 Blocker 1: At startup, suppress any pre-upgrade queued/in-flight
+        or follow-up-bearing release that does not satisfy the current notification scope
+        rules so old WEB-DL / global release.new rows never trigger tracker, evaluator,
+        or Telegram traffic while keeping their private archives intact.
+        """
+        conn = self._connect()
+        try:
+            actionable = conn.execute(
+                """
+                SELECT release_id, ack_message_id, pending_card_supersede_json
+                FROM releases
+                WHERE state IN ('queued', 'enriching', 'evaluating', 'delivering')
+                   OR pending_card_supersede_json IS NOT NULL
+                   OR pending_eval_reply_json IS NOT NULL
+                ORDER BY created_at ASC, release_id ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not actionable:
+            return 0
+
+        to_suppress: list[tuple[str, bool]] = []
+        for row in actionable:
+            rel_id = str(row["release_id"])
+            eligible, _reason = self.is_release_currently_eligible(
+                rel_id,
+                archive_dir,
+                allowed_filter_names=allowed_filter_names,
+                allowed_filter_ids=allowed_filter_ids,
+            )
+            if eligible:
+                continue
+            preserve_retire_supersede = False
+            raw_sup = row["pending_card_supersede_json"]
+            if row["ack_message_id"] is not None and isinstance(raw_sup, str) and raw_sup.strip():
+                try:
+                    sup_obj = json.loads(raw_sup)
+                    if isinstance(sup_obj, dict) and sup_obj.get("delivery_kind") in ("retired", "evidence_review"):
+                        preserve_retire_supersede = True
+                except ValueError:
+                    preserve_retire_supersede = False
+            to_suppress.append((rel_id, preserve_retire_supersede))
+
+        if not to_suppress:
+            return 0
+
+        now_iso = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for rel_id, preserve_retire in to_suppress:
+                if preserve_retire:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET pending_eval_reply_json = NULL,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (now_iso, rel_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET state = 'suppressed',
+                            suppression_reason = 'pre_upgrade_ineligible_scope',
+                            pending_reprocess = 0,
+                            pending_card_supersede_json = NULL,
+                            pending_eval_reply_json = NULL,
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (now_iso, rel_id),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return len(to_suppress)
+
     def record_non_movie_occurrence(
         self,
         *,
@@ -465,6 +661,25 @@ class IntakeDB:
                     is not None
                 )
 
+                # PR #18 Round 2 Blocker 4: If any historical pre-upgrade occurrence on this
+                # release still has a NULL digest (missing or failed-integrity archive during
+                # migration backfill), ordering/novelty vs. prior superseded deliveries cannot
+                # be proved. Preserve the current known correction intact while archiving.
+                has_unverified_legacy_occurrence = (
+                    not is_exact_latest_replay
+                    and not seen_prior_occurrence
+                    and conn.execute(
+                        """
+                        SELECT 1 FROM occurrences
+                        WHERE release_id = ?
+                          AND incoming_evidence_digest IS NULL
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    is not None
+                )
+
                 if is_exact_latest_replay:
                     # Exact duplicate (concurrent burst or late duplicate): attach occurrence
                     # without re-queuing, while preserving/upgrading source_occurrence_id if
@@ -480,11 +695,11 @@ class IntakeDB:
                         (occurrence_id, source_occ, received_at_iso, release_id),
                     )
                     result_status = "coalesced_duplicate"
-                elif seen_prior_occurrence:
-                    # Issue #13 §4a & PR #18 Blocker 3: Replayed older superseded evidence
-                    # (old A -> corrected B -> repeated A, including across schema upgrades).
-                    # Archive the replay occurrence, preserve newer correction B intact (never roll back
-                    # incoming_evidence_digest, incoming_snapshot_json, or source_occurrence_id).
+                elif seen_prior_occurrence or has_unverified_legacy_occurrence:
+                    # Issue #13 §4a & PR #18 Blocker 3 / Round 2 Blocker 4: Replayed older
+                    # superseded evidence (old A -> corrected B -> repeated A, including across
+                    # schema upgrades) or ambiguous replay after incomplete/corrupt archive
+                    # migration. Archive the incoming occurrence and preserve correction B intact.
                     conn.execute(
                         """
                         UPDATE releases

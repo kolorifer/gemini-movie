@@ -111,12 +111,12 @@ class ModelIdentificationSnapshot(BaseModel):
 
 class CatalogueIdentification(BaseModel):
     source: Literal["tmdb"] = "tmdb"
-    canonical_title: str
+    canonical_title: Optional[str] = None
     original_title: Optional[str] = None
     year: Optional[int] = None
     director: Optional[str] = None
     imdb_id: Optional[str] = None
-    tmdb_id: int
+    tmdb_id: Optional[int] = None
     runtime_minutes: Optional[int] = None
     compatible: bool = True
     conflict_reason: Optional[str] = None

@@ -237,6 +237,7 @@ def extract_grounding_sources(response: Any) -> list[dict[str, Any]]:
                 continue
             uri = str(_extract_attr_or_key(web, "uri") or "").strip()
             title = str(_extract_attr_or_key(web, "title") or "").strip()
+            explicit_domain = str(_extract_attr_or_key(web, "domain") or "").strip()
             snippet = str(
                 _extract_attr_or_key(web, "snippet", "text")
                 or _extract_attr_or_key(chunk, "snippet", "text")
@@ -252,9 +253,14 @@ def extract_grounding_sources(response: Any) -> list[dict[str, Any]]:
                     path = parsed_uri.path or ""
                     if domain.endswith("vertexaisearch.cloud.google.com"):
                         is_redirect = True
-                        if _BARE_HOSTNAME_RE.fullmatch(title):
+                        if explicit_domain and _BARE_HOSTNAME_RE.fullmatch(explicit_domain):
+                            domain = _normalize_domain(explicit_domain)
+                            path = ""
+                        elif _BARE_HOSTNAME_RE.fullmatch(title):
                             domain = _normalize_domain(title)
                             path = ""
+            if not domain and explicit_domain and _BARE_HOSTNAME_RE.fullmatch(explicit_domain):
+                domain = _normalize_domain(explicit_domain)
             entry: dict[str, Any] = {
                 "domain": domain,
                 "uri": uri,
@@ -283,10 +289,75 @@ def extract_grounding_sources(response: Any) -> list[dict[str, Any]]:
     return sources
 
 
+_FOUR_DIGIT_YEAR_RE = re.compile(r"(?<![a-z0-9])((?:188[89]|189\d|19\d\d|20\d\d|2100))(?![a-z0-9])")
+_PAREN_YEAR_RE = re.compile(r"\(\s*((?:188[89]|189\d|19\d\d|20\d\d|2100))\s*\)")
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:[;,\n]+|\.\s+|\b(?:and|while|whereas|but|versus|vs\.?)\b|\s+/\s+|\s*\|\s*)",
+    re.IGNORECASE,
+)
+_METRIC_CUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "rotten_tomatoes_critics",
+        re.compile(
+            r"\b(?:rotten_tomatoes_critics|tomatometer|critics?(?:\s+(?:score|rating|consensus))?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "rotten_tomatoes_audience",
+        re.compile(
+            r"\b(?:rotten_tomatoes_audience|popcornmeter|verified\s+audience|audience(?:\s+(?:score|rating))?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "metacritic",
+        re.compile(r"\b(?:metacritic(?:\s+(?:score|rating))?|metascore)\b", re.IGNORECASE),
+    ),
+    (
+        "imdb",
+        re.compile(r"\bimdb(?:\s+(?:score|rating))?\b", re.IGNORECASE),
+    ),
+    (
+        "letterboxd",
+        re.compile(r"\bletterboxd(?:\s+(?:score|rating|average))?\b", re.IGNORECASE),
+    ),
+    (
+        "rt_generic",
+        re.compile(r"\b(?:rotten\s+tomatoes|rt)\b", re.IGNORECASE),
+    ),
+)
+_RATING_NUM_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(\d{1,3}(?:\.\d{1,2})?)(\s*%|\s*/\s*100|\s*/\s*10|\s*out\s+of\s+10|\s*/\s*5|\s*out\s+of\s+5)?(?![A-Za-z0-9.])",
+    re.IGNORECASE,
+)
+
+
 def _title_tokens_for_match(title: str) -> list[str]:
     tokens = re.findall(r"[a-z0-9]+", title.lower())
     significant = [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS]
     return significant if significant else tokens
+
+
+def _extract_source_film_years(src: dict[str, Any], film_titles: list[str]) -> set[int]:
+    """Extract explicit film years from chunk title, URL slug, and parenthesized segment titles."""
+    title_embedded_years: set[int] = set()
+    for ft in film_titles:
+        for m in _FOUR_DIGIT_YEAR_RE.finditer(ft):
+            title_embedded_years.add(int(m.group(1)))
+
+    years: set[int] = set()
+    for text in (str(src.get("title") or ""), str(src.get("path") or "")):
+        for m in _FOUR_DIGIT_YEAR_RE.finditer(text):
+            y = int(m.group(1))
+            if y not in title_embedded_years:
+                years.add(y)
+    for text in [str(src.get("snippet") or ""), *(str(s) for s in (src.get("supported_segments") or []))]:
+        for m in _PAREN_YEAR_RE.finditer(text):
+            y = int(m.group(1))
+            if y not in title_embedded_years:
+                years.add(y)
+    return years
 
 
 def _chunk_matches_film(
@@ -295,6 +366,7 @@ def _chunk_matches_film(
     expected_domain: str,
     film_titles: list[str],
     film_imdb_id: Optional[str],
+    film_year: Optional[int] = None,
 ) -> bool:
     path = str(src.get("path") or "").strip()
     path_low = path.lower()
@@ -318,7 +390,7 @@ def _chunk_matches_film(
             if not path_low.startswith("/film/"):
                 return False
 
-    # 2. Verify the chunk actually pertains to this specific film (IMDb ID or title tokens)
+    # 2. Reject wrong-year remakes when the source explicitly specifies a film year
     combined = " ".join(
         [
             str(src.get("title") or ""),
@@ -327,7 +399,17 @@ def _chunk_matches_film(
             " ".join(str(s) for s in (src.get("supported_segments") or [])),
         ]
     ).lower()
-    if film_imdb_id and re.search(rf"(?<![a-z0-9]){re.escape(film_imdb_id.lower())}(?![a-z0-9])", combined):
+    imdb_matched = bool(
+        film_imdb_id
+        and re.search(rf"(?<![a-z0-9]){re.escape(film_imdb_id.lower())}(?![a-z0-9])", combined)
+    )
+    if film_year is not None and not imdb_matched:
+        source_years = _extract_source_film_years(src, film_titles)
+        if source_years and not any(abs(y - film_year) <= 1 for y in source_years):
+            return False
+
+    # 3. Verify the chunk actually pertains to this specific film (IMDb ID or title tokens)
+    if imdb_matched:
         return True
 
     combined_tokens = set(re.findall(r"[a-z0-9]+", combined))
@@ -338,38 +420,92 @@ def _chunk_matches_film(
     return False
 
 
-def _text_contains_rating_value(text: str, value: int | float, *, is_int: bool) -> bool:
+def _numeric_matches_target(num_str: str, value: int | float, *, is_int: bool) -> bool:
+    try:
+        parsed = float(num_str)
+    except ValueError:
+        return False
     if is_int:
-        iv = int(round(float(value)))
-        return bool(re.search(rf"(?<![\d.]){iv}(?:\s*%)?(?![\d.])", text))
-    fval = float(value)
-    candidates = {f"{fval:.1f}", f"{fval:g}"}
-    if round(fval, 2) != round(fval, 1):
-        candidates.add(f"{fval:.2f}")
-    for cand in candidates:
-        if re.search(rf"(?<![\d.]){re.escape(cand)}(?![\d.])", text):
-            return True
-    if float(int(round(fval))) == fval:
-        iv = int(round(fval))
-        if re.search(rf"(?<![\d.]){iv}(?:\.0)?\s*(?:/|out of)\s*(?:10|5)(?![\d.])", text, re.IGNORECASE):
-            return True
-    return False
+        if "." in num_str and abs(parsed - round(parsed)) > 1e-6:
+            return False
+        return int(round(parsed)) == int(round(float(value)))
+    return abs(parsed - float(value)) < 1e-6
 
 
-def _text_matches_metric_cue(text: str, rating_key: str) -> bool:
-    low = text.lower()
-    if rating_key == "rotten_tomatoes_critics":
-        if "rotten_tomatoes_critics" in low or "tomatometer" in low or "critic" in low:
-            return True
-        return ("rotten tomatoes" in low or "rt " in low) and "audience" not in low and "popcornmeter" not in low
-    if rating_key == "rotten_tomatoes_audience":
-        return "rotten_tomatoes_audience" in low or "popcornmeter" in low or "audience" in low
-    if rating_key == "metacritic":
-        return "metacritic" in low or "metascore" in low
-    if rating_key == "imdb":
-        return "imdb" in low or "/10" in low or "out of 10" in low
-    if rating_key == "letterboxd":
-        return "letterboxd" in low or "/5" in low or "out of 5" in low
+def _extract_clause_metric_bindings(clause: str) -> list[tuple[str, str]]:
+    """
+    Bind each metric cue in a single clause to its directly associated numeric value
+    so swapped scores (e.g. 'Tomatometer of 42% and Popcornmeter of 89%') never cross-validate.
+    """
+    cleaned = re.sub(r"\btt\d{7,10}\b", " ", clause, flags=re.IGNORECASE)
+    cleaned = _PAREN_YEAR_RE.sub(" ", cleaned)
+
+    cue_events: list[tuple[int, int, str]] = []
+    for metric_key, pattern in _METRIC_CUE_PATTERNS:
+        for m in pattern.finditer(cleaned):
+            cue_events.append((m.start(), m.end(), metric_key))
+    # Drop generic RT cue if a specific critics or audience cue appears in the same clause
+    has_specific_rt = any(
+        k in ("rotten_tomatoes_critics", "rotten_tomatoes_audience") for _, _, k in cue_events
+    )
+    filtered_cues: list[tuple[int, int, str]] = []
+    for s, e, k in sorted(cue_events, key=lambda item: (item[0], -(item[1] - item[0]))):
+        if k == "rt_generic":
+            if has_specific_rt:
+                continue
+            k = "rotten_tomatoes_critics"
+        if filtered_cues and s < filtered_cues[-1][1]:
+            continue
+        filtered_cues.append((s, e, k))
+
+    events: list[tuple[int, str, Any]] = [(s, "cue", k) for s, _e, k in filtered_cues]
+    direct_bindings: list[tuple[str, str]] = []
+
+    for m in _RATING_NUM_TOKEN_RE.finditer(cleaned):
+        num_str = m.group(1)
+        suffix = (m.group(2) or "").strip().lower()
+        # Skip overlaps with cue spans
+        if any(cs <= m.start() < ce for cs, ce, _ in filtered_cues):
+            continue
+        if suffix and ("/10" in suffix.replace(" ", "") or "out of 10" in re.sub(r"\s+", " ", suffix)):
+            direct_bindings.append(("imdb", num_str))
+        elif suffix and ("/5" in suffix.replace(" ", "") or "out of 5" in re.sub(r"\s+", " ", suffix)):
+            direct_bindings.append(("letterboxd", num_str))
+        events.append((m.start(), "num", num_str))
+
+    events.sort(key=lambda item: item[0])
+    used_nums: set[int] = set()
+    bindings: list[tuple[str, str]] = list(direct_bindings)
+
+    for idx, (_pos, kind, payload) in enumerate(events):
+        if kind != "cue":
+            continue
+        # Prefer immediately following unused number (e.g. 'Tomatometer of 42%', 'IMDb 7.5/10')
+        if idx + 1 < len(events) and events[idx + 1][1] == "num" and (idx + 1) not in used_nums:
+            used_nums.add(idx + 1)
+            bindings.append((str(payload), str(events[idx + 1][2])))
+        # Otherwise accept immediately preceding unused number (e.g. '42% Tomatometer', '89% audience')
+        elif idx - 1 >= 0 and events[idx - 1][1] == "num" and (idx - 1) not in used_nums:
+            used_nums.add(idx - 1)
+            bindings.append((str(payload), str(events[idx - 1][2])))
+
+    return bindings
+
+
+def _text_binds_metric_to_value(
+    text: str,
+    rating_key: str,
+    rating_value: int | float,
+    *,
+    is_int: bool,
+) -> bool:
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        for bound_key, num_str in _extract_clause_metric_bindings(clause):
+            if bound_key == rating_key and _numeric_matches_target(num_str, rating_value, is_int=is_int):
+                return True
     return False
 
 
@@ -381,6 +517,7 @@ def _find_supporting_grounding_source(
     is_int: bool,
     film_titles: list[str],
     film_imdb_id: Optional[str],
+    film_year: Optional[int] = None,
 ) -> Optional[str]:
     spec = _RATING_PLATFORM_SPECS.get(rating_key)
     if spec is None:
@@ -403,6 +540,7 @@ def _find_supporting_grounding_source(
             expected_domain=matched_dom,
             film_titles=film_titles,
             film_imdb_id=film_imdb_id,
+            film_year=film_year,
         ):
             continue
 
@@ -418,9 +556,7 @@ def _find_supporting_grounding_source(
             evidence_texts.append(title)
 
         for ev_text in evidence_texts:
-            if _text_contains_rating_value(ev_text, rating_value, is_int=is_int) and _text_matches_metric_cue(
-                ev_text, rating_key
-            ):
+            if _text_binds_metric_to_value(ev_text, rating_key, rating_value, is_int=is_int):
                 return matched_dom
     return None
 
@@ -433,9 +569,9 @@ def validate_and_ground_ratings(
 ) -> dict[str, Any]:
     """
     Validate platform-specific numeric score bounds and verify that every displayed rating
-    is backed by an authoritative platform grounding source matching the actual film,
-    metric, and numeric value. Out-of-range or ungrounded scores are coerced to None
-    (unknown) and listed in missing_sources.
+    is backed by an authoritative platform grounding source matching the actual film (including
+    year when supplied), metric, and bound numeric value. Out-of-range or ungrounded scores are
+    coerced to None (unknown) and listed in missing_sources.
     """
     ratings_in = dict(raw_ratings) if isinstance(raw_ratings, dict) else {}
     existing_missing = ratings_in.get("missing_sources")
@@ -449,6 +585,7 @@ def validate_and_ground_ratings(
 
     film_titles: list[str] = []
     film_imdb_id: Optional[str] = None
+    film_year: Optional[int] = None
     if isinstance(identification, dict):
         for field in ("canonical_title", "original_title"):
             val = identification.get(field)
@@ -457,6 +594,9 @@ def validate_and_ground_ratings(
         raw_imdb = identification.get("imdb_id")
         if isinstance(raw_imdb, str) and raw_imdb.strip():
             film_imdb_id = raw_imdb.strip().lower()
+        raw_year = identification.get("year")
+        if isinstance(raw_year, int) and not isinstance(raw_year, bool) and 1888 <= raw_year <= 2100:
+            film_year = raw_year
 
     def _add_missing(label: str) -> None:
         if not any(m.lower() == label.lower() for m in missing):
@@ -492,6 +632,7 @@ def validate_and_ground_ratings(
             is_int=is_int,
             film_titles=film_titles,
             film_imdb_id=film_imdb_id,
+            film_year=film_year,
         )
         if supporting_src is None:
             cleaned[key] = None

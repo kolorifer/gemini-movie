@@ -881,6 +881,7 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 patch.object(main.gemini_client, "evaluate", mock_gemini_eval),
             ):
                 # 1) Plain 2025 release with poisoned 1984 IMDb in extra_context MUST NOT hit 1984 cache
+                # and an unresolved tracker conflict with no release match MUST NOT be marked compatible or cached
                 r1 = asyncio.run(
                     main.evaluate(
                         EvaluateRequest(
@@ -891,12 +892,32 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 )
                 self.assertFalse(r1.cached)
                 self.assertEqual(r1.identification.year, 2025)
+                assert r1.catalogue_identification is not None
+                self.assertFalse(r1.catalogue_identification.compatible)
                 self.assertEqual(mock_gemini_eval.await_count, 1)
+
+                # Resolve 2025 movie cleanly for evidence_key scoping assertions (steps 2-4)
+                movie_2025_tmdb = TmdbMovie(
+                    tmdb_id=202599,
+                    canonical_title="Silent Night, Deadly Night",
+                    original_title="Silent Night, Deadly Night",
+                    year=2025,
+                    imdb_id="tt33000025",
+                    director="Mike P. Nelson",
+                    runtime_minutes=97,
+                )
+                mock_tmdb.lookup_with_diagnostics = AsyncMock(  # type: ignore[method-assign]
+                    return_value=TmdbLookupResult(
+                        movie=movie_2025_tmdb,
+                        tracker_conflict=None,
+                        trusted_for_cache=True,
+                    )
+                )
 
                 # 2) Same 2025 release with new MediaInfo/tracker evidence MUST miss cache
                 tinfo_a = TorrentInfo(
                     indexer="TorrentLeech",
-                    imdb_id="tt0088117",
+                    imdb_id="tt33000025",
                     runtime_minutes=97,
                     freeleech=False,
                 )
@@ -1920,6 +1941,196 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             self.assertEqual(rows3[0]["imdb_id"], "tt4450010")
             self.assertEqual(rows3[0]["tmdb_id"], 445001)
             self.assertEqual(rows3[0]["decision"], "WATCH")
+
+    def test_pr18_r2_blocker_2_and_gaps_unresolved_conflict_ratings_edition_and_privacy(self) -> None:
+        """
+        PR #18 Round 2 Blocker 2, Blocker 5 (Triage boundary), and Gaps 2 & 3:
+          - Unresolved tracker identity conflict with no title-search match cannot self-verify or cache model proposal.
+          - Swapped RT critic/audience ratings and wrong-year remake ratings are rejected; SDK web.domain on Vertex redirect is accepted.
+          - Restoration year after release year preserves Extended vs Theatrical cut distinction in edition_key and IMDb cache.
+          - Credential-like markers in accepted hint_title are scrubbed from build_user_prompt and extract_tmdb_query.
+        """
+        import main
+        from google.genai import types as sdk
+        from db import extract_edition_key
+        from gemini_client import build_user_prompt, extract_grounding_sources, validate_and_ground_ratings
+        from schemas import TorrentInfo
+        from tmdb_client import extract_tmdb_query
+
+        # 1) Blocker 2: Unresolved tracker conflict + no release-title match -> incompatible & uncached
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            movie_97 = TmdbMovie(
+                tmdb_id=97,
+                imdb_id="tt7777777",
+                canonical_title="Glass Harbor",
+                year=2024,
+                director="A. Blue",
+            )
+            movie_98 = TmdbMovie(
+                tmdb_id=98,
+                imdb_id="tt1111111",
+                canonical_title="Indigo Mist",
+                year=2020,
+                director="R. Hill",
+            )
+            proposed = _sample_payload(
+                title="Glass Harbor",
+                year=2024,
+                imdb_id="tt7777777",
+                tmdb_id=97,
+                director="A. Blue",
+            )
+            req = EvaluateRequest(
+                raw_text="Amber.Ridge.2004.1080p.BluRay.REMUX-FIXTURE",
+                torrent_info=TorrentInfo(tmdb_id=97, imdb_id="tt1111111", runtime_minutes=102),
+            )
+            client = TmdbClient(api_key="invented")
+            client._fetch_movie_details = lambda i: {97: movie_97, 98: movie_98}[i]  # type: ignore[method-assign]
+            client._find_tmdb_id_by_imdb = lambda i: {"tt7777777": 97, "tt1111111": 98}.get(i)  # type: ignore[method-assign]
+            client._search_tmdb_movie = lambda *args, **kwargs: None  # type: ignore[method-assign]
+            client.lookup_with_diagnostics = AsyncMock(wraps=client.lookup_with_diagnostics)  # type: ignore[method-assign]
+
+            with (
+                patch.object(main, "db", test_db),
+                patch.object(main, "tmdb_client", client),
+                patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=proposed)),
+            ):
+                first = asyncio.run(main.evaluate(req))
+                second = asyncio.run(main.evaluate(req))
+
+            self.assertFalse(first.cached)
+            assert first.catalogue_identification is not None
+            self.assertFalse(first.catalogue_identification.compatible)
+            self.assertEqual(first.identification.match_confidence, "low")
+            self.assertFalse(second.cached)
+            assert second.catalogue_identification is not None
+            self.assertFalse(second.catalogue_identification.compatible)
+            self.assertEqual(client.lookup_with_diagnostics.await_count, 2)
+            self.assertEqual(test_db.get_cache_entries_count(), 0)
+
+        # 2) Gap 2: Swapped critic/audience scores, wrong-year remake, and SDK explicit domain on Vertex redirect
+        ident = {"canonical_title": "Amber Ridge", "year": 2024, "imdb_id": "tt1111111"}
+
+        def _grounded(web: dict[str, str], segment: str, ratings: dict[str, int | float]) -> dict[str, object]:
+            resp = sdk.GenerateContentResponse(
+                candidates=[
+                    {
+                        "grounding_metadata": {
+                            "grounding_chunks": [{"web": web}],
+                            "grounding_supports": [
+                                {"segment": {"text": segment}, "grounding_chunk_indices": [0]}
+                            ],
+                        }
+                    }
+                ]
+            )
+            return validate_and_ground_ratings(
+                ratings,
+                grounding_sources=extract_grounding_sources(resp),
+                identification=ident,
+            )
+
+        rt_web = {"uri": "https://www.rottentomatoes.com/m/amber_ridge_2024", "title": "Amber Ridge (2024)"}
+        rt_seg = "Amber Ridge (2024) has a Tomatometer of 42% and a Popcornmeter of 89%."
+        swapped = _grounded(rt_web, rt_seg, {"rotten_tomatoes_critics": 89, "rotten_tomatoes_audience": 42})
+        self.assertIsNone(swapped["rotten_tomatoes_critics"])
+        self.assertIsNone(swapped["rotten_tomatoes_audience"])
+        self.assertEqual(swapped["sources"], {})
+
+        aligned = _grounded(rt_web, rt_seg, {"rotten_tomatoes_critics": 42, "rotten_tomatoes_audience": 89})
+        self.assertEqual(aligned["rotten_tomatoes_critics"], 42)
+        self.assertEqual(aligned["rotten_tomatoes_audience"], 89)
+        self.assertEqual(
+            aligned["sources"],
+            {
+                "rotten_tomatoes_critics": "rottentomatoes.com",
+                "rotten_tomatoes_audience": "rottentomatoes.com",
+            },
+        )
+
+        rt_1983 = {"uri": "https://www.rottentomatoes.com/m/amber_ridge_1983", "title": "Amber Ridge (1983)"}
+        remake_res = _grounded(rt_1983, "Amber Ridge (1983) has a Tomatometer of 86%.", {"rotten_tomatoes_critics": 86})
+        self.assertIsNone(remake_res["rotten_tomatoes_critics"])
+        self.assertEqual(remake_res["sources"], {})
+
+        redirect_web = {
+            "domain": "imdb.com",
+            "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/fixture",
+            "title": "Amber Ridge (2024)",
+        }
+        redirect_res = _grounded(redirect_web, "Amber Ridge tt1111111 has an IMDb score of 7.5/10.", {"imdb": 7.5})
+        self.assertEqual(redirect_res["imdb"], 7.5)
+        self.assertEqual(redirect_res["sources"], {"imdb": "imdb.com"})
+
+        # 3) Gap 3: Restoration year after release year preserves Extended vs Theatrical cut distinction
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "triage.db")
+            test_db.init_db()
+            rel_ext = "Amber.Ridge.2004.Extended.2020.Restoration.1080p.BluRay.REMUX-ZETA"
+            rel_th = "Amber.Ridge.2004.Theatrical.2020.Restoration.1080p.BluRay.REMUX-ZETA"
+            ek_ext = extract_edition_key(rel_ext)
+            ek_th = extract_edition_key(rel_th)
+            self.assertIn("extended", ek_ext)
+            self.assertIn("theatrical", ek_th)
+            self.assertNotEqual(ek_ext, ek_th)
+            test_db.save_evaluation(
+                rel_ext,
+                _sample_payload(title="Amber Ridge", year=2004, imdb_id="tt1111111").model_dump(),
+            )
+            self.assertIsNone(
+                test_db.get_cached_evaluation(
+                    rel_th,
+                    hint_year=2004,
+                    extra_context="tt1111111",
+                    allow_release_key_fallback=False,
+                )
+            )
+
+        # 4) Blocker 5 (Triage boundary): Synthetic credential markers in accepted hint_title
+        markers = [
+            "SYNTH_ACCESS_TOK_11",
+            "SYNTH_QUOTED_PASS_22",
+            "SYNTH_BEARER_33",
+            "SYNTH_PHPSESS_44",
+            "SYNTH_TLPASS_55",
+            "SYNTH_OPENAI_KEY_66778899",
+            "SYNTH_USERPASS_77",
+        ]
+        dirty_hint = (
+            "Amber Ridge "
+            f"access_token={markers[0]} "
+            f'passkey="{markers[1]}" '
+            f"Authorization: Bearer {markers[2]} "
+            f"Cookie: PHPSESSID={markers[3]}; tlpass={markers[4]} "
+            f"sk-proj-{markers[5]} "
+            f"user:{markers[6]}@tracker.invalid"
+        )
+        prompt = build_user_prompt(
+            EvaluateRequest(
+                raw_text="Amber.Ridge.2024.1080p.BluRay.REMUX-GRP",
+                hint_title=dirty_hint,
+                hint_year=2024,
+            )
+        )
+        q_title, _q_year = extract_tmdb_query(
+            "Amber.Ridge.2024.1080p.BluRay.REMUX-GRP",
+            hint_title=dirty_hint,
+            hint_year=2024,
+        )
+        for m in markers:
+            self.assertNotIn(m, prompt)
+            self.assertNotIn(m, q_title or "")
+        # Normal movie titles remain completely intact
+        clean_prompt = build_user_prompt(
+            EvaluateRequest(
+                raw_text="The.Secret.Life.of.Walter.Mitty.2013.1080p.BluRay.REMUX-GRP",
+                hint_title="The Secret Life of Walter Mitty",
+                hint_year=2013,
+            )
+        )
+        self.assertIn("The Secret Life of Walter Mitty", clean_prompt)
 
 
 if __name__ == "__main__":
