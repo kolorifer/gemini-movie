@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from db import RELEASE_STOP_TOKENS, YEAR_RE, extract_imdb_id
@@ -182,16 +183,28 @@ def _parse_year(release_date: Optional[str]) -> Optional[int]:
     return None
 
 
-def extract_tmdb_query(
-    raw_text: str,
-    *,
-    hint_title: Optional[str] = None,
-    hint_year: Optional[int] = None,
-) -> tuple[Optional[str], Optional[int]]:
+def _is_title_numeral_token(tokens: list[str], idx: int, *, max_release_year: int) -> bool:
     """
-    Extract a clean (title, year) search query from a release string and optional hints.
-    Preserves hyphenated titles (e.g. Spider-Man) while stripping trailing release groups
-    when release tags or dots are present.
+    Return True when a 4-digit year-like token at `tokens[idx]` is part of the movie title
+    (e.g. '2049' in 'Echo.2049.2017.1080p.BluRay.REMUX' or '1984' in 'Wonder.Woman.1984.2020')
+    rather than the release year itself.
+    """
+    low = tokens[idx].lower()
+    if not YEAR_RE.match(low):
+        return False
+    if idx == 0:
+        return True
+    if idx + 1 < len(tokens) and YEAR_RE.match(tokens[idx + 1].lower()):
+        return True
+    if int(low) > max_release_year:
+        return True
+    return False
+
+
+def extract_filename_tmdb_query(raw_text: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Extract (title, year) strictly from the release string alone (independent of upstream hints).
+    Preserves hyphenated titles (e.g. Spider-Man) and title-ending numerals (e.g. Echo 2049 2017).
     """
     cleaned = re.sub(r"\[redacted\]", " ", sanitize_tracker_text(raw_text, max_chars=512), flags=re.IGNORECASE).strip()
     has_release_markers = "." in cleaned or any(
@@ -203,13 +216,17 @@ def extract_tmdb_query(
         cleaned = re.sub(r"-[A-Za-z0-9]{2,20}$", "", cleaned)
 
     tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", cleaned) if t]
+    max_release_year = datetime.now(timezone.utc).year + 5
 
     title_tokens: list[str] = []
     detected_year: Optional[int] = None
 
     for idx, token in enumerate(tokens):
         low = token.lower()
-        if YEAR_RE.match(low) and idx > 0:
+        if YEAR_RE.match(low):
+            if _is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
+                title_tokens.append(token)
+                continue
             detected_year = int(low)
             break
         if low in RELEASE_STOP_TOKENS and title_tokens:
@@ -217,6 +234,22 @@ def extract_tmdb_query(
         if low.startswith("tt") and re.fullmatch(r"tt\d{7,10}", low):
             continue
         title_tokens.append(token)
+
+    return (" ".join(title_tokens).strip() or None), detected_year
+
+
+def extract_tmdb_query(
+    raw_text: str,
+    *,
+    hint_title: Optional[str] = None,
+    hint_year: Optional[int] = None,
+) -> tuple[Optional[str], Optional[int]]:
+    """
+    Extract a clean (title, year) search query from a release string and optional hints.
+    Preserves hyphenated titles, title-ending numerals (e.g. 'Echo.2049.2017'), and the
+    release filename's own year over a contradictory upstream hint_year.
+    """
+    raw_title, detected_year = extract_filename_tmdb_query(raw_text)
 
     clean_hint_title = (
         re.sub(
@@ -227,8 +260,8 @@ def extract_tmdb_query(
         if hint_title
         else ""
     )
-    query_title = clean_hint_title if clean_hint_title else " ".join(title_tokens).strip()
-    query_year = hint_year if hint_year is not None else detected_year
+    query_title = clean_hint_title if clean_hint_title else (raw_title or "")
+    query_year = detected_year if detected_year is not None else hint_year
     return (query_title or None), query_year
 
 
@@ -830,6 +863,65 @@ def check_tracker_movie_consistency(
     )
 
 
+def check_release_evidence_consistency(
+    movie: TmdbMovie,
+    *,
+    raw_text: str,
+    hint_title: Optional[str] = None,
+    hint_year: Optional[int] = None,
+    nfo_runtime: Optional[int] = None,
+    audio_languages: Optional[list[str]] = None,
+) -> Optional[str]:
+    """
+    PR #18 Round 4 Finding 5: Cross-check a candidate TMDB movie independently against BOTH
+    filename-derived evidence (`raw_text`) AND upstream hint evidence (`hint_title`, `hint_year`),
+    plus MediaInfo runtime and audio languages. Prevents a contradictory upstream hint from hiding
+    a filename year/title mismatch (e.g. 2012 filename with misleading 2024 hint).
+    """
+    raw_title, raw_year = extract_filename_tmdb_query(raw_text)
+    clean_hint_title = (
+        re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"\[redacted\]", " ", sanitize_tracker_text(hint_title, max_chars=240), flags=re.IGNORECASE),
+        ).strip()
+        if hint_title
+        else ""
+    ) or None
+
+    conflicts: list[str] = []
+    if raw_year is not None and hint_year is not None and abs(raw_year - hint_year) > 1:
+        conflicts.append(
+            f"release filename year ({raw_year}) contradicts upstream hint year ({hint_year})"
+        )
+
+    if raw_title is not None or raw_year is not None:
+        raw_conflict = check_tracker_movie_consistency(
+            movie,
+            query_title=raw_title,
+            query_year=raw_year,
+            nfo_runtime=nfo_runtime,
+            audio_languages=audio_languages,
+        )
+        if raw_conflict is not None:
+            conflicts.append(raw_conflict)
+
+    if clean_hint_title is not None or hint_year is not None:
+        hint_conflict = check_tracker_movie_consistency(
+            movie,
+            query_title=clean_hint_title,
+            query_year=hint_year,
+            nfo_runtime=nfo_runtime,
+            audio_languages=audio_languages,
+        )
+        if hint_conflict is not None and hint_conflict not in conflicts:
+            conflicts.append(hint_conflict)
+
+    if not conflicts:
+        return None
+    return "; ".join(conflicts)
+
+
 def format_torrent_info_for_prompt(
     torrent_info: Optional[TorrentInfo],
     *,
@@ -1211,6 +1303,7 @@ class TmdbClient:
         )
 
     def _lookup_with_diagnostics_sync(self, request: EvaluateRequest) -> TmdbLookupResult:
+        raw_title, raw_year = extract_filename_tmdb_query(request.raw_text)
         query_title, query_year = extract_tmdb_query(
             request.raw_text,
             hint_title=request.hint_title,
@@ -1225,8 +1318,13 @@ class TmdbClient:
         audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
 
         # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context
-        # Cross-check against release title/year/MediaInfo AND any tracker-supplied IDs.
+        # Cross-check against independent filename/hint evidence AND any tracker-supplied IDs.
         tracker_conflict: Optional[str] = None
+        if raw_year is not None and request.hint_year is not None and abs(raw_year - request.hint_year) > 1:
+            tracker_conflict = (
+                f"release filename year ({raw_year}) contradicts upstream hint year ({request.hint_year})"
+            )
+
         direct_imdb = extract_imdb_id(request.raw_text, request.extra_context)
         if direct_imdb:
             direct_tmdb_id = self._find_tmdb_id_by_imdb(direct_imdb)
@@ -1245,14 +1343,15 @@ class TmdbClient:
                     id_disagreements.append(
                         f"direct IMDb {direct_imdb} (TMDB {direct_movie.tmdb_id}) conflicts with tracker TMDB {tinfo.tmdb_id}"
                     )
-                consistency_conflict = check_tracker_movie_consistency(
+                consistency_conflict = check_release_evidence_consistency(
                     direct_movie,
-                    query_title=query_title,
-                    query_year=query_year,
+                    raw_text=request.raw_text,
+                    hint_title=request.hint_title,
+                    hint_year=request.hint_year,
                     nfo_runtime=nfo_runtime,
                     audio_languages=audio_languages,
                 )
-                if not id_disagreements and consistency_conflict is None:
+                if not id_disagreements and consistency_conflict is None and tracker_conflict is None:
                     return TmdbLookupResult(
                         movie=direct_movie,
                         tracker_conflict=None,
@@ -1261,8 +1360,13 @@ class TmdbClient:
                 conflict_msg = "; ".join(
                     p for p in (*id_disagreements, consistency_conflict) if p
                 )
-                logger.warning("Rejecting conflicting direct IMDb TMDB candidate: %s", conflict_msg)
-                tracker_conflict = conflict_msg
+                if conflict_msg:
+                    logger.warning("Rejecting conflicting direct IMDb TMDB candidate: %s", conflict_msg)
+                    tracker_conflict = (
+                        f"{tracker_conflict}; {conflict_msg}"
+                        if tracker_conflict and conflict_msg not in tracker_conflict
+                        else (tracker_conflict or conflict_msg)
+                    )
 
         # 2) Check tracker-supplied TMDB/IMDb IDs — when BOTH are supplied, resolve AND compare BOTH!
         if tinfo is not None and (tinfo.tmdb_id is not None or tinfo.imdb_id):
@@ -1308,10 +1412,11 @@ class TmdbClient:
                         f"{tracker_conflict}; {conflict_msg}" if tracker_conflict else conflict_msg
                     )
                 else:
-                    consistency_conflict = check_tracker_movie_consistency(
+                    consistency_conflict = check_release_evidence_consistency(
                         movie_by_tmdb,
-                        query_title=query_title,
-                        query_year=query_year,
+                        raw_text=request.raw_text,
+                        hint_title=request.hint_title,
+                        hint_year=request.hint_year,
                         nfo_runtime=nfo_runtime,
                         audio_languages=audio_languages,
                     )
@@ -1325,8 +1430,8 @@ class TmdbClient:
                         logger.warning("Rejecting tracker-supplied TMDB candidate: %s", consistency_conflict)
                         tracker_conflict = (
                             f"{tracker_conflict}; {consistency_conflict}"
-                            if tracker_conflict
-                            else consistency_conflict
+                            if tracker_conflict and consistency_conflict not in tracker_conflict
+                            else (tracker_conflict or consistency_conflict)
                         )
             else:
                 tracker_tmdb_id: Optional[int] = supplied_tmdb_id
@@ -1343,10 +1448,11 @@ class TmdbClient:
                         )
                         else None
                     )
-                    consistency_conflict = check_tracker_movie_consistency(
+                    consistency_conflict = check_release_evidence_consistency(
                         tracker_movie,
-                        query_title=query_title,
-                        query_year=query_year,
+                        raw_text=request.raw_text,
+                        hint_title=request.hint_title,
+                        hint_year=request.hint_year,
                         nfo_runtime=nfo_runtime,
                         audio_languages=audio_languages,
                     )
@@ -1360,19 +1466,22 @@ class TmdbClient:
                     if conflict_msg:
                         logger.warning("Rejecting tracker-supplied TMDB candidate: %s", conflict_msg)
                         tracker_conflict = (
-                            f"{tracker_conflict}; {conflict_msg}" if tracker_conflict else conflict_msg
+                            f"{tracker_conflict}; {conflict_msg}"
+                            if tracker_conflict and conflict_msg not in tracker_conflict
+                            else (tracker_conflict or conflict_msg)
                         )
 
         # 3) Clean title + year search (with MediaInfo runtime/language tie-breaking)
-        if query_title:
+        search_title = raw_title or query_title
+        if search_title:
             searched = self._search_tmdb_movie(
-                query_title,
+                search_title,
                 query_year,
                 nfo_runtime=nfo_runtime,
                 audio_languages=audio_languages,
             )
             if searched is not None:
-                # If a tracker conflict occurred, still run Gemini with the conflict warning
+                # If a tracker/hint conflict occurred, still run Gemini with the conflict warning
                 # rather than silently serving a cached entry without disambiguation.
                 return TmdbLookupResult(
                     movie=searched,

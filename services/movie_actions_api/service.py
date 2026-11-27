@@ -1926,6 +1926,8 @@ class ActionsService:
         existing, tags_list, radarr_err = await self._lookup_live_radarr_state(
             action=action,
             mutation_label="watched mutation",
+            operation="watched",
+            reconcile_retry_button=is_reconciliation,
         )
         if radarr_err is not None:
             return radarr_err
@@ -2075,6 +2077,7 @@ class ActionsService:
                 existing, _reread_tags, reread_err = await self._lookup_live_radarr_state(
                     action=action,
                     mutation_label="Watched",
+                    operation="watched",
                 )
                 if reread_err is not None:
                     is_unavailable = reread_err.status_code == 503
@@ -2508,6 +2511,7 @@ class ActionsService:
         *,
         action: dict[str, Any],
         mutation_label: str = "Radarr write",
+        operation: str = "grab",
         unavailable_badge: str = "503",
         reconcile_retry_button: bool = False,
     ) -> tuple[Optional[dict[str, Any]], Optional[list[dict[str, Any]]], Optional[HtmlResponseData]]:
@@ -2515,8 +2519,17 @@ class ActionsService:
         Query live Radarr state across BOTH bound TMDB ID and bound IMDb ID (when available)
         plus live tags. Detects cross-TMDb IMDb collisions, multi-row ambiguity, and identity
         drift before any mutation.
+        - `operation="grab"`: conservatively reconciles concurrent snapshots of the same row ID
+          so if either shows ownership, watched, or unmonitored status, grab is withheld.
+        - `operation="watched"`: NEVER synthesizes a hybrid record from diverging snapshots; if
+          concurrent TMDb/IMDb observations disagree on any field or presence, fetches the single
+          authoritative record via `GET /api/v3/movie/{id}` so recovery verification and PUT
+          updates operate on one coherent current movie record.
         Returns `(existing_movie_or_none, tags_list, error_response_or_none)`.
         """
+        if operation not in ("grab", "watched"):
+            raise ValueError(f"Unsupported Radarr lookup operation: {operation!r}")
+
         tmdb_id = action.get("bound_tmdb_id")
         if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
             return (
@@ -2531,20 +2544,41 @@ class ActionsService:
             )
 
         bound_imdb = str(action.get("bound_imdb_id") or "").strip().lower() or None
+        completion_seq = 0
+
+        async def _timed_tmdb() -> tuple[int, RadarrReadResult]:
+            nonlocal completion_seq
+            res = await self.radarr.get_movies_by_tmdb(tmdb_id)
+            completion_seq += 1
+            return completion_seq, res
+
+        async def _timed_imdb() -> tuple[int, RadarrReadResult]:
+            nonlocal completion_seq
+            assert bound_imdb is not None
+            res = await self.radarr.get_movies_by_imdb(bound_imdb)
+            completion_seq += 1
+            return completion_seq, res
+
         if bound_imdb:
-            movies_tmdb_res, movies_imdb_res, tags_res = await asyncio.gather(
-                self.radarr.get_movies_by_tmdb(tmdb_id),
-                self.radarr.get_movies_by_imdb(bound_imdb),
+            (tmdb_seq, movies_tmdb_res), (imdb_seq, movies_imdb_res), tags_res = await asyncio.gather(
+                _timed_tmdb(),
+                _timed_imdb(),
                 self.radarr.get_tags(),
             )
             reads_ok = movies_tmdb_res.ok and movies_imdb_res.ok and tags_res.ok
+            ordered_batches = (
+                [movies_tmdb_res.data or [], movies_imdb_res.data or []]
+                if tmdb_seq <= imdb_seq
+                else [movies_imdb_res.data or [], movies_tmdb_res.data or []]
+            )
         else:
-            movies_tmdb_res, tags_res = await asyncio.gather(
-                self.radarr.get_movies_by_tmdb(tmdb_id),
+            (_tmdb_seq, movies_tmdb_res), tags_res = await asyncio.gather(
+                _timed_tmdb(),
                 self.radarr.get_tags(),
             )
             movies_imdb_res = None
             reads_ok = movies_tmdb_res.ok and tags_res.ok
+            ordered_batches = [movies_tmdb_res.data or []]
 
         if not reads_ok:
             return (
@@ -2564,12 +2598,11 @@ class ActionsService:
             )
 
         deduped: dict[Any, dict[str, Any]] = {}
+        observed_counts: dict[Any, int] = {}
+        watched_snapshot_diverged = False
         fallback_idx = 0
-        conservative = mutation_label != "Watched"
-        for batch in (
-            movies_tmdb_res.data or [],
-            (movies_imdb_res.data or []) if movies_imdb_res is not None else [],
-        ):
+        conservative_for_grab = operation == "grab"
+        for batch in ordered_batches:
             for m in batch:
                 if not isinstance(m, dict):
                     continue
@@ -2579,11 +2612,15 @@ class ActionsService:
                     fallback_idx += 1
                 if key not in deduped:
                     deduped[key] = m
+                    observed_counts[key] = 1
                 else:
+                    observed_counts[key] = observed_counts.get(key, 1) + 1
+                    if not conservative_for_grab and deduped[key] != m:
+                        watched_snapshot_diverged = True
                     reconciled, drift = _reconcile_radarr_row_snapshots(
                         deduped[key],
                         m,
-                        conservative_for_grab=conservative,
+                        conservative_for_grab=conservative_for_grab,
                     )
                     if drift is not None or reconciled is None:
                         return (
@@ -2622,6 +2659,45 @@ class ActionsService:
             id_err = self._check_radarr_existing_movie_identity(action=action, existing=existing)
             if id_err is not None:
                 return None, None, id_err
+
+        # PR #18 Round 4 Findings 1 & 2: For Watched operations, whenever concurrent TMDb/IMDb
+        # reads returned diverging snapshots (or disagreed on row presence), fetch the single
+        # authoritative record by movie ID after both reads finish so recovery verification and
+        # PUT updates never act on a synthetic or stale snapshot.
+        if operation == "watched" and existing is not None:
+            mid = existing.get("id")
+            only_one_batch_found = (
+                bound_imdb is not None
+                and isinstance(mid, int)
+                and not isinstance(mid, bool)
+                and observed_counts.get(("id", int(mid)), 0) < 2
+            )
+            if (watched_snapshot_diverged or only_one_batch_found) and isinstance(mid, int) and not isinstance(mid, bool):
+                auth_res = await self.radarr.get_movie_by_id(int(mid))
+                if not auth_res.ok or not isinstance(auth_res.data, dict):
+                    if auth_res.status_code == 404:
+                        existing = None
+                    else:
+                        return (
+                            None,
+                            None,
+                            HtmlResponseData(
+                                status_code=503,
+                                html=render_simple_status_page(
+                                    title="Radarr Authoritative Read Failed",
+                                    badge=unavailable_badge,
+                                    message="Concurrent Radarr lookups diverged and the authoritative movie read could not be confirmed; retry safely.",
+                                    tone="warn",
+                                    post_button_label="Re-check Radarr Status & Reconcile" if reconcile_retry_button else None,
+                                    hidden_fields={"confirm": "1", "reconcile": "1"} if reconcile_retry_button else None,
+                                ),
+                            ),
+                        )
+                else:
+                    existing = dict(auth_res.data)
+                    id_err = self._check_radarr_existing_movie_identity(action=action, existing=existing)
+                    if id_err is not None:
+                        return None, None, id_err
 
         tags_list = [t for t in (tags_res.data or []) if isinstance(t, dict)]
         return existing, tags_list, None

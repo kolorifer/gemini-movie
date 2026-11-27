@@ -2355,6 +2355,140 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             self.assertFalse(four_alias.catalogue_identification.compatible)
             self.assertTrue(unrelated_again.cached)
 
+    def test_pr18_r4_finding_5_and_cache_regression_year_numeral_hint_and_disjoint_invalidation(self) -> None:
+        """
+        PR #18 Round 4 Finding 5 & Additional Cache Regression:
+          - Title-ending numerals (e.g. 'Echo.2049.2017.1080p.BluRay.REMUX-Z' and
+            'Wonder.Woman.1984.2020.2160p.UHD.BluRay.REMUX-Z') are parsed separately from the
+            release year, allowing genuinely matching films to confirm and cache.
+          - Contradictory upstream hints (e.g. 2012 filename with 2024 hint_year or unrelated
+            hint_title) cannot mask filename evidence and force incompatible/uncached results.
+          - Ordinary correct, localized alias, and RT rating attribution controls remain green.
+          - Conflict invalidation removes only reachable entries for the conflicting release and
+            its applicable IMDb aliases, preserving unrelated exact cache rows with disjoint IDs.
+        """
+        import main
+        from google.genai import types as sdk
+        from gemini_client import extract_grounding_sources, validate_and_ground_ratings
+        from schemas import TorrentInfo
+        from tmdb_client import extract_tmdb_query
+
+        # 1) Title-ending numeral parsing & normalize_release_key
+        self.assertEqual(extract_tmdb_query("Echo.2049.2017.1080p.BluRay.REMUX-Z"), ("Echo 2049", 2017))
+        self.assertEqual(extract_tmdb_query("Wonder.Woman.1984.2020.2160p.UHD.BluRay.REMUX-Z"), ("Wonder Woman 1984", 2020))
+        self.assertEqual(
+            extract_tmdb_query("Moss.Field.2012.1080p.BluRay.REMUX-Z", hint_title="Moss Field", hint_year=2024),
+            ("Moss Field", 2012),
+        )
+
+        # 2) Independent filename vs hint consistency across all controls and misleading-hint cases
+        cases = (
+            ("ordinary correct", "Moss.Field.2012.1080p.BluRay.REMUX-Z", "Moss Field", 2012, (), None, None, True),
+            ("ordinary wrong", "Moss.Field.2012.1080p.BluRay.REMUX-Z", "Moss Field", 2024, (), None, None, False),
+            ("valid localized alias", "Dolina.2012.1080p.BluRay.REMUX-Z", "Moss Field", 2012, ("Dolina",), None, None, True),
+            ("correct title-ending numeral", "Echo.2049.2017.1080p.BluRay.REMUX-Z", "Echo 2049", 2017, (), None, None, True),
+            ("misleading year hint", "Moss.Field.2012.1080p.BluRay.REMUX-Z", "Moss Field", 2024, (), "Moss Field", 2024, False),
+            ("misleading title hint", "Moss.Field.2012.1080p.BluRay.REMUX-Z", "Other Film", 2012, (), "Other Film", 2012, False),
+        )
+        for label, raw, model_title, year, aliases, hint, hint_year, should_match in cases:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "state.db")
+                test_db.init_db()
+                req = EvaluateRequest(
+                    raw_text=raw,
+                    hint_title=hint,
+                    hint_year=hint_year,
+                    torrent_info=TorrentInfo(runtime_minutes=103),
+                )
+                ref = TmdbMovie(
+                    tmdb_id=27,
+                    imdb_id="tt1234567",
+                    canonical_title=model_title,
+                    year=year,
+                    director="Dana Wren",
+                    runtime_minutes=103,
+                    alternative_titles=aliases,
+                )
+                client = TmdbClient(api_key="fixture")
+                client._search_tmdb_movie = lambda *args, **kwargs: None  # type: ignore[method-assign]
+                client._fetch_movie_details = lambda i: ref  # type: ignore[method-assign]
+                client._find_tmdb_id_by_imdb = lambda i: 27  # type: ignore[method-assign]
+                model_res = _sample_payload(
+                    title=model_title,
+                    year=year,
+                    director="Dana Wren",
+                    imdb_id="tt1234567",
+                    tmdb_id=27,
+                    runtime_minutes=103,
+                )
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    second = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                self.assertEqual(first.catalogue_identification.compatible, should_match, label)
+                self.assertEqual(second.cached, should_match, label)
+
+        # 3) RT rating attribution positive & negative controls
+        web = {"uri": "https://www.rottentomatoes.com/m/moss_field_2012", "title": "Moss Field (2012)"}
+        seg = "Moss Field: 82% Tomatometer from 74 critic reviews; audience score 89%."
+        resp = sdk.GenerateContentResponse(
+            candidates=[
+                {
+                    "grounding_metadata": {
+                        "grounding_chunks": [{"web": web}],
+                        "grounding_supports": [{"grounding_chunk_indices": [0], "segment": {"text": seg}}],
+                    }
+                }
+            ]
+        )
+        sources = extract_grounding_sources(resp)
+        good_rt = validate_and_ground_ratings(
+            {"rotten_tomatoes_critics": 82, "rotten_tomatoes_audience": 89},
+            grounding_sources=sources,
+            identification={"canonical_title": "Moss Field", "year": 2012},
+        )
+        self.assertEqual(good_rt["rotten_tomatoes_critics"], 82)
+        self.assertEqual(good_rt["rotten_tomatoes_audience"], 89)
+        bad_rt = validate_and_ground_ratings(
+            {"rotten_tomatoes_critics": 74, "rotten_tomatoes_audience": 82},
+            grounding_sources=sources,
+            identification={"canonical_title": "Moss Field", "year": 2012},
+        )
+        self.assertIsNone(bad_rt["rotten_tomatoes_critics"])
+        self.assertIsNone(bad_rt["rotten_tomatoes_audience"])
+
+        # 4) Additional cache regression: invalidating one release preserves disjoint-ID exact cache row
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = TriageDB(Path(tmpdir) / "cache.db")
+            test_db.init_db()
+            rel_a = "Harbor.2013.German.1080p.BluRay.REMUX-GRP"
+            rel_b = "Harbor.2013.French.1080p.BluRay.REMUX-GRP"
+            test_db.save_evaluation(
+                rel_a,
+                _sample_payload(title="Harbor", year=2013, imdb_id="tt1111111", tmdb_id=1).model_dump(),
+            )
+            test_db.save_evaluation(
+                rel_b,
+                _sample_payload(title="Harbor", year=2013, imdb_id="tt2222222", tmdb_id=2).model_dump(),
+            )
+            self.assertIsNotNone(
+                test_db.get_cached_evaluation(rel_a, allow_imdb_lookup=False, allow_release_key_fallback=False)
+            )
+            self.assertIsNotNone(
+                test_db.get_cached_evaluation(rel_b, allow_imdb_lookup=False, allow_release_key_fallback=False)
+            )
+            test_db.invalidate_evaluations(rel_a, imdb_ids=["tt1111111"])
+            self.assertIsNone(
+                test_db.get_cached_evaluation(rel_a, allow_imdb_lookup=False, allow_release_key_fallback=False)
+            )
+            self.assertIsNotNone(
+                test_db.get_cached_evaluation(rel_b, allow_imdb_lookup=False, allow_release_key_fallback=False)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

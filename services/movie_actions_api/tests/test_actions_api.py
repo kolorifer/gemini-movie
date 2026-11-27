@@ -4023,6 +4023,140 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r_watch2["pushes"], 0)
         self.assertEqual(r_watch2["feedback"], [])
 
+    async def test_pr18_r4_findings_1_and_2_watched_recovery_and_profile_preservation(self) -> None:
+        """
+        PR #18 Round 4 Findings 1 & 2:
+          - Explicit operation semantics on _lookup_live_radarr_state ensure Watched recovery
+            NEVER synthesizes {watched_tag, monitored=False} across two diverging observations;
+            it verifies BOTH on a single authoritative record before completing or posting feedback.
+          - Concurrent TMDb/IMDb reads where qualityProfileId changes mid-flight (in either read
+            completion order) NEVER overwrite the newer profile with a stale snapshot.
+          - Normal Watched remains green with exactly 1 update and 1 post-write readback.
+        """
+        async def _run_watched_case(mode: str, *, fail_retry_put: bool = False) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    radarr_client=rad,
+                    telegram_client=tg,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c,
+                ):
+                    card = _verified_card_payload(poster_path=None)
+                    hdr = {"X-Internal-Token": cfg.internal_api_secret}
+                    sent = await c.post("/internal/deliver/card", headers=hdr, json=card)
+                    self.assertEqual(sent.status_code, 200)
+                    token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["watched_good"]
+                    url = "/action/" + token
+                    rad.movies[101] = {
+                        "id": 101,
+                        "tmdbId": card["verified_tmdb_id"],
+                        "imdbId": card["verified_imdb_id"],
+                        "hasFile": False,
+                        "tags": [],
+                        "monitored": True,
+                        "qualityProfileId": 4,
+                    }
+                    orig_tmdb = rad.get_movies_by_tmdb
+                    orig_imdb = rad.get_movies_by_imdb
+                    gate = asyncio.Event()
+
+                    if mode == "watched_recovery":
+                        rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        r_init = await c.post(url, data={"confirm": "1"})
+                        self.assertEqual(r_init.status_code, 503)
+                        if fail_retry_put:
+                            rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        rad.movies[101].update({"tags": [], "monitored": False})
+
+                        async def _first(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            gate.set()
+                            return val
+
+                        async def _second(key: str) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101].update({"tags": [7], "monitored": True})
+                            return await orig_imdb(key)
+
+                        rad.get_movies_by_tmdb = _first  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _second  # type: ignore[method-assign]
+                    elif mode == "watched_preserves_profile_imdb_first":
+                        async def _earlier(key: str) -> RadarrReadResult:
+                            val = await orig_imdb(key)
+                            gate.set()
+                            return val
+
+                        async def _later(key: int) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101]["qualityProfileId"] = 9
+                            return await orig_tmdb(key)
+
+                        rad.get_movies_by_imdb = _earlier  # type: ignore[method-assign]
+                        rad.get_movies_by_tmdb = _later  # type: ignore[method-assign]
+                    elif mode == "watched_preserves_profile_tmdb_first":
+                        async def _earlier_t(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            gate.set()
+                            return val
+
+                        async def _later_i(key: str) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101]["qualityProfileId"] = 9
+                            return await orig_imdb(key)
+
+                        rad.get_movies_by_tmdb = _earlier_t  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _later_i  # type: ignore[method-assign]
+
+                    r = await c.post(url, data={"confirm": "1"})
+                    return {
+                        "http": r.status_code,
+                        "monitored": rad.movies[101]["monitored"],
+                        "tags": list(rad.movies[101]["tags"]),
+                        "profile_id": rad.movies[101]["qualityProfileId"],
+                        "feedback": [v["decision"] for v in fb.calls],
+                        "update_calls": len(rad.update_calls),
+                        "readback_calls": rad.readback_calls,
+                    }
+
+        r_norm = await _run_watched_case("watched_normal")
+        self.assertEqual(r_norm["http"], 200)
+        self.assertFalse(r_norm["monitored"])
+        self.assertIn(7, r_norm["tags"])
+        self.assertEqual(r_norm["profile_id"], 4)
+        self.assertEqual(r_norm["feedback"], ["watch"])
+        self.assertEqual(r_norm["update_calls"], 1)
+        self.assertEqual(r_norm["readback_calls"], 1)
+
+        r_rec = await _run_watched_case("watched_recovery")
+        self.assertEqual(r_rec["http"], 200)
+        self.assertFalse(r_rec["monitored"])
+        self.assertIn(7, r_rec["tags"])
+        self.assertEqual(r_rec["feedback"], ["watch"])
+        self.assertEqual(r_rec["update_calls"], 2)
+
+        r_rec_fail = await _run_watched_case("watched_recovery", fail_retry_put=True)
+        self.assertEqual(r_rec_fail["http"], 503)
+        self.assertTrue(r_rec_fail["monitored"])
+        self.assertEqual(r_rec_fail["feedback"], [])
+
+        for prof_mode in ("watched_preserves_profile_imdb_first", "watched_preserves_profile_tmdb_first"):
+            r_prof = await _run_watched_case(prof_mode)
+            self.assertEqual(r_prof["http"], 200, prof_mode)
+            self.assertEqual(r_prof["profile_id"], 9, prof_mode)
+            self.assertFalse(r_prof["monitored"], prof_mode)
+            self.assertIn(7, r_prof["tags"], prof_mode)
+            self.assertEqual(r_prof["feedback"], ["watch"], prof_mode)
+            self.assertEqual(r_prof["update_calls"], 1, prof_mode)
+
 
 if __name__ == "__main__":
     unittest.main()

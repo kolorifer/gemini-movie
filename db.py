@@ -575,10 +575,18 @@ def normalize_release_key(
 
     title_tokens: list[str] = []
     detected_year: Optional[int] = None
+    max_release_year = datetime.now(timezone.utc).year + 5
 
     for idx, token in enumerate(tokens):
         low = token.lower()
-        if YEAR_RE.match(low) and idx > 0:
+        if YEAR_RE.match(low):
+            if (
+                idx == 0
+                or (idx + 1 < len(tokens) and YEAR_RE.match(tokens[idx + 1].lower()))
+                or int(low) > max_release_year
+            ):
+                title_tokens.append(low)
+                continue
             detected_year = int(low)
             break
         if low in RELEASE_STOP_TOKENS and title_tokens:
@@ -1000,11 +1008,15 @@ class TriageDB:
         edition_key: Optional[str] = None,
         evidence_key: str = "",
         imdb_ids: Optional[list[str]] = None,
+        include_release_key_fallback: bool = False,
     ) -> int:
         """
-        PR #18 Round 3 Finding 4: Invalidate previously cached evaluations reachable for
-        this release (exact raw text, release_key, and applicable IMDb aliases) whenever a
-        refresh or re-evaluation establishes a catalogue/identity contradiction.
+        PR #18 Round 3 Finding 4 & Round 4 Cache Regression: Invalidate previously cached
+        evaluations actually reachable for this release (exact `raw_text_normalized` and
+        applicable IMDb aliases under the matching `(quality_key, edition_key, evidence_key)`).
+        Because evaluation reads disable `release_key` fallback (`allow_release_key_fallback=False`),
+        do NOT broadly delete by `release_key` unless explicitly requested, so distinct files
+        sharing a title/year with disjoint verified IMDb/TMDb IDs are never evicted.
         """
         norm_raw = normalize_raw_text(raw_text)
         rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
@@ -1023,11 +1035,12 @@ class TriageDB:
                 if low not in clean_imdbs:
                     clean_imdbs.append(low)
 
-        query_year: Optional[int] = hint_year
-        if query_year is None and rel_key:
+        rel_year: Optional[int] = None
+        if rel_key:
             tail = rel_key.rsplit(" ", 1)[-1]
             if YEAR_RE.match(tail):
-                query_year = int(tail)
+                rel_year = int(tail)
+        query_year: Optional[int] = rel_year if rel_year is not None else hint_year
 
         deleted = 0
         with self._connect() as conn:
@@ -1043,7 +1056,7 @@ class TriageDB:
             )
             deleted += cur.rowcount
 
-            if rel_key:
+            if include_release_key_fallback and rel_key:
                 cur = conn.execute(
                     """
                     DELETE FROM evaluations

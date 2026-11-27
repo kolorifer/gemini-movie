@@ -26,10 +26,9 @@ from tmdb_client import (
     TmdbClient,
     apply_tmdb_verification,
     apply_unresolved_conflict_result,
-    check_tracker_movie_consistency,
+    check_release_evidence_consistency,
     compute_evidence_key,
     extract_nfo_runtime_minutes,
-    extract_tmdb_query,
     format_torrent_info_for_prompt,
     is_tmdb_compatible,
 )
@@ -209,26 +208,23 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
             if tmdb_client.enabled
             else None
         )
-        # Round 3 Finding 3: Cross-check any late model-proposed catalogue record
-        # against the original release evidence (title, year, MediaInfo runtime/audio)
-        # before declaring compatibility or writing to cache.
+        # Round 3 Finding 3 & Round 4 Finding 5: Cross-check any late model-proposed
+        # catalogue record independently against BOTH filename evidence (title/numerals/year)
+        # AND upstream hint evidence plus MediaInfo runtime/audio before declaring compatibility
+        # or writing to cache.
         late_release_conflict: Optional[str] = None
         if verified_candidate is not None:
-            query_title, query_year = extract_tmdb_query(
-                payload.raw_text,
-                hint_title=payload.hint_title,
-                hint_year=payload.hint_year,
-            )
             nfo_runtime = (
                 tinfo.runtime_minutes or extract_nfo_runtime_minutes(tinfo.nfo_text)
                 if tinfo is not None
                 else None
             )
             audio_languages = list(tinfo.audio_languages) if tinfo is not None else []
-            late_release_conflict = check_tracker_movie_consistency(
+            late_release_conflict = check_release_evidence_consistency(
                 verified_candidate,
-                query_title=query_title,
-                query_year=query_year,
+                raw_text=payload.raw_text,
+                hint_title=payload.hint_title,
+                hint_year=payload.hint_year,
                 nfo_runtime=nfo_runtime,
                 audio_languages=audio_languages,
             )

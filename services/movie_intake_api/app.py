@@ -188,6 +188,8 @@ def create_app(
             await asyncio.to_thread(
                 intake_db.backfill_legacy_occurrence_digests,
                 cfg.webhook_archive_dir,
+                allowed_filter_names=cfg.allowed_filter_names,
+                allowed_filter_ids=cfg.allowed_filter_ids,
             )
             await asyncio.to_thread(
                 intake_db.recheck_pre_upgrade_actionable_releases,

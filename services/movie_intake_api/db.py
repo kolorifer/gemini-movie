@@ -258,19 +258,27 @@ class IntakeDB:
             conn.close()
         self._harden_db_files()
 
-    def backfill_legacy_occurrence_digests(self, archive_dir: Path) -> int:
+    def backfill_legacy_occurrence_digests(
+        self,
+        archive_dir: Path,
+        *,
+        allowed_filter_names: tuple[str, ...] = DEFAULT_ALLOWED_FILTER_NAMES,
+        allowed_filter_ids: tuple[int, ...] = (),
+    ) -> int:
         """
-        PR #18 Blocker 3: Recompute `occurrences.incoming_evidence_digest` from verified
-        archived payloads for any pre-upgrade movie occurrences whose digest is NULL,
-        and sync `releases.incoming_evidence_digest` for the release's `latest_occurrence_id`
-        so exact and re-wrapped replays after an upgrade can never revert an earlier correction.
+        PR #18 Blocker 3 & Round 4 Findings 3/4: Recompute `occurrences.incoming_evidence_digest`
+        from verified archived payloads for any pre-upgrade movie occurrences whose digest is NULL,
+        classify each intact occurrence individually under current notification scope rules
+        (keeping eligible ones as `movie_candidate` and marking proven excluded ones as
+        `pre_upgrade_ineligible_scope` without erasing proven eligible history), and sync
+        `releases.incoming_evidence_digest` for the release's `latest_occurrence_id`.
         """
         conn = self._connect()
         try:
             pending = conn.execute(
                 """
                 SELECT o.occurrence_id, o.release_id, o.archive_relpath, o.archive_sha256,
-                       r.latest_occurrence_id
+                       o.classification, r.latest_occurrence_id
                 FROM occurrences o
                 JOIN releases r ON r.release_id = o.release_id
                 WHERE o.release_id IS NOT NULL
@@ -284,20 +292,33 @@ class IntakeDB:
         if not pending:
             return 0
 
-        updates: list[tuple[str, str, str, bool]] = []
+        updates: list[tuple[str, str, Optional[str], str, str, bool]] = []
         for row in pending:
             occ_id = str(row["occurrence_id"])
             rel_id = str(row["release_id"])
             relpath = str(row["archive_relpath"])
             expected_sha = str(row["archive_sha256"])
+            cur_cls = str(row["classification"] or "movie_candidate")
             is_latest = occ_id == str(row["latest_occurrence_id"])
             try:
                 raw_payload = read_verified_archive_json(archive_dir, relpath, expected_sha)
             except (ArchiveIntegrityError, PrivateFileError, OSError, ValueError):
                 continue
             digest = compute_legacy_occurrence_evidence_digest(raw_payload)
-            if digest:
-                updates.append((digest, occ_id, rel_id, is_latest))
+            if not digest:
+                continue
+            new_cls = cur_cls
+            new_diag: Optional[str] = None
+            if cur_cls == "movie_candidate":
+                reclassified = classify_webhook_payload(
+                    raw_payload,
+                    allowed_filter_names=allowed_filter_names,
+                    allowed_filter_ids=allowed_filter_ids,
+                )
+                if reclassified.classification != "movie_candidate":
+                    new_cls = "pre_upgrade_ineligible_scope"
+                    new_diag = reclassified.diagnostic_note or "pre_upgrade_ineligible_scope"
+            updates.append((digest, new_cls, new_diag, occ_id, rel_id, is_latest))
 
         if not updates:
             return 0
@@ -305,14 +326,16 @@ class IntakeDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for digest, occ_id, rel_id, is_latest in updates:
+            for digest, new_cls, new_diag, occ_id, rel_id, is_latest in updates:
                 conn.execute(
                     """
                     UPDATE occurrences
-                    SET incoming_evidence_digest = ?
+                    SET incoming_evidence_digest = ?,
+                        classification = ?,
+                        diagnostic_note = COALESCE(diagnostic_note, ?)
                     WHERE occurrence_id = ? AND incoming_evidence_digest IS NULL
                     """,
-                    (digest, occ_id),
+                    (digest, new_cls, new_diag, occ_id),
                 )
                 if is_latest:
                     conn.execute(
@@ -448,7 +471,7 @@ class IntakeDB:
         try:
             actionable = conn.execute(
                 """
-                SELECT release_id, ack_message_id, pending_card_supersede_json
+                SELECT release_id, latest_occurrence_id, ack_message_id, pending_card_supersede_json
                 FROM releases
                 WHERE state IN ('queued', 'enriching', 'evaluating', 'delivering')
                    OR pending_card_supersede_json IS NOT NULL
@@ -462,10 +485,11 @@ class IntakeDB:
         if not actionable:
             return 0
 
-        to_suppress: list[tuple[str, bool]] = []
+        to_suppress: list[tuple[str, str, Optional[str], bool]] = []
         for row in actionable:
             rel_id = str(row["release_id"])
-            eligible, _reason = self.is_release_currently_eligible(
+            latest_occ_id = str(row["latest_occurrence_id"] or "")
+            eligible, reason = self.is_release_currently_eligible(
                 rel_id,
                 archive_dir,
                 allowed_filter_names=allowed_filter_names,
@@ -482,7 +506,7 @@ class IntakeDB:
                         preserve_retire_supersede = True
                 except ValueError:
                     preserve_retire_supersede = False
-            to_suppress.append((rel_id, preserve_retire_supersede))
+            to_suppress.append((rel_id, latest_occ_id, reason, preserve_retire_supersede))
 
         if not to_suppress:
             return 0
@@ -491,7 +515,22 @@ class IntakeDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for rel_id, preserve_retire in to_suppress:
+            for rel_id, latest_occ_id, reason, preserve_retire in to_suppress:
+                if (
+                    latest_occ_id
+                    and reason not in ("unverified_occurrence_archive", "missing_latest_occurrence_record")
+                ):
+                    conn.execute(
+                        """
+                        UPDATE occurrences
+                        SET classification = 'pre_upgrade_ineligible_scope',
+                            diagnostic_note = COALESCE(diagnostic_note, ?)
+                        WHERE occurrence_id = ?
+                          AND release_id = ?
+                          AND classification = 'movie_candidate'
+                        """,
+                        (reason or "pre_upgrade_ineligible_scope", latest_occ_id, rel_id),
+                    )
                 if preserve_retire:
                     conn.execute(
                         """
@@ -636,29 +675,33 @@ class IntakeDB:
                 card_revision = int(existing["card_revision"])
                 cur_digest = str(existing["incoming_evidence_digest"])
                 latest_occ_id = str(existing["latest_occurrence_id"])
-                source_occ = (
-                    occurrence_id
-                    if classified.has_download_url
-                    else str(existing["source_occurrence_id"])
-                )
-
-                # PR #18 Round 3 Finding 2: If a pre-upgrade release was suppressed at startup
-                # solely because its earlier delivery did not satisfy current scope/filter rules,
-                # a fresh qualifying arrival MUST wake and queue the release once (even when the
-                # movie fields match the earlier excluded snapshot), advancing latest_occurrence_id
-                # to this newly verified occurrence.
-                waking_pre_upgrade_ineligible = (
-                    cur_state == "suppressed"
-                    and cur_suppression_reason == "pre_upgrade_ineligible_scope"
-                    and card_revision == 0
-                )
-
+                cur_source_occ = str(existing["source_occurrence_id"])
                 latest_occ_row = conn.execute(
-                    "SELECT archive_sha256 FROM occurrences WHERE occurrence_id = ?",
+                    "SELECT classification, archive_sha256, incoming_evidence_digest FROM occurrences WHERE occurrence_id = ?",
                     (latest_occ_id,),
                 ).fetchone()
+                latest_is_ineligible_pre_upgrade = (
+                    latest_occ_row is not None
+                    and str(latest_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
+                )
+                if classified.has_download_url:
+                    source_occ = occurrence_id
+                elif latest_is_ineligible_pre_upgrade and cur_source_occ == latest_occ_id:
+                    source_occ = occurrence_id
+                else:
+                    source_occ = cur_source_occ
+
+                # PR #18 Round 4 Findings 3 & 4:
+                # 1. Never bypass proven eligible (`movie_candidate`) history or missing-archive
+                #    ordering guards when waking a suppressed release, and never relabel prior
+                #    `movie_candidate` records.
+                # 2. Only treat `latest_occurrence_id` as an exact duplicate when it was NOT an
+                #    intact pre-upgrade excluded delivery (`pre_upgrade_ineligible_scope`), so a
+                #    genuinely new qualifying delivery (both card_revision==0 and card_revision>=1)
+                #    can wake/reassess once while exact replays of earlier allowed occurrences or
+                #    releases with unverified missing archives stay protected.
                 is_exact_latest_replay = (
-                    not waking_pre_upgrade_ineligible
+                    not latest_is_ineligible_pre_upgrade
                     and (
                         cur_digest == classified.incoming_evidence_digest
                         or (
@@ -668,12 +711,8 @@ class IntakeDB:
                     )
                 )
 
-                # Scope prior-occurrence detection strictly to accepted/applied `movie_candidate`
-                # rows so an occurrence previously withheld due to a missing/corrupt archive does
-                # not permanently block genuine recovery after archive restoration (Round 3 Finding 5).
                 seen_prior_occurrence = (
-                    not waking_pre_upgrade_ineligible
-                    and not is_exact_latest_replay
+                    not is_exact_latest_replay
                     and conn.execute(
                         """
                         SELECT 1 FROM occurrences
@@ -690,13 +729,13 @@ class IntakeDB:
                     is not None
                 )
 
-                # PR #18 Round 2 Blocker 4: If any historical applied pre-upgrade occurrence on
-                # this release still has a NULL digest (missing or failed-integrity archive during
-                # migration backfill), ordering/novelty vs. prior superseded deliveries cannot
-                # be proved. Preserve the current known correction intact while archiving.
+                # PR #18 Round 2 Blocker 4 & Round 4 Finding 3: If any historical applied
+                # `movie_candidate` occurrence still has a NULL digest (missing or failed-integrity
+                # archive), ordering/novelty vs. prior deliveries cannot be proved. Withhold the
+                # incoming arrival without poisoning history so archive restoration + restart can
+                # still recover cleanly.
                 has_unverified_legacy_occurrence = (
-                    not waking_pre_upgrade_ineligible
-                    and not is_exact_latest_replay
+                    not is_exact_latest_replay
                     and not seen_prior_occurrence
                     and conn.execute(
                         """
@@ -711,17 +750,61 @@ class IntakeDB:
                     is not None
                 )
 
-                if waking_pre_upgrade_ineligible:
+                waking_pre_upgrade_ineligible_new = (
+                    not is_exact_latest_replay
+                    and not seen_prior_occurrence
+                    and not has_unverified_legacy_occurrence
+                    and cur_state == "suppressed"
+                    and cur_suppression_reason == "pre_upgrade_ineligible_scope"
+                    and card_revision == 0
+                )
+
+                if is_exact_latest_replay:
+                    # Exact duplicate (concurrent burst or late duplicate): attach occurrence
+                    # without re-queuing, while preserving/upgrading source_occurrence_id if
+                    # this delivery supplies a usable download URL.
                     conn.execute(
                         """
-                        UPDATE occurrences
-                        SET classification = 'pre_upgrade_ineligible_suppressed',
-                            diagnostic_note = COALESCE(diagnostic_note, 'superseded_by_fresh_qualifying_delivery')
+                        UPDATE releases
+                        SET latest_occurrence_id = ?,
+                            source_occurrence_id = ?,
+                            updated_at = ?
                         WHERE release_id = ?
-                          AND classification = 'movie_candidate'
                         """,
-                        (release_id,),
+                        (occurrence_id, source_occ, received_at_iso, release_id),
                     )
+                    result_status = "coalesced_duplicate"
+                elif seen_prior_occurrence:
+                    # Issue #13 §4a & PR #18 Blocker 3 / Round 4 Finding 3: Replayed older
+                    # superseded eligible evidence (including across upgrades and suppressed
+                    # transitions). Archive the replay occurrence and preserve current state.
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (received_at_iso, release_id),
+                    )
+                    result_status = "coalesced_duplicate"
+                elif has_unverified_legacy_occurrence:
+                    # PR #18 Round 2 Blocker 4 & Round 3 Finding 5: Ambiguous arrival while an
+                    # earlier pre-upgrade archive is missing/corrupt. Archive the arrival as
+                    # withheld (`movie_withheld_unverified_history`) and preserve current state
+                    # intact, without poisoning `seen_prior_occurrence` if the archive is later
+                    # restored and genuine new evidence is redelivered.
+                    occ_classification = "movie_withheld_unverified_history"
+                    occ_diagnostic_note = "withheld_unverified_legacy_archive"
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (received_at_iso, release_id),
+                    )
+                    result_status = "coalesced_duplicate"
+                elif waking_pre_upgrade_ineligible_new:
                     conn.execute(
                         """
                         UPDATE releases
@@ -744,7 +827,7 @@ class IntakeDB:
                         """,
                         (
                             occurrence_id,
-                            occurrence_id,
+                            source_occ,
                             classified.incoming_evidence_digest,
                             snap_json,
                             received_at_iso,
@@ -753,51 +836,6 @@ class IntakeDB:
                         ),
                     )
                     result_status = "accepted"
-                elif is_exact_latest_replay:
-                    # Exact duplicate (concurrent burst or late duplicate): attach occurrence
-                    # without re-queuing, while preserving/upgrading source_occurrence_id if
-                    # this delivery supplies a usable download URL.
-                    conn.execute(
-                        """
-                        UPDATE releases
-                        SET latest_occurrence_id = ?,
-                            source_occurrence_id = ?,
-                            updated_at = ?
-                        WHERE release_id = ?
-                        """,
-                        (occurrence_id, source_occ, received_at_iso, release_id),
-                    )
-                    result_status = "coalesced_duplicate"
-                elif seen_prior_occurrence:
-                    # Issue #13 §4a & PR #18 Blocker 3: Replayed older superseded evidence
-                    # (old A -> corrected B -> repeated A, including across schema upgrades).
-                    # Archive the replay occurrence, preserve newer correction B intact.
-                    conn.execute(
-                        """
-                        UPDATE releases
-                        SET updated_at = ?
-                        WHERE release_id = ?
-                        """,
-                        (received_at_iso, release_id),
-                    )
-                    result_status = "coalesced_duplicate"
-                elif has_unverified_legacy_occurrence:
-                    # PR #18 Round 2 Blocker 4 & Round 3 Finding 5: Ambiguous arrival while an
-                    # earlier pre-upgrade archive is missing/corrupt. Archive the arrival as
-                    # withheld (`movie_withheld_unverified_history`) and preserve correction B
-                    # intact, without poisoning `seen_prior_occurrence` if the archive is later
-                    # restored and genuine new evidence is redelivered.
-                    occ_classification = "movie_withheld_unverified_history"
-                    occ_diagnostic_note = "withheld_unverified_legacy_archive"
-                    conn.execute(
-                        """
-                        UPDATE releases
-                        SET updated_at = ?
-                        WHERE release_id = ?
-                        """,
-                        (received_at_iso, release_id),
-                    )
-                    result_status = "coalesced_duplicate"
                 elif cur_state == "ambiguous_delivery":
                     # Never reopen/resend a possibly delivered grab card while delivery is ambiguous,
                     # but still preserve a newly supplied usable acquisition source occurrence.
