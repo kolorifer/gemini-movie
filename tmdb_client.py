@@ -880,6 +880,16 @@ def check_tracker_movie_consistency(
     )
 
 
+def _movie_titles_include_year_numeral(movie: TmdbMovie, year_numeral: Optional[int]) -> bool:
+    if year_numeral is None:
+        return False
+    token = str(year_numeral)
+    for title in movie.all_titles():
+        if token in _normalize_title_for_compare(title).split():
+            return True
+    return False
+
+
 def check_release_evidence_consistency(
     movie: TmdbMovie,
     *,
@@ -899,6 +909,7 @@ def check_release_evidence_consistency(
     corroborating title/year or catalogue evidence.
     """
     clean_hint_title = _clean_hint_title(hint_title)
+    raw_candidates = extract_filename_tmdb_candidates(raw_text)
     raw_title, raw_year = extract_filename_tmdb_query(
         raw_text,
         hint_title=clean_hint_title,
@@ -906,17 +917,22 @@ def check_release_evidence_consistency(
     )
 
     conflicts: list[str] = []
-    if raw_year is not None and hint_year is not None and abs(raw_year - hint_year) > 1:
-        conflicts.append(
-            f"release filename year ({raw_year}) contradicts upstream hint year ({hint_year})"
-        )
-
-    if clean_hint_title is None and hint_year is None:
-        raw_candidates = extract_filename_tmdb_candidates(raw_text)
-        raw_conflict: Optional[str] = None
+    if clean_hint_title is None:
+        primary_year = raw_candidates[0][1] if raw_candidates else None
+        matched_raw_candidate = False
+        first_raw_conflict: Optional[str] = None
         for idx, (cand_title, cand_year) in enumerate(raw_candidates):
             if cand_title is None and cand_year is None:
                 continue
+            cand_conflicts: list[str] = []
+            if cand_year is not None and hint_year is not None and abs(cand_year - hint_year) > 1:
+                cand_conflicts.append(
+                    f"release filename year ({cand_year}) contradicts upstream hint year ({hint_year})"
+                )
+            if idx >= 1 and not _movie_titles_include_year_numeral(movie, primary_year):
+                cand_conflicts.append(
+                    f"catalogue title '{movie.canonical_title}' does not corroborate filename title numeral {primary_year}"
+                )
             cand_conflict = check_tracker_movie_consistency(
                 movie,
                 query_title=cand_title,
@@ -924,23 +940,30 @@ def check_release_evidence_consistency(
                 nfo_runtime=nfo_runtime,
                 audio_languages=audio_languages,
             )
-            if cand_conflict is None:
-                raw_conflict = None
+            if cand_conflict is not None:
+                cand_conflicts.append(cand_conflict)
+            if not cand_conflicts:
+                matched_raw_candidate = True
                 break
             if idx == 0:
-                raw_conflict = cand_conflict
-        if raw_conflict is not None:
-            conflicts.append(raw_conflict)
-    elif raw_title is not None or raw_year is not None:
-        raw_conflict = check_tracker_movie_consistency(
-            movie,
-            query_title=raw_title,
-            query_year=raw_year,
-            nfo_runtime=nfo_runtime,
-            audio_languages=audio_languages,
-        )
-        if raw_conflict is not None:
-            conflicts.append(raw_conflict)
+                first_raw_conflict = "; ".join(cand_conflicts)
+        if not matched_raw_candidate and first_raw_conflict:
+            conflicts.append(first_raw_conflict)
+    else:
+        if raw_year is not None and hint_year is not None and abs(raw_year - hint_year) > 1:
+            conflicts.append(
+                f"release filename year ({raw_year}) contradicts upstream hint year ({hint_year})"
+            )
+        if raw_title is not None or raw_year is not None:
+            raw_conflict = check_tracker_movie_consistency(
+                movie,
+                query_title=raw_title,
+                query_year=raw_year,
+                nfo_runtime=nfo_runtime,
+                audio_languages=audio_languages,
+            )
+            if raw_conflict is not None:
+                conflicts.append(raw_conflict)
 
     if clean_hint_title is not None or hint_year is not None:
         hint_conflict = check_tracker_movie_consistency(
@@ -1339,14 +1362,16 @@ class TmdbClient:
         )
 
     def _lookup_with_diagnostics_sync(self, request: EvaluateRequest) -> TmdbLookupResult:
+        clean_hint_title = _clean_hint_title(request.hint_title)
+        raw_candidates = extract_filename_tmdb_candidates(request.raw_text)
         raw_title, raw_year = extract_filename_tmdb_query(
             request.raw_text,
-            hint_title=request.hint_title,
+            hint_title=clean_hint_title,
             hint_year=request.hint_year,
         )
         query_title, query_year = extract_tmdb_query(
             request.raw_text,
-            hint_title=request.hint_title,
+            hint_title=clean_hint_title,
             hint_year=request.hint_year,
         )
         tinfo = request.torrent_info
@@ -1360,10 +1385,21 @@ class TmdbClient:
         # 1) Check caller-provided explicit IMDb ID in raw_text / extra_context
         # Cross-check against independent filename/hint evidence AND any tracker-supplied IDs.
         tracker_conflict: Optional[str] = None
+        deferred_year_conflict: Optional[str] = None
         if raw_year is not None and request.hint_year is not None and abs(raw_year - request.hint_year) > 1:
-            tracker_conflict = (
+            year_conflict_msg = (
                 f"release filename year ({raw_year}) contradicts upstream hint year ({request.hint_year})"
             )
+            alt_matches_hint_year = clean_hint_title is None and any(
+                cand_year is not None and abs(cand_year - request.hint_year) <= 1
+                for _, cand_year in raw_candidates[1:]
+            )
+            if alt_matches_hint_year:
+                # Defer only until catalogue candidates are checked; alternate candidate still
+                # requires catalogue title corroboration of the title numeral (never bypassing).
+                deferred_year_conflict = year_conflict_msg
+            else:
+                tracker_conflict = year_conflict_msg
 
         direct_imdb = extract_imdb_id(request.raw_text, request.extra_context)
         if direct_imdb:
@@ -1516,8 +1552,8 @@ class TmdbClient:
         primary_search_title = raw_title or query_title
         if primary_search_title:
             search_queries.append((primary_search_title, query_year))
-        if request.hint_title is None and request.hint_year is None:
-            for cand_title, cand_year in extract_filename_tmdb_candidates(request.raw_text)[1:]:
+        if clean_hint_title is None:
+            for cand_title, cand_year in raw_candidates[1:]:
                 if cand_title and (cand_title, cand_year) not in search_queries:
                     search_queries.append((cand_title, cand_year))
 
@@ -1561,6 +1597,14 @@ class TmdbClient:
                 f"{tracker_conflict}; {first_conflict}"
                 if tracker_conflict and first_conflict not in tracker_conflict
                 else (tracker_conflict or first_conflict)
+            )
+        if deferred_year_conflict and (
+            not tracker_conflict or deferred_year_conflict not in tracker_conflict
+        ):
+            tracker_conflict = (
+                f"{tracker_conflict}; {deferred_year_conflict}"
+                if tracker_conflict
+                else deferred_year_conflict
             )
 
         return TmdbLookupResult(

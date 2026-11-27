@@ -6099,6 +6099,100 @@ Language : German
                     1,
                 )
 
+            # 405 & 406: Pre-upgrade card_revision>=1 releases suppressed behind an excluded A:
+            #   - 405: A was acknowledged (card_revision=1), B queued but never delivered, then
+            #     excluded A suppressed the queue -> delayed A coalesces, redelivered B wakes
+            #     once via `updated_correction` to supersede the stale card for A.
+            #   - 406: Both A and B were acknowledged (ack_incoming_digest == baseline B), then
+            #     excluded A suppressed the queue -> neither A nor already-delivered B wakes.
+            from services.movie_intake_api.classifier import compute_baseline_legacy_evidence_digest
+
+            def _seed_acked_case(case: str, ack_version: str, card_rev: int) -> None:
+                _seed_pre_upgrade(
+                    db,
+                    cfg.webhook_archive_dir,
+                    case,
+                    [
+                        (f"occ-{case}-a1", "a", True, True),
+                        (f"occ-{case}-b1", "b", True, True),
+                        (f"occ-{case}-a2", "a", False, True),
+                    ],
+                )
+                ack_raw = json.loads(_payload(case, ack_version, approved_filter=True).decode("utf-8"))
+                ack_base_dig = compute_baseline_legacy_evidence_digest(ack_raw)
+                assert ack_base_dig is not None
+                conn = db._connect()
+                try:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET card_revision = ?,
+                            ack_chat_id = '-100123456',
+                            ack_message_id = 777,
+                            ack_incoming_digest = ?,
+                            last_evaluated_digest = 'legacy-eval-digest'
+                        WHERE release_id = ?
+                        """,
+                        (card_rev, ack_base_dig, f"rel-r6-{case}"),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            _seed_acked_case("405", "a", 1)
+            _seed_acked_case("406", "b", 2)
+
+            app3, actions3, triage3 = _make_runtime()
+            with TestClient(app3) as client3:
+                self.assertEqual(_row("405")["state"], "suppressed")
+                self.assertEqual(_row("406")["state"], "suppressed")
+
+                # 405: replay A coalesces; redelivering undelivered B wakes once via updated_correction
+                r405_a = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "a", approved_filter=True, envelope="r1"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_a.json()["status"], "coalesced_duplicate")
+                r405_b = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "b", approved_filter=True, envelope="r2"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_b.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app3.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage3.calls if ".405." in v["raw_text"]],
+                    ["tt4440002"],
+                )
+                self.assertEqual(len([v for v in actions3.card_calls if v.get("external_id") == "405"]), 1)
+                r405_b_dup = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "b", approved_filter=True, envelope="r3"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_b_dup.json()["status"], "coalesced_duplicate")
+
+                # 406: B was already delivered before upgrade -> neither A nor B wakes
+                r406_a = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("406", "a", approved_filter=True, envelope="r1"),
+                    headers={"Content-Type": "application/json"},
+                )
+                r406_b = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("406", "b", approved_filter=True, envelope="r2"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r406_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(r406_b.json()["status"], "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app3.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage3.calls if ".406." in v["raw_text"]],
+                    [],
+                )
+                self.assertEqual(len([v for v in actions3.card_calls if v.get("external_id") == "406"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

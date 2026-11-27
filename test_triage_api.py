@@ -2686,6 +2686,26 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             ),
             ("Granite Bay", 1994),
         )
+        # Never flip to title-numeral reading on hint_year alone when hint_title omits the numeral
+        for misleading_title in (None, "Baie de Granit", "Granite Bay: 4K Restoration"):
+            self.assertEqual(
+                extract_filename_tmdb_query(
+                    "Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z",
+                    hint_title=misleading_title,
+                    hint_year=2022,
+                ),
+                ("Granite Bay", 1994),
+                str(misleading_title),
+            )
+        # Localized title carrying the numeral + matching year still corroborates the numeral title
+        self.assertEqual(
+            extract_filename_tmdb_query(
+                "Wonder.Woman.1984.2020.Remastered.2160p.UHD.BluRay.REMUX-Z",
+                hint_title="Mujer Maravilla 1984",
+                hint_year=2020,
+            ),
+            ("Wonder Woman 1984", 2020),
+        )
 
         # 3) End-to-end evaluate checks (positive controls + Round 6 fix + negative controls)
         eval_cases = (
@@ -2696,6 +2716,7 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             ("past numeral title remastered no hints", "Crew.Of.1999.1990.Remastered.1080p.BluRay.REMUX-Z", "Crew of 1999", 1990, None, None, True),
             ("earlier numeral title remastered with hints", "Wonder.Woman.1984.2020.Remastered.2160p.UHD.BluRay.REMUX-Z", "Wonder Woman 1984", 2020, "Wonder Woman 1984", 2020, True),
             ("earlier numeral title remastered no hints", "Wonder.Woman.1984.2020.Remastered.2160p.UHD.BluRay.REMUX-Z", "Wonder Woman 1984", 2020, None, None, True),
+            ("earlier numeral title remastered year-only hint", "Wonder.Woman.1984.2020.Remastered.2160p.UHD.BluRay.REMUX-Z", "Wonder Woman 1984", 2020, None, 2020, True),
             ("reject impossible chronology film", "Crew.Of.1999.1990.Remastered.1080p.BluRay.REMUX-Z", "Crew Of", 1999, None, None, False),
             ("reject misleading restoration year hint", "Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z", "Granite Bay", 2022, "Granite Bay", 2022, False),
         )
@@ -2745,6 +2766,63 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 assert first.catalogue_identification is not None
                 self.assertEqual(first.catalogue_identification.compatible, should_match, label)
                 self.assertEqual(second.cached, should_match, label)
+
+        # 4) Non-Latin film from the restoration year MUST NOT bypass title-numeral corroboration
+        #    via non_latin_corroborated (whether with no hints, year-only hint, or localized alias)
+        for label, hint_t, hint_y in (
+            ("non-latin 2022 remake no hints", None, None),
+            ("non-latin 2022 remake year-only hint", None, 2022),
+            ("non-latin 2022 remake localized alias + misleading year", "Baie de Granit", 2022),
+        ):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "db.sqlite")
+                test_db.init_db()
+                remake_2022 = TmdbMovie(
+                    tmdb_id=99,
+                    imdb_id="tt9999999",
+                    canonical_title="Granite Bay",
+                    original_title="花崗岩湾",
+                    year=2022,
+                    director="Wrong Dir",
+                    runtime_minutes=103,
+                    original_language="ja",
+                )
+                client = TmdbClient(api_key="fixture")
+                client._search_results = lambda *a, **k: [  # type: ignore[method-assign]
+                    {
+                        "id": 99,
+                        "title": "Granite Bay",
+                        "original_title": "花崗岩湾",
+                        "release_date": "2022-05-01",
+                        "popularity": 10,
+                    }
+                ]
+                client._fetch_movie_details = lambda i, _m=remake_2022: _m  # type: ignore[method-assign]
+                client._find_tmdb_id_by_imdb = lambda i: 99  # type: ignore[method-assign]
+                req = EvaluateRequest(
+                    raw_text="Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z",
+                    hint_title=hint_t,
+                    hint_year=hint_y,
+                    torrent_info=TorrentInfo(tmdb_id=99, runtime_minutes=103, audio_languages=["Japanese"]),
+                )
+                model_res = _sample_payload(
+                    title="Granite Bay",
+                    year=2022,
+                    director="Wrong Dir",
+                    runtime_minutes=103,
+                    imdb_id="tt9999999",
+                    tmdb_id=99,
+                )
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    second = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                self.assertFalse(first.catalogue_identification.compatible, label)
+                self.assertFalse(second.cached, label)
 
 
 if __name__ == "__main__":

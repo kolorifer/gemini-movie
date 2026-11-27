@@ -728,17 +728,20 @@ def select_release_title_year_candidate(
     norm_alt = _normalize_title_compare(" ".join(alt_tokens))
     norm_hint = _normalize_title_compare(hint_title) if hint_title else ""
 
+    hint_words = norm_hint.split() if norm_hint else []
+    hint_contains_primary_year = bool(
+        primary_year is not None and str(primary_year) in hint_words
+    )
     hint_title_matches_primary = bool(norm_hint and norm_primary and norm_hint == norm_primary)
     hint_title_matches_alt = bool(norm_hint and norm_alt and norm_hint == norm_alt)
     if (
         norm_hint
         and not hint_title_matches_primary
         and not hint_title_matches_alt
-        and primary_year is not None
+        and hint_contains_primary_year
         and norm_primary
     ):
-        hint_words = norm_hint.split()
-        if str(primary_year) in hint_words and all(w in hint_words for w in norm_primary.split()):
+        if all(w in hint_words for w in norm_primary.split()):
             hint_title_matches_alt = True
 
     hint_year_matches_primary = (
@@ -751,7 +754,8 @@ def select_release_title_year_candidate(
     if hint_title_matches_alt and (hint_year is None or hint_year_matches_alt):
         return candidates[1]
     if (
-        not hint_title_matches_primary
+        hint_contains_primary_year
+        and not hint_title_matches_primary
         and hint_year_matches_alt
         and not hint_year_matches_primary
     ):
