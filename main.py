@@ -188,18 +188,21 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
         # lookup of the model's competing suggestion. Keep both separate so any
         # disagreement returns an explicit conflict and withholds trusted caching.
         verified_result = apply_tmdb_verification(result, release_tmdb)
-    elif lookup.tracker_conflict:
-        # Round 2 Blocker 2: An unresolved tracker identity conflict with no
-        # release-grounded catalogue match cannot be resolved or cached via a
-        # lookup keyed only by the model's proposed IDs.
+    elif lookup.tracker_conflict or lookup.lookup_incomplete_reason:
+        # Round 2 Blocker 2 & Round 8 P1: An unresolved tracker/release conflict or an
+        # interrupted catalogue pre-lookup cannot be marked compatible or cached via a
+        # fallback lookup keyed only by the model's proposed IDs.
         verified_candidate = (
             await tmdb_client.verify_identification(result.identification)
             if tmdb_client.enabled
             else None
         )
+        unresolved_reason = "; ".join(
+            part for part in (lookup.tracker_conflict, lookup.lookup_incomplete_reason) if part
+        )
         verified_result = apply_unresolved_conflict_result(
             result,
-            conflict_reason=lookup.tracker_conflict,
+            conflict_reason=unresolved_reason,
             candidate_tmdb=verified_candidate,
         )
     else:
@@ -239,14 +242,17 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
 
     result_dict = verified_result.model_dump()
 
-    # Withhold caching when catalogue verification found an unresolved incompatibility
-    # or when a tracker/release conflict could not be resolved against release evidence.
+    # Withhold caching when catalogue verification found an unresolved incompatibility,
+    # a tracker/release conflict could not be resolved, or pre-lookup comparison was interrupted.
     has_catalogue_conflict = bool(
         (
             verified_result.catalogue_identification is not None
             and not verified_result.catalogue_identification.compatible
         )
-        or (release_tmdb is None and bool(lookup.tracker_conflict))
+        or (
+            release_tmdb is None
+            and bool(lookup.tracker_conflict or lookup.lookup_incomplete_reason)
+        )
     )
     if has_catalogue_conflict:
         # Round 3 Finding 4: Invalidate any previously cached compatible entries reachable
