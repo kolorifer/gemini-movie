@@ -1100,6 +1100,19 @@ Language : German
                 self.assertEqual(actions.card_calls[-1]["delivery_kind"], "evidence_review")
                 self.assertIn("runtime", (actions.card_calls[-1]["conflict_reason"] or "").lower())
 
+    def test_actions_client_accepts_unmonitored_no_file(self) -> None:
+        async def lookup() -> RadarrStatusResponse:
+            response = {"status": "unmonitored_no_file", "movie_id": 77, "monitored": False}
+            transport = httpx.MockTransport(lambda _: httpx.Response(200, json=response))
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                actions = ActionsApiClient(base_url="http://localhost", internal_token="", http_client=http_client)
+                return await actions.get_radarr_status(tmdb_id=4024001, imdb_id=None)
+
+        self.assertEqual(
+            asyncio.run(lookup()),
+            RadarrStatusResponse(status="unmonitored_no_file", movie_id=77, monitored=False),
+        )
+
     def test_shadow_case_4_radarr_suppression_alternative_grab_and_ambiguous_delivery(self) -> None:
         """Mandatory Shadow Case 4 (4a-4d) + Alternative Grab + quality suppression + ambiguous_delivery."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1136,11 +1149,7 @@ Language : German
                 )
             )
 
-            radarr_next = {
-                "resp": RadarrStatusResponse(
-                    status="watched_unmonitored", movie_id=77, monitored=False, alternative_grab_configured=True
-                )
-            }
+            radarr_next: dict[str, RadarrStatusResponse] = {}
             card_override: dict[str, Optional[DeliveryCardResponse]] = {"resp": None}
 
             def _card_handler(payload: dict[str, Any]) -> DeliveryCardResponse:
@@ -1169,24 +1178,35 @@ Language : German
             )
 
             with TestClient(app) as client:
-                # 4a: Watched + unmonitored -> suppressed BEFORE delivery, 0 Telegram sends, 0 evaluator calls
-                r_4a = client.post(
-                    "/webhook/test-webhook-secret",
-                    json=_make_autobrr_movie_webhook(
-                        release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
-                        external_id="4001",
-                        title="Library Film",
-                        year=2024,
-                        meta_imdb="tt4024001",
-                    ),
-                )
-                asyncio.run(app.state.worker.process_next_queued())
-                rel_4a = db.get_release(r_4a.json()["release_id"])
-                assert rel_4a is not None
-                self.assertEqual(rel_4a["state"], "suppressed")
-                self.assertEqual(rel_4a["suppression_reason"], "watched_unmonitored")
-                self.assertEqual(len(actions.card_calls), 0)
-                self.assertEqual(len(triage.calls), 0)
+                # 4a: Unmonitored watched and skipped movies are suppressed before delivery and evaluation.
+                for external_id, status in (("4001", "watched_unmonitored"), ("4010", "unmonitored_no_file")):
+                    with self.subTest(status=status):
+                        radarr_next["resp"] = RadarrStatusResponse(
+                            status=status, movie_id=77, monitored=False, alternative_grab_configured=True
+                        )
+                        r_4a = client.post(
+                            "/webhook/test-webhook-secret",
+                            json=_make_autobrr_movie_webhook(
+                                release_name="Library.Film.2024.2160p.UHD.BluRay.REMUX-GRP",
+                                external_id=external_id,
+                                title="Library Film",
+                                year=2024,
+                                meta_imdb="tt4024001",
+                            ),
+                        )
+                        asyncio.run(app.state.worker.process_next_queued())
+                        rel_4a = db.get_release(r_4a.json()["release_id"])
+                        assert rel_4a is not None
+                        self.assertEqual(rel_4a["state"], "suppressed")
+                        self.assertEqual(rel_4a["suppression_reason"], status)
+                        self.assertEqual(rel_4a["eval_reply_status"], "skipped")
+                        self.assertEqual(
+                            actions.radarr_calls[-1],
+                            {"tmdb_id": 4024001, "imdb_id": "tt4024001", "release_title": "Library Film"},
+                        )
+                        self.assertEqual(len(actions.card_calls), 0)
+                        self.assertEqual(len(actions.eval_reply_calls), 0)
+                        self.assertEqual(len(triage.calls), 0)
 
                 # 4b: Monitored, hasFile=false -> NOT suppressed, labeled explicitly
                 radarr_next["resp"] = RadarrStatusResponse(

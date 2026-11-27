@@ -6,10 +6,12 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
+from unittest.mock import patch
 
 import httpx
 
@@ -47,7 +49,7 @@ from services.movie_actions_api.clients import (
     TriageFeedbackClient,
 )
 from services.movie_actions_api.config import ActionsConfig, AlternativeGrabConfig
-from services.movie_actions_api.db import ActionsDB, NewActionRecord, generate_uuid7, utc_now, utc_now_iso
+from services.movie_actions_api.db import ActionsDB, ActionGroupSnapshot, NewActionRecord, generate_uuid7, utc_now, utc_now_iso
 from services.movie_actions_api.security import PrivateFileError, hash_token, redact_secrets
 from services.movie_actions_api.telegram_format import (
     TELEGRAM_CAPTION_UTF16_LIMIT,
@@ -220,6 +222,34 @@ class ControllableFeedbackStub(ShadowStubTriageFeedbackClient):
             return self.outcome_queue.pop(0)
         expected = str(kwargs["decision"]).strip().upper()
         return FeedbackPostResult(saved=True, decision_saved=expected)
+
+
+@dataclass
+class SkipCard:
+    """A delivered card with real confirmation URLs and an isolated action journal."""
+
+    client: httpx.AsyncClient
+    db: ActionsDB
+    radarr: ControllableRadarrStub
+    feedback: ControllableFeedbackStub
+    qbit: ShadowStubQbitClient
+    tokens: dict[str, str]
+
+    def snapshot(self) -> ActionGroupSnapshot:
+        return self.db.get_action_group_readonly(hash_token(self.tokens["skip"]))
+
+    def expire(self) -> None:
+        with sqlite3.connect(self.db.db_path) as conn:
+            conn.execute(
+                "UPDATE actions SET expires_at = ? WHERE token_sha256 = ?",
+                (utc_now_iso(utc_now() - timedelta(minutes=1)), hash_token(self.tokens["skip"])),
+            )
+
+    def url(self, button: str = "skip") -> str:
+        return f"/action/{self.tokens[button]}"
+
+    async def post(self, button: str = "skip", **fields: str) -> httpx.Response:
+        return await self.client.post(self.url(button), data={"confirm": "1", **fields})
 
 
 class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
@@ -709,6 +739,7 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 },
                 3: {"id": 3, "tmdbId": 1003, "imdbId": "tt0001003", "monitored": True, "hasFile": False, "tags": []},
                 4: {"id": 4, "tmdbId": 1004, "imdbId": "tt9999999", "monitored": True, "hasFile": False, "tags": []},
+                5: {"id": 5, "tmdbId": 1005, "monitored": False, "hasFile": False, "tags": [9]},
             }
             app = create_actions_app(
                 cfg,
@@ -731,6 +762,11 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(owned["movie_id"], 2)
                     self.assertEqual(owned["file_id"], 222)
                     self.assertEqual(owned["existing_quality"], "Remux-2160p")
+                    skipped = (await client.get("/internal/radarr/status", params={"tmdb_id": 1005}, headers=headers)).json()
+                    self.assertEqual(skipped["status"], "unmonitored_no_file")
+                    self.assertEqual(skipped["movie_id"], 5)
+                    self.assertIs(skipped["monitored"], False)
+                    self.assertEqual(skipped["detail"], "existing_unmonitored_no_file_unwatched")
                     self.assertEqual(
                         (await client.get("/internal/radarr/status", params={"tmdb_id": 1003}, headers=headers)).json()["status"],
                         "monitored_no_file",
@@ -1087,10 +1123,13 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(r_alt_refused.status_code, 409)
                     self.assertEqual(len(radarr.push_calls), 0)
 
-                    # Standalone Skip: explicit POST -> decision="skip", ZERO Radarr mutations!
+                    # Skip on a previously watched movie verifies the existing state and preserves its tags.
                     r_skip = await client.post(f"/action/{tokens['skip']}", data={"confirm": "1"})
                     self.assertEqual(r_skip.status_code, 200)
-                    self.assertIn("No Radarr changes were made", r_skip.text)
+                    self.assertIn("Skip Completed", r_skip.text)
+                    self.assertEqual(len(radarr.update_calls), 1)
+                    self.assertEqual(radarr.readback_calls, 2)
+                    self.assertEqual(set(radarr.movies[50]["tags"]), {42, 7})
                     self.assertEqual(fb.calls[-1]["decision"], "skip")
                     self.assertEqual(fb.calls[-1]["note"], "Skipped via Telegram")
 
@@ -1136,6 +1175,398 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         app.state.db.get_action_group_readonly(hash_token(legacy_tok)).action["status"],
                         "completed_all",
                     )
+
+    async def _open_skip_card(
+        self, *, monitored: Optional[bool] = None, alternative: bool = False
+    ) -> SkipCard:
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        policy_path = self._write_alt_grab_config(temp) if alternative else None
+        cfg = self._make_config(temp, alt_policy_path=policy_path)
+        telegram = ControllableTelegramStub()
+        radarr = ControllableRadarrStub()
+        feedback = ControllableFeedbackStub()
+        qbit = ShadowStubQbitClient()
+        payload = _verified_card_payload(poster_path=None)
+        if monitored is not None:
+            radarr.movies[51] = {
+                "id": 51, "tmdbId": payload["verified_tmdb_id"], "imdbId": payload["verified_imdb_id"],
+                "monitored": monitored, "tags": [9], "qualityProfileId": 3, "hasFile": alternative,
+            }
+        if alternative:
+            radarr.download_clients = [{
+                "enable": True, "implementation": "QBittorrent",
+                "fields": [
+                    {"name": "host", "value": "qbit.seedbox.invalid"},
+                    {"name": "port", "value": 443},
+                    {"name": "useSsl", "value": True},
+                    {"name": "urlBase", "value": "/qbittorrent"},
+                    {"name": "movieCategory", "value": "movies"},
+                ],
+            }]
+            movie = radarr.movies[51]
+            movie["movieFile"] = {
+                "id": 31, "relativePath": "Festival.Gem.2025.mkv",
+                "quality": {"quality": {"name": "Bluray-1080p"}}, "size": 100_000_000,
+            }
+            payload.update(
+                delivery_kind="alternative_grab",
+                radarr_status="owned_file",
+                bound_existing_movie_id=51,
+                bound_existing_file_id=31,
+                bound_rejection_class="cutoff_met",
+                rejection_reasons=["Existing file meets cutoff: Bluray-1080p"],
+                bound_movie_file_snapshot=build_movie_file_snapshot(movie),
+            )
+        app = create_actions_app(
+            cfg, telegram_client=telegram, radarr_client=radarr, triage_feedback_client=feedback,
+            intake_push_client=ShadowStubIntakePushClient(), qbit_client=qbit,
+            torrent_fetcher=ShadowStubTorrentFetcher(),
+        )
+        await self.enterAsyncContext(app.router.lifespan_context(app))
+        client = await self.enterAsyncContext(
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        )
+        sent = await client.post(
+            "/internal/deliver/card", json=payload, headers={"X-Internal-Token": cfg.internal_api_secret}
+        )
+        self.assertEqual(sent.status_code, 200)
+        tokens = _extract_tokens_from_markup(telegram.sent_messages[-1]["reply_markup"])
+        return SkipCard(client, app.state.db, radarr, feedback, qbit, tokens)
+
+    async def test_skip_absent_validates_live_options_adds_without_search_and_verifies_feedback(self) -> None:
+        card = await self._open_skip_card()
+        card.radarr.root_folders.append({"id": 2, "path": "/media/archive"})
+        card.radarr.quality_profiles.append({"id": 12, "name": "Archive Remux"})
+        preview = await card.client.get(card.url())
+        self.assertEqual(preview.status_code, 200)
+        for text in (
+            "Confirm Skip (Add Unmonitored)", 'name="root_folder_path"', 'name="quality_profile_id"', "searchForMovie=false"
+        ):
+            self.assertIn(text, preview.text)
+        self.assertEqual(card.radarr.add_calls, [])
+        self.assertEqual(card.feedback.calls, [])
+
+        for fields in ({"quality_profile_id": "999"}, {"root_folder_path": "/removed"}):
+            self.assertEqual((await card.post(**fields)).status_code, 400)
+        self.assertEqual(card.radarr.add_calls, [])
+        self.assertEqual(card.feedback.calls, [])
+        feedback_start = []
+        save_feedback = card.feedback.post_feedback
+
+        async def observe_feedback(**kwargs: Any) -> FeedbackPostResult:
+            feedback_start.append((card.radarr.readback_calls, card.snapshot().action["status"]))
+            return await save_feedback(**kwargs)
+
+        with patch.object(card.feedback, "post_feedback", side_effect=observe_feedback):
+            result = await card.post(root_folder_path="/media/archive", quality_profile_id="12")
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(feedback_start, [(1, "completed_radarr")])
+        self.assertIn("Skip Completed", result.text)
+        self.assertIn("SKIP", result.text)
+        self.assertEqual(card.radarr.add_calls, [{
+            "tmdbId": 550101, "imdbId": "tt5501010", "year": 2025, "title": "Festival Gem",
+            "rootFolderPath": "/media/archive", "qualityProfileId": 12, "monitored": False,
+            "tags": [], "addOptions": {"searchForMovie": False},
+        }])
+        self.assertEqual(card.radarr.update_calls, [])
+        self.assertEqual(card.radarr.readback_calls, 1)
+        snapshot = card.snapshot()
+        self.assertEqual(snapshot.action["status"], "completed_all")
+        self.assertEqual(snapshot.action["radarr_movie_id"], 101)
+        self.assertEqual(snapshot.action["feedback_decision_saved"], "SKIP")
+        self.assertIn(("radarr_skip", "skip_verified_readback"), [
+            (att["phase"], att["outcome_summary"]) for att in snapshot.group_attempts
+        ])
+        self.assertEqual(card.feedback.calls, [{
+            "title": "Festival Gem", "tmdb_id": 550101, "imdb_id": "tt5501010",
+            "decision": "skip", "note": "Skipped via Telegram",
+        }])
+
+    async def test_skip_existing_preserves_file_profile_and_custom_tags_and_avoids_redundant_put(self) -> None:
+        for monitored in (True, False):
+            with self.subTest(monitored=monitored):
+                card = await self._open_skip_card(monitored=True, alternative=True)
+                card.radarr.movies[51]["monitored"] = monitored
+                before = dict(card.radarr.movies[51])
+                preview = await card.client.get(card.url())
+                self.assertEqual(preview.status_code, 200)
+                self.assertNotIn('name="root_folder_path"', preview.text)
+                self.assertNotIn('name="quality_profile_id"', preview.text)
+                self.assertIn("will be set to unmonitored" if monitored else "already unmonitored", preview.text.lower())
+                self.assertEqual(card.radarr.update_calls, [])
+                self.assertEqual((await card.post()).status_code, 200)
+                self.assertEqual(card.radarr.movies[51], {**before, "monitored": False})
+                expected_writes = (
+                    [{"movie_id": 51, "payload": {"monitored": False, "editor_only": True}}] if monitored else []
+                )
+                self.assertEqual(card.radarr.update_calls, expected_writes)
+                self.assertEqual(card.radarr.add_calls, [])
+                self.assertEqual(card.radarr.readback_calls, 1)
+                self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_skip_does_not_require_watched_tag(self) -> None:
+        card = await self._open_skip_card()
+        card.radarr.tags = []
+        self.assertEqual((await card.post()).status_code, 200)
+        self.assertEqual(card.radarr.movies[101]["tags"], [])
+        self.assertIs(card.radarr.movies[101]["monitored"], False)
+        self.assertEqual(card.radarr.readback_calls, 1)
+        self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_skip_readback_rejects_identity_drift_monitored_or_unexpected_watched_tag(self) -> None:
+        for drift in ({"imdbId": "tt9999999"}, {"monitored": True}, {"tags": [7]}):
+            with self.subTest(drift=drift):
+                card = await self._open_skip_card()
+                card.radarr.readback_override = RadarrReadResult(ok=True, data={
+                    "id": 101, "tmdbId": 550101, "imdbId": "tt5501010", "monitored": False, "tags": [], **drift,
+                })
+                self.assertGreaterEqual((await card.post()).status_code, 400)
+                self.assertEqual(card.snapshot().action["status"], "ambiguous_radarr")
+                self.assertEqual(card.feedback.calls, [])
+                if "tags" in drift:
+                    card.radarr.movies[101]["tags"] = [7]
+                    self.assertGreaterEqual((await card.post(reconcile="1")).status_code, 400)
+                    self.assertEqual(card.snapshot().action["status"], "ambiguous_radarr")
+                    self.assertEqual(card.feedback.calls, [])
+                    self.assertEqual(card.radarr.update_calls, [])
+
+    async def test_skip_rejects_authoritative_record_with_wrong_id_or_no_bound_external_id(self) -> None:
+        for invalid_identity in ({"id": 52}, {"imdbId": None, "tmdbId": None}):
+            with self.subTest(invalid_identity=invalid_identity):
+                card = await self._open_skip_card(monitored=True)
+                invalid = {**card.radarr.movies[51], **invalid_identity}
+                card.radarr.readback_override = RadarrReadResult(ok=True, data=invalid)
+                # A partial batch match requires an authoritative read before PUT.
+                with patch.object(card.radarr, "get_movies_by_imdb", return_value=RadarrReadResult(ok=True, data=[])):
+                    self.assertGreaterEqual((await card.post()).status_code, 400)
+                self.assertEqual(card.radarr.readback_calls, 1)
+                self.assertEqual(card.radarr.update_calls, [])
+                self.assertEqual(card.feedback.calls, [])
+                # During recovery the same invalid by-ID reply cannot seal an uncertain write.
+                card.radarr.readback_override = None
+                card.radarr.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                self.assertEqual((await card.post()).status_code, 503)
+                card.radarr.readback_override = RadarrReadResult(ok=True, data={**invalid, "monitored": False})
+                self.assertGreaterEqual((await card.post(reconcile="1")).status_code, 400)
+                self.assertEqual(card.snapshot().action["status"], "ambiguous_radarr")
+                self.assertEqual(len(card.radarr.update_calls), 1)
+                self.assertEqual(card.feedback.calls, [])
+
+    async def test_skip_uses_authoritative_movie_on_divergent_or_partial_lookup(self) -> None:
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                card = await self._open_skip_card(monitored=True)
+                stale = {**card.radarr.movies[51], "monitored": False}
+                imdb_read = RadarrReadResult(ok=True, data=[] if missing else [stale])
+                with patch.object(card.radarr, "get_movies_by_imdb", return_value=imdb_read):
+                    self.assertEqual((await card.post()).status_code, 200)
+                self.assertEqual(card.radarr.readback_calls, 2)  # authoritative lookup, then post-mutation verification
+                self.assertIs(card.radarr.movies[51]["monitored"], False)
+                self.assertEqual(len(card.radarr.update_calls), 1)
+                self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_skip_add_race_rereads_both_ids_before_unmonitoring_the_winner(self) -> None:
+        for conflict in (False, True):
+            with self.subTest(conflict=conflict):
+                card = await self._open_skip_card()
+
+                def concurrent_add(request: httpx.Request) -> httpx.Response:
+                    self.assertEqual((request.method, request.url.path), ("POST", "/api/v3/movie"))
+                    payload = json.loads(request.content)
+                    card.radarr.add_calls.append(dict(payload))
+                    card.radarr.movies[51] = {**payload, "id": 51, "monitored": True, "tags": [9]}
+                    if conflict:
+                        card.radarr.movies[52] = {**card.radarr.movies[51], "id": 52, "tmdbId": 999999}
+                    tmdb_read.reset_mock()
+                    imdb_read.reset_mock()
+                    return httpx.Response(400, json=[{"errorCode": "MovieExistsValidator"}])
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(concurrent_add)) as http:
+                    wire = RadarrClient(base_url="http://radarr.invalid", api_key="test", http_client=http)
+                    with (
+                        patch.object(card.radarr, "add_movie", side_effect=wire.add_movie),
+                        patch.object(card.radarr, "get_movies_by_tmdb", wraps=card.radarr.get_movies_by_tmdb) as tmdb_read,
+                        patch.object(card.radarr, "get_movies_by_imdb", wraps=card.radarr.get_movies_by_imdb) as imdb_read,
+                    ):
+                        result = await card.post()
+                        tmdb_read.assert_awaited_with(550101)
+                        imdb_read.assert_awaited_with("tt5501010")
+                self.assertEqual(len(card.radarr.add_calls), 1)
+                if conflict:
+                    self.assertEqual(result.status_code, 409)
+                    self.assertEqual(card.radarr.update_calls, [])
+                    self.assertEqual(card.feedback.calls, [])
+                else:
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(card.radarr.movies[51]["tags"], [9])
+                    self.assertIs(card.radarr.movies[51]["monitored"], False)
+                    self.assertEqual(
+                        card.radarr.update_calls, [{"movie_id": 51, "payload": {"monitored": False, "editor_only": True}}]
+                    )
+                    self.assertEqual(card.radarr.readback_calls, 1)
+                    self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_skip_lost_add_ack_reconciles_applied_state_or_expires_when_absent(self) -> None:
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                card = await self._open_skip_card()
+                def lost_ack(request: httpx.Request) -> httpx.Response:
+                    payload = json.loads(request.content)
+                    card.radarr.add_calls.append(payload)
+                    if landed:
+                        card.radarr.movies[101] = {**payload, "id": 101, "hasFile": False}
+                    raise httpx.ReadTimeout("response timed out", request=request)
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(lost_ack)) as http:
+                    wire = RadarrClient(base_url="http://radarr.invalid", api_key="test", http_client=http)
+                    with patch.object(card.radarr, "add_movie", side_effect=wire.add_movie):
+                        self.assertEqual((await card.post()).status_code, 503)
+                self.assertEqual(card.snapshot().action["status"], "ambiguous_radarr")
+                self.assertEqual(card.feedback.calls, [])
+                card.expire()
+                result = await card.post(reconcile="1")
+                snapshot = card.snapshot()
+                if landed:
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(snapshot.action["status"], "completed_all")
+                    self.assertEqual(snapshot.action["feedback_decision_saved"], "SKIP")
+                    self.assertEqual(card.radarr.readback_calls, 1)
+                    self.assertIn("reconciled_skip_state_verified", [att["outcome_summary"] for att in snapshot.group_attempts])
+                else:
+                    self.assertEqual(result.status_code, 410)
+                    self.assertEqual(snapshot.action["last_error_redacted"], "expired_with_skip_movie_absent")
+                    self.assertEqual(snapshot.action["status"], "expired")
+                    self.assertEqual(card.feedback.calls, [])
+                self.assertEqual(len(card.radarr.add_calls), 1)
+                self.assertEqual(card.radarr.update_calls, [])
+
+    async def test_skip_add_race_lost_update_ack_preserves_preexisting_watched_tag(self) -> None:
+        card = await self._open_skip_card()
+
+        async def concurrent_watched_add(payload: dict[str, Any]) -> RadarrWriteResult:
+            card.radarr.add_calls.append(dict(payload))
+            card.radarr.movies[51] = {**payload, "id": 51, "monitored": True, "tags": [7, 9]}
+            return RadarrWriteResult(outcome="already_exists")
+
+        card.radarr.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+        with patch.object(card.radarr, "add_movie", side_effect=concurrent_watched_add):
+            self.assertGreaterEqual((await card.post()).status_code, 400)
+        self.assertEqual(card.snapshot().action["status"], "ambiguous_radarr")
+        self.assertEqual(card.feedback.calls, [])
+        card.radarr.movies[51]["monitored"] = False
+        # Both indexes temporarily omit the race winner. Its journaled movie ID still resolves.
+        no_matches = RadarrReadResult(ok=True, data=[])
+        with (
+            patch.object(card.radarr, "get_movies_by_tmdb", return_value=no_matches),
+            patch.object(card.radarr, "get_movies_by_imdb", return_value=no_matches),
+        ):
+            self.assertEqual((await card.post(reconcile="1")).status_code, 200)
+        self.assertEqual(card.snapshot().action["status"], "completed_all")
+        self.assertEqual(card.radarr.movies[51]["tags"], [7, 9])
+        self.assertEqual(card.snapshot().action["radarr_movie_id"], 51)
+        self.assertEqual(len(card.radarr.add_calls), 1)
+        self.assertEqual(len(card.radarr.update_calls), 1)
+        self.assertEqual(card.radarr.readback_calls, 1)
+        self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_legacy_skip_confirmation_requires_consent_to_unmonitor_before_writing(self) -> None:
+        card = await self._open_skip_card()
+        with sqlite3.connect(card.db.db_path) as conn:
+            conn.execute("UPDATE actions SET bound_snapshot_json = NULL WHERE token_sha256 = ?", (hash_token(card.tokens["skip"]),))
+        refreshed = await card.post()
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertIn("Confirm Skip (Add Unmonitored)", refreshed.text)
+        self.assertIn('name="skip_unmonitor" value="1"', refreshed.text)
+        self.assertEqual(card.snapshot().action["status"], "active")
+        self.assertEqual(card.radarr.add_calls, [])
+        self.assertEqual(card.radarr.update_calls, [])
+        self.assertEqual(card.feedback.calls, [])
+        self.assertEqual((await card.post(skip_unmonitor="1")).status_code, 200)
+        self.assertIs(card.radarr.movies[101]["monitored"], False)
+        self.assertEqual(len(card.radarr.add_calls), 1)
+        self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+
+    async def test_legacy_skip_completion_and_unsealed_feedback_only_form_never_initiate_a_write(self) -> None:
+        card = await self._open_skip_card()
+        with sqlite3.connect(card.db.db_path) as conn:
+            conn.execute(
+                """UPDATE actions SET status='completed_all', feedback_status='saved', feedback_decision_saved='SKIP'
+                     WHERE token_sha256 = ?""",
+                (hash_token(card.tokens["skip"]),),
+            )
+        for result in (await card.client.get(card.url()), await card.post()):
+            self.assertEqual(result.status_code, 200)
+            self.assertIn("SKIP", result.text)
+            self.assertNotIn("unmonitored", result.text.lower())
+        self.assertEqual(card.radarr.add_calls, [])
+        self.assertEqual(card.feedback.calls, [])
+
+        active = await self._open_skip_card()
+        with sqlite3.connect(active.db.db_path) as conn:
+            conn.execute(
+                "UPDATE actions SET feedback_status='failed' WHERE token_sha256 = ?", (hash_token(active.tokens["skip"]),)
+            )
+        self.assertEqual((await active.post(retry_feedback_only="1")).status_code, 409)
+        active.expire()
+        self.assertEqual((await active.client.get(active.url())).status_code, 410)
+        self.assertEqual((await active.post()).status_code, 410)
+        self.assertEqual(active.radarr.add_calls, [])
+        self.assertEqual(active.feedback.calls, [])
+
+    async def test_skip_feedback_retry_remains_sealed_after_token_expiry(self) -> None:
+        card = await self._open_skip_card(monitored=True)
+        card.feedback.outcome_queue.append(FeedbackPostResult(saved=False, error_redacted="feedback_http_502"))
+        first = await card.post()
+        self.assertEqual(first.status_code, 200)
+        self.assertIn("Retry Evaluator Feedback Only", first.text)
+        self.assertEqual(card.snapshot().action["status"], "completed_radarr")
+        self.assertEqual(card.snapshot().action["feedback_status"], "failed")
+        card.expire()
+        card.radarr.fail_reads = True
+        self.assertIn("Retry Evaluator Feedback Only", (await card.client.get(card.url())).text)
+        self.assertEqual((await card.post(retry_feedback_only="1")).status_code, 200)
+        self.assertEqual(card.snapshot().action["status"], "completed_all")
+        self.assertEqual(card.snapshot().action["feedback_decision_saved"], "SKIP")
+        self.assertEqual((await card.post()).status_code, 200)
+        self.assertEqual(len(card.feedback.calls), 2)
+        self.assertEqual(len(card.radarr.update_calls), 1)
+        self.assertEqual(card.radarr.readback_calls, 1)
+        self.assertEqual(card.radarr.add_calls, [])
+
+    async def test_sibling_skip_blocks_both_grabs_from_attempt_through_completion(self) -> None:
+        for grab in ("add_grab", "alternative_grab"):
+            with self.subTest(grab=grab):
+                card = await self._open_skip_card(monitored=True, alternative=(grab == "alternative_grab"))
+                self.assertEqual((await card.client.get(card.url(grab))).status_code, 200)
+
+                async def assert_blocked(status: str) -> None:
+                    self.assertEqual(card.snapshot().action["status"], status)
+                    for result in (await card.client.get(card.url(grab)), await card.post(grab)):
+                        self.assertEqual(result.status_code, 409)
+                        self.assertIn("skip", result.text.lower())
+                    self.assertEqual(card.radarr.push_calls, [])
+                    self.assertEqual(card.qbit.add_calls, [])
+
+                started, resume = asyncio.Event(), asyncio.Event()
+                card.radarr.update_started_event = started
+                card.radarr.delay_update_event = resume
+                card.radarr.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                skip_request = asyncio.create_task(card.post())
+                try:
+                    await asyncio.wait_for(started.wait(), 5)
+                    await assert_blocked("attempting")
+                finally:
+                    resume.set()
+                    initial = await asyncio.wait_for(skip_request, 5)
+                self.assertEqual(initial.status_code, 503)
+                await assert_blocked("ambiguous_radarr")
+                card.radarr.movies[51]["monitored"] = False
+                card.feedback.outcome_queue.append(FeedbackPostResult(saved=False))
+                self.assertEqual((await card.post(reconcile="1")).status_code, 200)
+                card.radarr.movies[51]["monitored"] = True  # Otherwise the live unmonitored movie also blocks grabs.
+                await assert_blocked("completed_radarr")
+                self.assertEqual((await card.post(retry_feedback_only="1")).status_code, 200)
+                await assert_blocked("completed_all")
 
     async def test_mandatory_case_5f_process_kill_startup_recovery_and_reconciliation(self) -> None:
         """Mandatory Shadow Case 5f: hard-kill after committing attempting/sending -> startup recovery -> reconcile with 0 duplicate writes."""
@@ -2958,6 +3389,17 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(radarr.add_calls), 0)
                     self.assertEqual(len(radarr.push_calls), 0)
 
+                    radarr.movies[92]["tags"] = []
+                    for response in (
+                        await client.get(f"/action/{toks_d2['add_grab']}"),
+                        await client.post(f"/action/{toks_d2['add_grab']}", data={"confirm": "1"}),
+                    ):
+                        self.assertEqual(response.status_code, 409)
+                        self.assertIn("unmonitored", response.text.lower())
+                    self.assertEqual(radarr.add_calls, [])
+                    self.assertEqual(radarr.update_calls, [])
+                    self.assertEqual(len(radarr.push_calls), 0)
+
                     # 2b) Movie now owns a file (hasFile=True, monitored=True) -> POST MUST refuse 409!
                     radarr.movies[92].update({"monitored": True, "hasFile": True, "tags": []})
                     r_post_owned = await client.post(
@@ -3563,7 +4005,7 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         row["movieFileId"] = 111
                         radarr.movies[101] = row
                         out["grab_http"] = (await _post("add_grab")).status_code
-                    elif mode == "watched_during_push":
+                    elif mode in ("watched_during_push", "skip_during_push"):
                         # Reverse direction: Add & Grab already in radarr_release_push -> Watched MUST be blocked (409)
                         radarr.movies[101] = row
                         entered, resume = asyncio.Event(), asyncio.Event()
@@ -3578,7 +4020,8 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         grab_task = asyncio.create_task(_post("add_grab"))
                         try:
                             await asyncio.wait_for(entered.wait(), 5)
-                            out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                            button = "skip" if mode == "skip_during_push" else "watched_bad"
+                            out["sibling_http"] = (await asyncio.wait_for(_post(button), 5)).status_code
                         finally:
                             resume.set()
                             out["grab_http"] = (await asyncio.wait_for(grab_task, 5)).status_code
@@ -3596,8 +4039,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         grab_task = asyncio.create_task(_post("add_grab"))
                         try:
                             await asyncio.wait_for(entered.wait(), 5)
-                            if mode == "watched_during_grab":
-                                out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                            if mode in ("watched_during_grab", "skip_during_grab"):
+                                button = "skip" if mode == "skip_during_grab" else "watched_bad"
+                                out["sibling_http"] = (await asyncio.wait_for(_post(button), 5)).status_code
+                                if mode == "skip_during_grab":
+                                    # Isolate the sibling guard even if the movie is externally re-monitored.
+                                    radarr.movies[101]["monitored"] = True
                             else:
                                 ret_r = await asyncio.wait_for(
                                     client.post(
@@ -3625,11 +4072,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r1["push_attempts"], 0)
         self.assertEqual(r1["feedback"], [])
 
-        r2 = await _run_scenario("watched_during_grab")
-        self.assertEqual(r2["watched_http"], 200)
-        self.assertEqual(r2["grab_http"], 409)
-        self.assertEqual(r2["push_attempts"], 0)
-        self.assertEqual(r2["feedback"], ["skip"])
+        for mode in ("watched_during_grab", "skip_during_grab"):
+            r2 = await _run_scenario(mode)
+            self.assertEqual(r2["sibling_http"], 200)
+            self.assertEqual(r2["grab_http"], 409)
+            self.assertEqual(r2["push_attempts"], 0)
+            self.assertEqual(r2["feedback"], ["skip"])
 
         r3 = await _run_scenario("retired_during_grab")
         self.assertEqual(r3["retirement_http"], 200)
@@ -3652,11 +4100,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r5["feedback"], [])
 
         # Reverse direction: watched_bad blocked with 409 while radarr_release_push is active
-        r6 = await _run_scenario("watched_during_push")
-        self.assertEqual(r6["watched_http"], 409)
-        self.assertEqual(r6["grab_http"], 200)
-        self.assertEqual(r6["push_attempts"], 1)
-        self.assertEqual(r6["feedback"], ["watch"])
+        for mode in ("watched_during_push", "skip_during_push"):
+            r6 = await _run_scenario(mode)
+            self.assertEqual(r6["sibling_http"], 409)
+            self.assertEqual(r6["grab_http"], 200)
+            self.assertEqual(r6["push_attempts"], 1)
+            self.assertEqual(r6["feedback"], ["watch"])
 
         # Gap 5: SQLite -wal/-shm sidecar vanishing concurrently during lstat or chmod must not crash
         from unittest import mock

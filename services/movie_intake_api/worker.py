@@ -369,8 +369,8 @@ class IntakeWorker:
         Returns (mode, suppression_reason, radarr_note) where mode is one of:
           suppress | actionable_grab | alternative_grab | evidence_review
         """
-        if radarr.status == "watched_unmonitored":
-            return "suppress", "watched_unmonitored", None
+        if radarr.status in ("watched_unmonitored", "unmonitored_no_file"):
+            return "suppress", radarr.status, None
         if radarr.status == "owned_file":
             if (
                 alt_grab_eligible

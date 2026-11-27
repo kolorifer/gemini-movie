@@ -11,7 +11,7 @@ from .security import redact_secrets
 @dataclass(frozen=True)
 class RadarrStatusResponse:
     status: str
-    # absent | watched_unmonitored | owned_file | monitored_no_file | ambiguous | lookup_failed
+    # absent | watched_unmonitored | owned_file | monitored_no_file | unmonitored_no_file | ambiguous | lookup_failed
     movie_id: Optional[int] = None
     file_id: Optional[int] = None
     existing_quality: Optional[str] = None
@@ -231,6 +231,7 @@ class ActionsApiClient:
                 "watched_unmonitored",
                 "owned_file",
                 "monitored_no_file",
+                "unmonitored_no_file",
                 "ambiguous",
                 "lookup_failed",
             ):
