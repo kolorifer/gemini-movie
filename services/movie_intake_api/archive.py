@@ -14,6 +14,7 @@ from .security import (
     PrivateFileError,
     atomic_write_private_file,
     ensure_private_dir,
+    fsync_directory,
     read_owner_private_regular_file,
 )
 
@@ -59,6 +60,9 @@ class ArchiveReceipt:
 def verify_archive_root(archive_dir: Path) -> bool:
     try:
         ensure_private_dir(archive_dir)
+        if archive_dir.parent.exists():
+            fsync_directory(archive_dir.parent)
+        fsync_directory(archive_dir)
         return True
     except (PrivateFileError, OSError):
         return False
@@ -88,10 +92,14 @@ def archive_raw_webhook(
 
     try:
         ensure_private_dir(archive_dir)
+        if archive_dir.parent.exists():
+            fsync_directory(archive_dir.parent)
         cur = archive_dir
         for part in (year_part, month_part, day_part):
+            parent_dir = cur
             cur = cur / part
             ensure_private_dir(cur)
+            fsync_directory(parent_dir)
         target = cur / filename
         atomic_write_private_file(target, raw_bytes)
     except Exception as exc:

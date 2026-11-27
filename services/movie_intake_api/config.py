@@ -38,6 +38,30 @@ def _validate_absolute_path_override(env_name: str, raw: Optional[str], default:
     return Path(cleaned)
 
 
+def _parse_filter_names(raw: Optional[str]) -> tuple[str, ...]:
+    if raw is None or not raw.strip():
+        return ("Movies Remux",)
+    names = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not names:
+        raise ValueError("MOVIE_INTEL_ALLOWED_FILTERS cannot be empty when configured")
+    return names
+
+
+def _parse_filter_ids(raw: Optional[str]) -> tuple[int, ...]:
+    if raw is None or not raw.strip():
+        return ()
+    ids: list[int] = []
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        val = int(cleaned)
+        if val < 1:
+            raise ValueError(f"MOVIE_INTEL_ALLOWED_FILTER_IDS entries must be positive integers, got {cleaned!r}")
+        ids.append(val)
+    return tuple(ids)
+
+
 @dataclass(frozen=True)
 class IntakeConfig:
     host: str
@@ -58,6 +82,8 @@ class IntakeConfig:
     tl_min_interval_seconds: float = 1.5
     retry_backoff_seconds: float = 30.0
     max_webhook_body_bytes: int = MAX_WEBHOOK_BODY_BYTES
+    allowed_filter_names: tuple[str, ...] = ("Movies Remux",)
+    allowed_filter_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "IntakeConfig":
@@ -126,4 +152,6 @@ class IntakeConfig:
             retry_backoff_seconds=max(
                 0.0, float((source.get("RETRY_BACKOFF_SECONDS") or "30.0").strip())
             ),
+            allowed_filter_names=_parse_filter_names(source.get("MOVIE_INTEL_ALLOWED_FILTERS")),
+            allowed_filter_ids=_parse_filter_ids(source.get("MOVIE_INTEL_ALLOWED_FILTER_IDS")),
         )

@@ -62,27 +62,35 @@ def _make_autobrr_movie_webhook(
     meta_tmdb: Optional[int] = None,
     size: int = 68_500_000_000,
     freeleech: Optional[bool] = False,
-    action_rejected: bool = False,
+    action_rejected: bool = True,
     action_type: Optional[str] = "RADARR",
     rejections: Optional[list[str]] = None,
     download_url: Optional[str] = None,
-    event: str = "PUSH_APPROVED",
+    event: str = "action.rejected",
+    filter_name: Optional[str] = "Movies Remux",
+    filter_id: Optional[int] = 7,
+    resolution: Optional[str] = None,
+    source: Optional[str] = None,
+    media_processing: Optional[str] = "REMUX",
 ) -> dict[str, Any]:
     effective_dl_url = (
         download_url
         if download_url is not None
         else f"https://www.torrentleech.org/rss/download/{external_id}/SUPER_SECRET_PASSKEY_VALUE/{release_name}.torrent"
     )
+    inferred_res = "2160p" if "2160p" in release_name else "1080p"
+    effective_res = inferred_res if resolution is None else resolution
+    effective_src = ("UHD BluRay" if effective_res == "2160p" else "BluRay") if source is None else source
     rel: dict[str, Any] = {
         "name": release_name,
         "type": release_type,
         "category": category,
         "external_id": external_id,
         "size": size,
-        "resolution": "2160p" if "2160p" in release_name else "1080p",
-        "source": "UHD.BluRay",
+        "resolution": effective_res,
+        "source": effective_src,
         "hdr": ["DV", "HDR10"] if "DV" in release_name else [],
-        "media_processing": "REMUX",
+        "media_processing": media_processing,
         "group": "CiNEPHiLES" if "CiNEPHiLES" in release_name else "FraMeSToR",
         "download_url": effective_dl_url,
         "protocol": "torrent",
@@ -103,14 +111,32 @@ def _make_autobrr_movie_webhook(
     if action_type is not None:
         action_obj["type"] = action_type
 
+    effective_rejections = (
+        list(rejections)
+        if rejections is not None
+        else (["Unknown Movie"] if action_rejected else [])
+    )
+    result_obj: dict[str, Any] = {"rejections": effective_rejections}
+    if action_rejected:
+        result_obj["status"] = "PUSH_REJECTED"
+
+    data_obj: dict[str, Any] = {
+        "indexer": indexer,
+        "action": action_obj,
+        "result": result_obj,
+        "release": rel,
+    }
+    if filter_name is not None or filter_id is not None:
+        filter_obj: dict[str, Any] = {}
+        if filter_name is not None:
+            filter_obj["name"] = filter_name
+        if filter_id is not None:
+            filter_obj["id"] = filter_id
+        data_obj["filter"] = filter_obj
+
     return {
         "event": event,
-        "action": action_obj,
-        "data": {
-            "indexer": indexer,
-            "result": {"rejections": rejections or []},
-            "release": rel,
-        },
+        "data": data_obj,
     }
 
 
@@ -1267,12 +1293,12 @@ Language : German
                 self.assertEqual(db.get_release(r_unmon.json()["release_id"])["suppression_reason"], "already_owned")  # type: ignore[index]
                 self.assertEqual(len(actions.card_calls), cards_before_unmon)
 
-                # Routine disallowed quality rejection -> suppressed early (0 TL calls, 0 cards)
+                # Routine disallowed quality rejection on eligible BD REMUX -> suppressed early (0 TL calls, 0 cards)
                 tl_before = len(tl.calls)
                 r_qrej = client.post(
                     "/webhook/test-webhook-secret",
                     json=_make_autobrr_movie_webhook(
-                        release_name="Library.Film.2024.1080p.WEB-DL-GRP",
+                        release_name="Library.Film.2024.1080p.BluRay.REMUX-GRP",
                         external_id="4005",
                         title="Library Film",
                         year=2024,
@@ -3223,7 +3249,7 @@ Language : German
             ),
             # Release name > 512 chars
             _make_autobrr_movie_webhook(
-                release_name="Example.Film.2024." + ("A" * 510) + ".2160p.REMUX-GRP",
+                release_name="Example.Film.2024." + ("A" * 510) + ".2160p.UHD.BluRay.REMUX-GRP",
                 external_id="77010",
                 action_rejected=True,
                 rejections=["Existing file meets cutoff: Remux-1080p"],
@@ -3314,17 +3340,17 @@ Language : German
 
     def test_live_autobrr_release_new_then_action_rejected_shapes_and_eval_reuse(self) -> None:
         """
-        OPS-REPORT #6 regressions:
-          1) Live autobrr emits event='action.rejected' with nested data.action.type='RADARR'
-             and data.result.status='PUSH_REJECTED' (no top-level 'action' object).
-          2) release.new -> action.rejected ('Unknown Movie...') produces 1 card (rev 1) + 1 eval
-             both when Occ 2 arrives mid-flight and when Occ 2 arrives after completion.
-          3) release.new (owned -> suppressed) -> action.rejected (4-form quality cutoff)
-             upgrades cleanly to 1 Alternative Grab card + 1 eval.
-          4) Radarr action change (actionable_grab -> alternative_grab) with unchanged movie
-             evidence edits card to rev 2 with preserve_eval_reply=True and reuses the single eval reply.
-          5) Unresolved path (evidence_review) release.new -> action.rejected also avoids a 2nd eval.
-          6) Pre-migration intake.db cleanly adds last_card_digest / last_eval_reply_digest.
+        Live autobrr shapes & eval reuse regressions (OPS-REPORT #6 + Issue #13 §1):
+          1) Global `release.new` archives unchanged as `non_movie_archive_only` (0 TL/eval/cards).
+          2) Qualifying `action.rejected` (`data.action.type='RADARR'`, `data.filter.name='Movies Remux'`,
+             `data.result.status='PUSH_REJECTED'`) admits eligible 1080p/2160p BD REMUX releases;
+             mid-flight follow-up `action.rejected` produces 1 card (rev 1) + 1 eval (complete no-op on pass 2).
+          3) `release.new` (archived only) -> `action.rejected` (4-form quality cutoff on owned file)
+             produces 1 Alternative Grab card + 1 eval and archives both original payloads.
+          4) Radarr action change (`actionable_grab` -> `alternative_grab`) with unchanged movie
+             evidence edits card to rev 2 with `preserve_eval_reply=True` and reuses the single eval reply.
+          5) Unresolved path (`evidence_review`) follow-up `action.rejected` also avoids a 2nd eval.
+          6) Pre-migration intake.db cleanly adds `last_card_digest` / `last_eval_reply_digest`.
         """
         import sqlite3
 
@@ -3370,6 +3396,7 @@ Language : German
             *,
             rejections: list[str],
             action_type: str = "RADARR",
+            filter_name: str = "Movies Remux",
             evt_id: str = "evt-rej-1",
         ) -> dict[str, Any]:
             return {
@@ -3379,7 +3406,7 @@ Language : German
                 "data": {
                     "indexer": "TorrentLeech",
                     "action": {"name": "Radarr 4K", "type": action_type},
-                    "filter": {"id": 7, "name": "Movies 4K"},
+                    "filter": {"id": 7, "name": filter_name},
                     "release": dict(rel_obj),
                     "result": {
                         "status": "PUSH_REJECTED",
@@ -3393,11 +3420,11 @@ Language : German
             name=elio_name, external_id="241889121", title="Elio", year=2025, meta_imdb="tt4919268"
         )
 
-        # 1) Live autobrr rejection classification without top-level `action` object
+        # 1) Global `release.new` ends at archiving; qualifying Radarr `action.rejected` enters movie lane
         cw_new = classify_webhook_payload(_live_release_new(elio_rel))
+        self.assertEqual(cw_new.classification, "non_movie_archive_only")
         self.assertFalse(cw_new.action_rejected)
-        self.assertTrue(cw_new.action_is_radarr)
-        self.assertEqual(classify_rejection_reasons(cw_new), ("not_rejected", None))
+        self.assertFalse(cw_new.action_is_radarr)
 
         cw_unknown = classify_webhook_payload(
             _live_action_rejected(
@@ -3405,6 +3432,7 @@ Language : German
                 rejections=["Unknown Movie. Unable to match to existing movie in Library using release title."],
             )
         )
+        self.assertEqual(cw_unknown.classification, "movie_candidate")
         self.assertTrue(cw_unknown.action_rejected)
         self.assertTrue(cw_unknown.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_unknown), ("needs_identity_and_radarr_check", None))
@@ -3412,6 +3440,7 @@ Language : German
         cw_cutoff = classify_webhook_payload(
             _live_action_rejected(elio_rel, rejections=["Existing file meets cutoff: Remux-2160p"])
         )
+        self.assertEqual(cw_cutoff.classification, "movie_candidate")
         self.assertTrue(cw_cutoff.action_rejected)
         self.assertTrue(cw_cutoff.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_cutoff), ("legacy_alt_grab_eligible", "cutoff_met"))
@@ -3423,6 +3452,7 @@ Language : German
                 rejections=["Existing file meets cutoff: Remux-2160p"],
             )
         )
+        self.assertEqual(cw_non_radarr.classification, "non_movie_archive_only")
         self.assertTrue(cw_non_radarr.action_rejected)
         self.assertFalse(cw_non_radarr.action_is_radarr)
         self.assertEqual(classify_rejection_reasons(cw_non_radarr), ("quality_rejected_suppress", "cutoff_met"))
@@ -3430,6 +3460,7 @@ Language : German
         cw_unwanted = classify_webhook_payload(
             _live_action_rejected(elio_rel, rejections=["Quality is not wanted in profile"])
         )
+        self.assertEqual(cw_unwanted.classification, "movie_candidate")
         self.assertTrue(cw_unwanted.action_rejected)
         self.assertEqual(classify_rejection_reasons(cw_unwanted), ("quality_rejected_suppress", "quality_unwanted"))
 
@@ -3536,13 +3567,26 @@ Language : German
             )
 
             with TestClient(app) as client:
-                # 2) Exact Elio live regression: Occ 2 arrives MID-FLIGHT while Pass 1 is evaluating,
-                #    then a 3rd identical action.rejected / post-completion follow-up arrives.
-                r1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(elio_rel))
+                # 2) Global `release.new` archives cleanly (0 work), then qualifying `action.rejected` starts Pass 1,
+                #    and a mid-flight follow-up `action.rejected` with revised rejection text triggers Pass 2 no-op.
+                r0_new = client.post("/webhook/test-webhook-secret", json=_live_release_new(elio_rel))
+                self.assertEqual(r0_new.status_code, 200)
+                self.assertEqual(r0_new.json()["status"], "archived_non_movie")
+                self.assertIsNone(r0_new.json()["release_id"])
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(tl.calls), 0)
+                self.assertEqual(len(triage.calls), 0)
+                self.assertEqual(len(actions.card_calls), 0)
+
+                r1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(elio_rel, rejections=["Unknown Movie"], evt_id="evt-e1"),
+                )
                 self.assertEqual(r1.status_code, 200)
                 rel_elio = r1.json()["release_id"]
+                self.assertIsNotNone(rel_elio)
 
-                # Simulate Occ 2 (action.rejected "Unknown Movie...") arriving while Pass 1 is in /evaluate!
+                # Simulate Occ 2 (updated action.rejected wording) arriving while Pass 1 is in /evaluate!
                 def _post_midflight_reject() -> None:
                     r_mid = client.post(
                         "/webhook/test-webhook-secret",
@@ -3551,6 +3595,7 @@ Language : German
                             rejections=[
                                 "Unknown Movie. Unable to match to existing movie in Library using release title."
                             ],
+                            evt_id="evt-e2",
                         ),
                     )
                     self.assertEqual(r_mid.status_code, 200)
@@ -3581,7 +3626,7 @@ Language : German
                 self.assertEqual(len([e for e in actions.eval_reply_calls if e["release_id"] == rel_elio]), 1)
                 self.assertEqual(len(triage.calls), 1)
 
-                # 3) Live release.new (owned -> suppressed) -> action.rejected (4-form cutoff) -> 1 alt-grab card + 1 eval
+                # 3) Live `release.new` (archived only) -> `action.rejected` (4-form quality cutoff on owned file) -> 1 alt-grab card + 1 eval
                 radarr_state["status"] = RadarrStatusResponse(
                     status="owned_file",
                     movie_id=501,
@@ -3595,14 +3640,9 @@ Language : German
                     name=elio_name, external_id="241889122", title="Elio", year=2025, meta_imdb="tt4919268"
                 )
                 r_alt1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(alt_rel, evt_id="evt-a1"))
-                rel_alt = r_alt1.json()["release_id"]
-                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
-                sup_row = db.get_release(rel_alt)
-                assert sup_row is not None
-                self.assertEqual(sup_row["state"], "suppressed")
-                self.assertEqual(sup_row["suppression_reason"], "already_owned")
-                self.assertEqual(sup_row["card_revision"], 0)
-                self.assertEqual(len([c for c in actions.card_calls if c["release_id"] == rel_alt]), 0)
+                self.assertEqual(r_alt1.json()["status"], "archived_non_movie")
+                self.assertIsNone(r_alt1.json()["release_id"])
+                self.assertFalse(asyncio.run(app.state.worker.process_next_queued()))
 
                 r_alt2 = client.post(
                     "/webhook/test-webhook-secret",
@@ -3612,7 +3652,8 @@ Language : German
                         evt_id="evt-a2",
                     ),
                 )
-                self.assertEqual(r_alt2.json()["status"], "updated_correction")
+                self.assertEqual(r_alt2.json()["status"], "accepted")
+                rel_alt = r_alt2.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 alt_done = db.get_release(rel_alt)
                 assert alt_done is not None
@@ -3633,7 +3674,10 @@ Language : German
                 trans_rel = _live_release_obj(
                     name=elio_name, external_id="241889123", title="Elio", year=2025, meta_imdb="tt4919268"
                 )
-                r_tr1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(trans_rel, evt_id="evt-t1"))
+                r_tr1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(trans_rel, rejections=["Unknown Movie"], evt_id="evt-t1"),
+                )
                 rel_trans = r_tr1.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 self.assertEqual(len(triage.calls), triage_before_case4 + 1)
@@ -3675,7 +3719,7 @@ Language : German
                 self.assertEqual(len(triage.calls), triage_before_case4 + 1)
                 self.assertEqual(len(trans_replies), 1)
 
-                # 5) Unresolved path (evidence_review) release.new -> action.rejected ("Unknown Movie...") -> 1 card + 1 eval
+                # 5) Unresolved path (evidence_review) follow-up action.rejected -> 1 card + 1 eval
                 triage_before_case5 = len(triage.calls)
                 unres_rel = _live_release_obj(
                     name="Mystery.Unidentified.2025.2160p.UHD.BluRay.REMUX-TRiToN",
@@ -3684,7 +3728,10 @@ Language : German
                     year=2025,
                     meta_imdb=None,
                 )
-                r_u1 = client.post("/webhook/test-webhook-secret", json=_live_release_new(unres_rel, evt_id="evt-u1"))
+                r_u1 = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_live_action_rejected(unres_rel, rejections=["Unknown Movie"], evt_id="evt-u1"),
+                )
                 rel_unres = r_u1.json()["release_id"]
                 self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
                 self.assertEqual(len(triage.calls), triage_before_case5 + 1)
@@ -3781,6 +3828,2619 @@ Language : German
             assert mig_row is not None
             self.assertIsNone(mig_row["last_card_digest"])
             self.assertEqual(mig_row["last_eval_reply_digest"], "full-dig-1")
+
+    def test_issue_13_3c_same_year_sequel_and_3b_intake_contradiction(self) -> None:
+        """
+        Issue #13 §3c & §3b regressions:
+          - Invented release 'North Crossing' (2021) with no listing IMDb ID MUST NOT pass Intake's
+            identity gate for 'North Crossing II' (2021); must land in evidence_review with 0 buttons.
+          - Sequel/part/numeral variants ('II', '2', 'Part 2', 'Chapter 2', 'III') never falsely match.
+          - Independently supported TMDB alias overrides cleanly.
+          - Downstream _eval_contradicts_movie catches title, year, director, model_identification,
+            and catalogue_identification conflicts (not just IDs).
+        """
+        from services.movie_intake_api.tmdb_verifier import _titles_match
+        from services.movie_intake_api.worker import _eval_contradicts_movie
+
+        # Unit matrix for sequel/part/numeral separation
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing II"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing 2"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing Part 2"]))
+        self.assertFalse(_titles_match("North Crossing", ["North Crossing Chapter 2"]))
+        self.assertFalse(_titles_match("North Crossing II", ["North Crossing III"]))
+        self.assertFalse(_titles_match("North Crossing Part 1", ["North Crossing Part 2"]))
+        # Equivalent numeral notations and explicit TMDB alias match
+        self.assertTrue(_titles_match("North Crossing 2", ["North Crossing II"]))
+        self.assertTrue(_titles_match("North Crossing Part Two", ["North Crossing Part 2"]))
+        self.assertTrue(_titles_match("North Crossing", ["North Crossing II", "North Crossing"]))
+
+        # End-to-end Intake pipeline: North Crossing (2021) without listing IMDb -> evaluator proposes North Crossing II (2021)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            sequel = TmdbMovieRecord(
+                tmdb_id=8820212,
+                title="North Crossing II",
+                original_title="North Crossing II",
+                year=2021,
+                imdb_id="tt8820212",
+                runtime_minutes=115,
+                director="Elena Rostova",
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {sequel.tmdb_id: sequel}, {sequel.imdb_id: [sequel.tmdb_id]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda _ext, _n: TorrentLeechResult(
+                    outcome="listing_id_missing",
+                    imdb_id=None,
+                    file_runtime_minutes=115,
+                    audio_languages=("English",),
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _body: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="North Crossing II",
+                        year=2021,
+                        imdb_id="tt8820212",
+                        tmdb_id=8820212,
+                        confidence="high",
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                r = client.post(
+                    "/webhook/test-webhook-secret",
+                    json=_make_autobrr_movie_webhook(
+                        release_name="North.Crossing.2021.2160p.UHD.BluRay.REMUX-GROUP",
+                        external_id="882021",
+                        title="North Crossing",
+                        year=2021,
+                        meta_imdb=None,
+                        meta_tmdb=None,
+                    ),
+                )
+                self.assertEqual(r.status_code, 200)
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(len(actions.card_calls), 1)
+                card = actions.card_calls[0]
+                self.assertEqual(card["delivery_kind"], "evidence_review")
+                self.assertEqual(card["identity_gate_status"], "evidence_review")
+                self.assertNotIn("verified_tmdb_id", card)
+                self.assertIn("does not match", str(card.get("conflict_reason") or "").lower())
+
+        # §3b downstream _eval_contradicts_movie checks beyond IDs
+        verified_film = TmdbMovieRecord(
+            tmdb_id=50202,
+            title="Silent Valley",
+            original_title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            runtime_minutes=104,
+            director="David Kowalski",
+        )
+        # Same IDs substituted onto wrong title/director -> MUST contradict!
+        swapped_eval = _make_eval_payload(
+            title="Paper Harbor",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        swapped_eval["identification"]["director"] = "David Mercer"
+        contradiction = _eval_contradicts_movie(swapped_eval, verified_film)
+        self.assertIsNotNone(contradiction)
+
+        # Same title/IDs but director shares only first name -> MUST contradict!
+        dir_mismatch_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        dir_mismatch_eval["identification"]["director"] = "David Mercer"
+        self.assertIsNotNone(_eval_contradicts_movie(dir_mismatch_eval, verified_film))
+
+        # Explicit catalogue_identification.compatible == False -> MUST contradict!
+        cat_conflict_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        cat_conflict_eval["identification"]["director"] = "David Kowalski"
+        cat_conflict_eval["catalogue_identification"] = {
+            "source": "tmdb",
+            "canonical_title": "Silent Valley",
+            "tmdb_id": 50202,
+            "compatible": False,
+            "conflict_reason": "contradictory TMDB IDs",
+        }
+        self.assertIsNotNone(_eval_contradicts_movie(cat_conflict_eval, verified_film))
+
+        # Agreeing title, year, director, and IDs -> None (no contradiction)
+        agree_eval = _make_eval_payload(
+            title="Silent Valley",
+            year=2024,
+            imdb_id="tt5020200",
+            tmdb_id=50202,
+        )
+        agree_eval["identification"]["director"] = "David Kowalski"
+        self.assertIsNone(_eval_contradicts_movie(agree_eval, verified_film))
+
+    def test_issue_13_2a_late_quality_rejection_and_radarr_suppression_retire_delivered_card(self) -> None:
+        """Issue #13 §2a: Later quality rejection or Radarr suppression edits delivered card to retired."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=770011,
+                title="Harbor Dusk",
+                original_title="Harbor Dusk",
+                year=2025,
+                imdb_id="tt7700110",
+                runtime_minutes=118,
+                poster_path="/harbor_dusk.jpg",
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {770011: movie}, {"tt7700110": [770011]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt7700110",
+                    file_runtime_minutes=118,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Harbor Dusk",
+                        year=2025,
+                        imdb_id="tt7700110",
+                        tmdb_id=770011,
+                    ),
+                )
+            )
+            radarr_state = {"status": "absent"}
+            actions = StubActionsClient(
+                radarr_handler=lambda *_: RadarrStatusResponse(status=radarr_state["status"])
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+
+            rel_name = "Harbor.Dusk.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+            base_payload = _make_autobrr_movie_webhook(
+                external_id="770011",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                meta_imdb="tt7700110",
+                rejections=["Unknown Movie"],
+            )
+            late_quality_payload = _make_autobrr_movie_webhook(
+                external_id="770011",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                meta_imdb="tt7700110",
+                rejections=["Quality is not wanted in profile"],
+            )
+
+            with TestClient(app) as client:
+                # 1. Initial proposal delivered with actionable_grab rev 1 + 1 eval reply
+                r1 = client.post(f"/webhook/{cfg.webhook_secret}", json=base_payload)
+                self.assertEqual(r1.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[0]["card_revision"], 1)
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+
+                # 2. Later "Quality is not wanted in profile" MUST retire card (rev 2) with preserve_eval_reply=True
+                r2 = client.post(f"/webhook/{cfg.webhook_secret}", json=late_quality_payload)
+                self.assertEqual(r2.status_code, 200)
+                self.assertEqual(r2.json()["status"], "updated_correction")
+                asyncio.run(app.state.worker.process_next_queued())
+
+                self.assertEqual(len(actions.card_calls), 2)
+                retired_card = actions.card_calls[1]
+                self.assertEqual(retired_card["delivery_kind"], "retired")
+                self.assertEqual(retired_card["card_revision"], 2)
+                self.assertTrue(retired_card.get("preserve_eval_reply"))
+                self.assertIn("Quality is not wanted in profile", str(retired_card.get("radarr_note") or ""))
+                # Existing eval reply is preserved; zero duplicate eval replies sent
+                self.assertEqual(len(actions.eval_reply_calls), 1)
+
+                rel_row = db.get_release(r1.json()["release_id"])
+                assert rel_row is not None
+                self.assertEqual(rel_row["state"], "suppressed")
+                self.assertEqual(rel_row["suppression_reason"], "quality_rejected")
+                self.assertEqual(rel_row["card_revision"], 2)
+
+                # 3. Second release: Radarr transitions to watched_unmonitored before later correction arrives -> retires card
+                rel2_name = "Harbor.Dusk.2025.1080p.BluRay.REMUX.AVC-GROUP2"
+                p2_initial = _make_autobrr_movie_webhook(
+                    external_id="770012",
+                    release_name=rel2_name,
+                    title="Harbor Dusk",
+                    year=2025,
+                    meta_imdb="tt7700110",
+                    category="Movies :: Bluray",
+                    resolution="1080p",
+                    source="BluRay",
+                    rejections=["Unknown Movie"],
+                )
+                r3 = client.post(f"/webhook/{cfg.webhook_secret}", json=p2_initial)
+                self.assertEqual(r3.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "actionable_grab")
+
+                radarr_state["status"] = "watched_unmonitored"
+                p2_followup = _make_autobrr_movie_webhook(
+                    external_id="770012",
+                    release_name=rel2_name,
+                    title="Harbor Dusk",
+                    year=2025,
+                    meta_imdb="tt7700110",
+                    category="Movies :: Bluray",
+                    resolution="1080p",
+                    source="BluRay",
+                    freeleech=True,
+                    rejections=["Unknown Movie"],
+                )
+                r4 = client.post(f"/webhook/{cfg.webhook_secret}", json=p2_followup)
+                self.assertEqual(r4.status_code, 200)
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(actions.card_calls[-1]["delivery_kind"], "retired")
+                self.assertEqual(actions.card_calls[-1]["card_revision"], 2)
+                self.assertTrue(actions.card_calls[-1].get("preserve_eval_reply"))
+                rel2_row = db.get_release(r3.json()["release_id"])
+                assert rel2_row is not None
+                self.assertEqual(rel2_row["state"], "suppressed")
+                self.assertEqual(rel2_row["suppression_reason"], "watched_unmonitored")
+
+    def test_issue_13_4a_replay_of_superseded_evidence_preserves_newer_correction(self) -> None:
+        """Issue #13 §4a: old A -> corrected B -> repeated A archives all 3 and keeps B (queued, posted, restarted)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie_b = TmdbMovieRecord(
+                tmdb_id=880022,
+                title="Winter Signal",
+                original_title="Winter Signal",
+                year=2025,
+                imdb_id="tt8800220",
+                runtime_minutes=110,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {880022: movie_b}, {"tt8800220": [880022]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt8800220",
+                    file_runtime_minutes=110,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="Winter Signal",
+                        year=2025,
+                        imdb_id="tt8800220",
+                        tmdb_id=880022,
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+
+            rel_name = "Winter.Signal.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+            payload_a = _make_autobrr_movie_webhook(
+                external_id="880022",
+                release_name=rel_name,
+                title="Winter Signal",
+                year=2025,
+                meta_imdb="tt1111111",  # old wrong IMDb A
+                rejections=["Unknown Movie"],
+            )
+            payload_b = _make_autobrr_movie_webhook(
+                external_id="880022",
+                release_name=rel_name,
+                title="Winter Signal",
+                year=2025,
+                meta_imdb="tt8800220",  # corrected IMDb B
+                rejections=["Unknown Movie"],
+            )
+
+            app1 = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app1) as client:
+                # 1) While queued: old A -> corrected B -> repeated A
+                r_a1 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a1.status_code, 200)
+                self.assertEqual(r_a1.json()["status"], "accepted")
+                release_id = r_a1.json()["release_id"]
+
+                r_b = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_b)
+                self.assertEqual(r_b.status_code, 200)
+                self.assertEqual(r_b.json()["status"], "updated_correction")
+                self.assertEqual(r_b.json()["release_id"], release_id)
+
+                r_a2 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a2.status_code, 200)
+                self.assertEqual(r_a2.json()["status"], "coalesced_duplicate")
+
+                # All 3 raw archives exist AND queued release still holds corrected B (tt8800220)
+                archives_after_queued = list(cfg.webhook_archive_dir.rglob("*.json"))
+                self.assertEqual(len(archives_after_queued), 3)
+                rel_q = db.get_release(release_id)
+                assert rel_q is not None
+                snap_q = json.loads(str(rel_q["incoming_snapshot_json"]))
+                self.assertEqual(snap_q["meta_imdb"], "tt8800220")
+                self.assertEqual(rel_q["state"], "queued")
+
+                # 2) Worker posts verified card for B, then repeated A arrives again
+                asyncio.run(app1.state.worker.process_next_queued())
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(actions.card_calls[0]["delivery_kind"], "actionable_grab")
+                self.assertEqual(actions.card_calls[0]["verified_imdb_id"], "tt8800220")
+
+                r_a3 = client.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a3.status_code, 200)
+                self.assertEqual(r_a3.json()["status"], "coalesced_duplicate")
+                processed_after_a3 = asyncio.run(app1.state.worker.process_next_queued())
+                self.assertFalse(processed_after_a3)
+                self.assertEqual(len(actions.card_calls), 1)
+                rel_done = db.get_release(release_id)
+                assert rel_done is not None
+                self.assertEqual(rel_done["state"], "completed")
+                self.assertEqual(json.loads(str(rel_done["incoming_snapshot_json"]))["meta_imdb"], "tt8800220")
+
+            # 3) After restart (fresh IntakeDB & app instance on same SQLite DB): repeated A still ignored!
+            db_restarted = IntakeDB(cfg.intake_db_path)
+            db_restarted.init_db()
+            app2 = create_app(
+                cfg,
+                db=db_restarted,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app2) as client2:
+                r_a4 = client2.post(f"/webhook/{cfg.webhook_secret}", json=payload_a)
+                self.assertEqual(r_a4.status_code, 200)
+                self.assertEqual(r_a4.json()["status"], "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), 5)
+                rel_post_restart = db_restarted.get_release(release_id)
+                assert rel_post_restart is not None
+                self.assertEqual(rel_post_restart["state"], "completed")
+                self.assertEqual(
+                    json.loads(str(rel_post_restart["incoming_snapshot_json"]))["meta_imdb"],
+                    "tt8800220",
+                )
+
+    def test_issue_13_4b_malformed_rejections_and_missing_action_type_disable_alternative_grab(self) -> None:
+        """Issue #13 §4b: Missing action type or unreadable/mixed rejection list must disable Alternative Grab."""
+        from services.movie_intake_api.classifier import ClassifiedWebhook
+
+        rel_name = "Harbor.Dusk.2025.2160p.UHD.BluRay.REMUX.HEVC-GROUP"
+        valid_dl = "https://www.torrentleech.org/rss/download/770099/deadbeef0123456789/Harbor.Dusk.2025.torrent"
+
+        # 1) Missing action.type -> never treated as Radarr
+        missing_action_payload = _make_autobrr_movie_webhook(
+            external_id="770099",
+            release_name=rel_name,
+            title="Harbor Dusk",
+            year=2025,
+            download_url=valid_dl,
+            rejections=["Existing file meets cutoff: Remux-2160p"],
+        )
+        missing_action_payload["data"].pop("action", None)
+        cw_missing = classify_webhook_payload(missing_action_payload)
+        self.assertEqual(cw_missing.classification, "non_movie_archive_only")
+        self.assertFalse(cw_missing.action_is_radarr)
+
+        # 2) Mixed rejection lists containing unreadable / non-string / blank items MUST set
+        # has_malformed_rejections=True and disable BOTH legacy_alt_grab_eligible AND quality_rejected_suppress!
+        malformed_cases: list[Any] = [
+            ["Existing file meets cutoff: Remux-2160p", 12345],
+            ["Existing file meets cutoff: Remux-2160p", None],
+            ["Existing file meets cutoff: Remux-2160p", {"nested": "bad"}],
+            ["Existing file meets cutoff: Remux-2160p", "   "],
+            {"unexpected": "dict"},
+            "",
+        ]
+        for bad_rej in malformed_cases:
+            payload = _make_autobrr_movie_webhook(
+                external_id="770099",
+                release_name=rel_name,
+                title="Harbor Dusk",
+                year=2025,
+                download_url=valid_dl,
+                rejections=["Existing file meets cutoff: Remux-2160p"],
+            )
+            payload["data"]["result"]["rejections"] = bad_rej
+            cw = classify_webhook_payload(payload)
+            self.assertEqual(cw.classification, "movie_candidate")
+            self.assertTrue(cw.has_malformed_rejections, f"Expected malformed flag for {bad_rej!r}")
+            self.assertEqual(
+                classify_rejection_reasons(cw),
+                ("needs_identity_and_radarr_check", None),
+                f"Malformed rejection list {bad_rej!r} must disable Alternative Grab & quality suppress",
+            )
+            # Round-trip through sanitized snapshot preserves has_malformed_rejections
+            rt = ClassifiedWebhook.from_sanitized_snapshot(cw.to_sanitized_snapshot(), cw.incoming_evidence_digest)
+            self.assertTrue(rt.has_malformed_rejections)
+            self.assertEqual(classify_rejection_reasons(rt), ("needs_identity_and_radarr_check", None))
+
+    def test_issue_13_5a_6a_6b_privacy_boundaries_worker_log_and_bounded_evaluator_errors(self) -> None:
+        """Issue #13 §5a, §6a, §6b: SQLite snapshot & outbound sanitization, safe worker error logs, card evidence, bounded errors."""
+        import logging
+
+        from services.movie_intake_api.clients import MAX_EVALUATOR_ERROR_CHARS, TriageApiClient
+        from services.movie_intake_api.security import SecretRedactingLogFilter
+        from services.movie_intake_api.worker import build_triage_evaluate_request
+
+        # 1. §5a: Free-form webhook fields with harmless secret markers stay in 0600 raw archive ONLY,
+        # NEVER in SQLite (intake.db / -wal) or outbound /evaluate requests!
+        secret_markers = [
+            "MK_NAME_PASS",
+            "MK_TITLE_KEY",
+            "MK_CAT_TOK",
+            "MK_GRP_COOK",
+            "MK_HDR_URL",
+            "MK_REJ_AIZA",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _make_config(tmpdir)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            movie = TmdbMovieRecord(
+                tmdb_id=765432,
+                title="The Secret Agent",
+                original_title="The Secret Agent",
+                year=2025,
+                imdb_id="tt7654321",
+                runtime_minutes=120,
+            )
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {765432: movie}, {"tt7654321": [765432]})
+            tl = StubTlScraper(
+                db,
+                cfg.tl_cookie_file,
+                lambda *_: TorrentLeechResult(
+                    outcome="listing_id_found",
+                    imdb_id="tt7654321",
+                    file_runtime_minutes=120,
+                ),
+            )
+            triage = StubTriageClient(
+                lambda _: TriageEvalResult(
+                    ok=True,
+                    payload=_make_eval_payload(
+                        title="The Secret Agent",
+                        year=2025,
+                        imdb_id="tt7654321",
+                        tmdb_id=765432,
+                    ),
+                )
+            )
+            actions = StubActionsClient(radarr_handler=lambda *_: RadarrStatusResponse(status="absent"))
+
+            payload = _make_autobrr_movie_webhook(
+                external_id="765432",
+                release_name="The.Secret.Agent.2025.2160p.UHD.BluRay.REMUX.HEVC-GRP passkey=MK_NAME_PASS",
+                title="The Secret Agent api_key=MK_TITLE_KEY",
+                year=2025,
+                category="Movies :: 4K token=MK_CAT_TOK",
+                meta_imdb="tt7654321",
+                rejections=["Unknown Movie AIzaSyMK_REJ_AIZA_123456789012345"],
+            )
+            payload["data"]["release"]["group"] = "GRP cookie=MK_GRP_COOK"
+            payload["data"]["release"]["hdr"] = ["HDR10 https://tracker.invalid/MK_HDR_URL"]
+            raw_bytes = json.dumps(payload).encode("utf-8")
+
+            app = create_app(
+                cfg,
+                db=db,
+                tl_scraper=tl,
+                tmdb_client=tmdb,
+                triage_client=triage,
+                actions_client=actions,
+                start_worker=False,
+            )
+            with TestClient(app) as client:
+                r = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_bytes,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["status"], "accepted")
+
+                # Raw private archive retains exact original bytes
+                archives = list(cfg.webhook_archive_dir.rglob("*.json"))
+                self.assertEqual(len(archives), 1)
+                self.assertEqual(archives[0].read_bytes(), raw_bytes)
+
+                # SQLite database + WAL contain ZERO secret markers!
+                db_blob = cfg.intake_db_path.read_bytes()
+                wal_path = Path(f"{cfg.intake_db_path}-wal")
+                if wal_path.exists():
+                    db_blob += wal_path.read_bytes()
+                for marker in secret_markers:
+                    self.assertNotIn(marker.encode("utf-8"), db_blob, f"Marker {marker} leaked to SQLite!")
+
+                # Process worker & check outbound /evaluate payload AND §6a card evidence fields
+                asyncio.run(app.state.worker.process_next_queued())
+                self.assertEqual(len(triage.calls), 1)
+                eval_serialized = json.dumps(triage.calls[0])
+                for marker in secret_markers:
+                    self.assertNotIn(marker, eval_serialized, f"Marker {marker} leaked to /evaluate payload!")
+                # Title "The Secret Agent" itself was NOT mangled
+                self.assertIn("The Secret Agent", eval_serialized)
+
+                self.assertEqual(len(actions.card_calls), 1)
+                card = actions.card_calls[0]
+                self.assertEqual(card["external_id"], "765432")
+                self.assertTrue(card.get("checks_passed"))
+                self.assertIn("tt7654321", str(card.get("accepted_evidence") or ""))
+                self.assertIn("765432", str(card.get("accepted_evidence") or ""))
+
+        # 2. §5a: Worker loop exception logging MUST NOT emit raw unsanitized exception traceback!
+        class _CaptureHandler(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.formatted_records: list[str] = []
+                self.raw_exc_infos: list[Any] = []
+                self.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.raw_exc_infos.append(record.exc_info)
+                self.formatted_records.append(self.format(record))
+
+        worker_logger = logging.getLogger("services.movie_intake_api.worker")
+        cap = _CaptureHandler()
+        redactor = SecretRedactingLogFilter()
+        cap.addFilter(redactor)
+        worker_logger.addHandler(cap)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg_w = _make_config(Path(tmp))
+                db_w = IntakeDB(cfg_w.intake_db_path)
+                db_w.init_db()
+                app_w = create_app(cfg_w, db=db_w, start_worker=False)
+                worker = app_w.state.worker
+
+                async def _boom() -> bool:
+                    worker._stop.set()
+                    raise RuntimeError(
+                        "Failed https://tracker.invalid/dl?passkey=EXC_URL_SECRET_999 token=EXC_RAW_MARKER_888"
+                    )
+
+                worker.process_next_queued = _boom  # type: ignore[method-assign]
+                asyncio.run(worker._run_loop())
+        finally:
+            worker_logger.removeHandler(cap)
+
+        self.assertGreaterEqual(len(cap.formatted_records), 1)
+        joined_logs = "\n".join(cap.formatted_records)
+        self.assertNotIn("EXC_URL_SECRET_999", joined_logs)
+        self.assertNotIn("EXC_RAW_MARKER_888", joined_logs)
+        self.assertIn("RuntimeError", joined_logs)
+        self.assertTrue(all(ei is None for ei in cap.raw_exc_infos))
+
+        # 3. §6b: TriageApiClient retains full bounded sanitized evaluator error (not clipped at 240 chars)
+        # and adds explicit truncation label if safety bound is exceeded
+        tail_body = ("diagnostic context " * 80) + "api_key=ERR_SECRET_777 END_DIAGNOSTIC_MARKER_42"
+        huge_body = ("overflow error block " * 1200) + "passkey=HUGE_SECRET_666"
+        resp_mode = {"body": tail_body}
+
+        def _triage_err_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text=resp_mode["body"])
+
+        async def _run_err_checks() -> tuple[TriageEvalResult, TriageEvalResult]:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_triage_err_handler)) as hc:
+                tc = TriageApiClient(base_url="http://127.0.0.1:40716", internal_token="tok", http_client=hc)
+                res_medium = await tc.evaluate({"raw_text": "x"})
+                resp_mode["body"] = huge_body
+                res_huge = await tc.evaluate({"raw_text": "x"})
+                return res_medium, res_huge
+
+        res_med, res_huge = asyncio.run(_run_err_checks())
+        self.assertFalse(res_med.ok)
+        assert res_med.error_redacted is not None
+        self.assertIn("END_DIAGNOSTIC_MARKER_42", res_med.error_redacted)
+        self.assertNotIn("ERR_SECRET_777", res_med.error_redacted)
+        self.assertNotIn("[truncated:", res_med.error_redacted)
+
+        self.assertFalse(res_huge.ok)
+        assert res_huge.error_redacted is not None
+        self.assertLessEqual(len(res_huge.error_redacted), MAX_EVALUATOR_ERROR_CHARS)
+        self.assertIn("[truncated:", res_huge.error_redacted)
+        self.assertNotIn("HUGE_SECRET_666", res_huge.error_redacted)
+
+    def test_pr18_blocker_3_pre_upgrade_schema_replay_preserves_correction(self) -> None:
+        """PR #18 Blocker 3: Replaying original A (exact or re-wrapped) after upgrading from legacy schema preserves correction B."""
+        import sqlite3
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            cfg = _make_config(base)
+            cfg.intake_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            def _make_body(imdb_id: str, event_id: str) -> bytes:
+                return json.dumps(
+                    {
+                        "event": "action.rejected",
+                        "id": event_id,
+                        "data": {
+                            "indexer": "TorrentLeech",
+                            "action": {"type": "RADARR"},
+                            "filter": {"id": 7, "name": "Movies Remux"},
+                            "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                            "release": {
+                                "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                                "type": "movie",
+                                "title": "North Field",
+                                "year": 2021,
+                                "meta_imdb": imdb_id,
+                                "resolution": "1080p",
+                                "media_processing": "REMUX",
+                                "source": "BluRay",
+                                "external_id": "445001",
+                                "category": "Movies :: Bluray",
+                            },
+                        },
+                    }
+                ).encode("utf-8")
+
+            raw_a = _make_body("tt4440001", "event-tt4440001")
+            raw_b = _make_body("tt4440002", "event-tt4440002")
+            rec_a = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-a", raw_a)
+            rec_b = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-b", raw_b)
+
+            # Seed exact pre-upgrade baseline schema (06ee6078): occurrences has NO incoming_evidence_digest column
+            conn = sqlite3.connect(str(cfg.intake_db_path))
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE occurrences (
+                        occurrence_id            TEXT PRIMARY KEY,
+                        received_at              TEXT NOT NULL,
+                        archive_relpath          TEXT NOT NULL,
+                        archive_sha256           TEXT NOT NULL,
+                        payload_bytes            INTEGER NOT NULL,
+                        classification           TEXT NOT NULL,
+                        diagnostic_note          TEXT,
+                        release_id               TEXT
+                    );
+                    CREATE TABLE releases (
+                        release_id               TEXT PRIMARY KEY,
+                        indexer_norm             TEXT NOT NULL,
+                        external_id_norm         TEXT NOT NULL,
+                        exact_release_name       TEXT NOT NULL,
+                        first_occurrence_id      TEXT NOT NULL,
+                        latest_occurrence_id     TEXT NOT NULL,
+                        source_occurrence_id     TEXT NOT NULL,
+                        card_revision            INTEGER NOT NULL DEFAULT 0,
+                        state                    TEXT NOT NULL,
+                        pending_reprocess        INTEGER NOT NULL DEFAULT 0,
+                        incoming_evidence_digest TEXT NOT NULL,
+                        incoming_snapshot_json   TEXT NOT NULL,
+                        full_evidence_digest     TEXT,
+                        last_evaluated_digest    TEXT,
+                        tl_status                TEXT,
+                        tl_metadata_json         TEXT,
+                        verified_tmdb_id         INTEGER,
+                        verified_imdb_id         TEXT,
+                        verified_title           TEXT,
+                        verified_year            INTEGER,
+                        radarr_status_json       TEXT,
+                        evaluation_json          TEXT,
+                        ack_chat_id              TEXT,
+                        ack_message_id           INTEGER,
+                        ack_thread_id            INTEGER,
+                        ack_incoming_digest      TEXT,
+                        eval_reply_status        TEXT,
+                        pending_card_supersede_json TEXT,
+                        pending_eval_reply_json  TEXT,
+                        retry_count              INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at          TEXT NOT NULL,
+                        lease_owner              TEXT,
+                        lease_expires_at         TEXT,
+                        last_error_redacted      TEXT,
+                        created_at               TEXT NOT NULL,
+                        updated_at               TEXT NOT NULL,
+                        UNIQUE (indexer_norm, external_id_norm, exact_release_name)
+                    );
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'queued', 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "rel-legacy-1",
+                        "torrentleech",
+                        "445001",
+                        "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                        "occ-legacy-a",
+                        "occ-legacy-b",
+                        "occ-legacy-b",
+                        "legacy-v0-digest-of-b",
+                        json.dumps({"meta_imdb": "tt4440002", "exact_release_name": "North.Field.2021.1080p.BluRay.REMUX-GROUP"}),
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:01+00:00",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id
+                    ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-1')
+                    """,
+                    ("occ-legacy-a", "2026-11-26T00:00:00+00:00", rec_a.archive_relpath, rec_a.archive_sha256, rec_a.payload_bytes),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id
+                    ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-1')
+                    """,
+                    ("occ-legacy-b", "2026-11-26T00:00:01+00:00", rec_b.archive_relpath, rec_b.archive_sha256, rec_b.payload_bytes),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            os.chmod(cfg.intake_db_path, 0o600)
+
+            # Open migrated DB with normal candidate app and replay exact A, then re-wrapped A (new event.id)
+            db = IntakeDB(cfg.intake_db_path)
+            app = create_app(cfg, db=db, start_worker=False)
+            with TestClient(app) as client:
+                r_exact = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_a,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_exact.status_code, 200)
+                self.assertEqual(r_exact.json()["status"], "coalesced_duplicate")
+
+                row_after_exact = db.list_all_releases()[0]
+                self.assertEqual(json.loads(row_after_exact["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 3)
+
+                # Re-wrapped replay of A with a different event id (different archive_sha256, same evidence digest)
+                raw_a_rewrapped = _make_body("tt4440001", "event-tt4440001-rewrapped")
+                r_rewrapped = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_a_rewrapped,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r_rewrapped.status_code, 200)
+                self.assertEqual(r_rewrapped.json()["status"], "coalesced_duplicate")
+
+                row_after_rewrap = db.list_all_releases()[0]
+                self.assertEqual(json.loads(row_after_rewrap["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 4)
+                self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), 4)
+
+    def test_pr18_blocker_5_rejected_webhook_never_copies_raw_fields_into_sqlite(self) -> None:
+        """PR #18 Blocker 5: Invalid metadata/filter/action/category rejection branches store fixed reason codes with zero raw field text in SQLite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+            app = create_app(cfg, db=db, start_worker=False)
+
+            marker = "HARMLESS_PRIVATE_MARKER_7741"
+            base_release = {
+                "name": "Example.Film.2024.2160p.UHD.BluRay.REMUX-GROUP",
+                "type": "movie",
+                "title": "Example Film",
+                "year": 2024,
+                "category": "Movies :: 4K",
+                "external_id": "445009",
+                "resolution": "2160p",
+                "source": "UHD BluRay",
+                "media_processing": "REMUX",
+            }
+            cases = [
+                # Invalid source containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "source": f"WEB-{marker}"},
+                    },
+                },
+                # Invalid resolution containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "resolution": f"720p-{marker}"},
+                    },
+                },
+                # Invalid media_processing containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "media_processing": f"Encode-{marker}"},
+                    },
+                },
+                # Mismatched filter name containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": f"OtherFilter-{marker}"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": dict(base_release),
+                    },
+                },
+                # Non-Radarr action type containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": f"SONARR-{marker}"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": dict(base_release),
+                    },
+                },
+                # Unclassified category/type containing marker
+                {
+                    "event": "action.rejected",
+                    "data": {
+                        "indexer": "TorrentLeech",
+                        "action": {"type": "RADARR"},
+                        "filter": {"id": 7, "name": "Movies Remux"},
+                        "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                        "release": {**base_release, "type": f"custom-{marker}", "category": f"Other :: {marker}"},
+                    },
+                },
+            ]
+
+            with TestClient(app) as client:
+                for body in cases:
+                    raw = json.dumps(body).encode("utf-8")
+                    r = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    self.assertEqual(r.json()["status"], "archived_non_movie")
+
+            occs = db.list_all_occurrences()
+            self.assertEqual(len(occs), len(cases))
+            self.assertEqual(len(db.list_all_releases()), 0)
+            notes = [str(o.get("diagnostic_note") or "") for o in occs]
+            self.assertIn("ineligible_quality:ineligible_metadata_source", notes)
+            self.assertIn("ineligible_quality:ineligible_metadata_resolution", notes)
+            self.assertIn("ineligible_quality:ineligible_metadata_processing", notes)
+            self.assertIn("filter_mismatch", notes)
+            self.assertIn("non_radarr_action", notes)
+            self.assertIn("unclassified_non_movie", notes)
+            # Zero leakage of raw marker anywhere in SQLite occurrences!
+            for o in occs:
+                self.assertNotIn(marker, json.dumps(o))
+            # Raw archive still preserves exact incoming bytes
+            self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), len(cases))
+
+    def test_pr18_r2_blocker_1_pre_upgrade_queued_webdl_suppressed_with_zero_external_calls(self) -> None:
+        """
+        PR #18 Round 2 Blocker 1: Pre-upgrade queued global release.new WEB-DL rows (and
+        pending follow-ups) are suppressed against their archived webhook and configured filters
+        before any tracker, evaluator, or Telegram/Actions call, while retaining the private archive.
+        """
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            webdl_body = {
+                "id": "pre-upgrade-webdl-1",
+                "event": "release.new",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "release": {
+                        "name": "North.Field.2021.1080p.WEB-DL-GROUP",
+                        "type": "movie",
+                        "title": "North Field",
+                        "year": 2021,
+                        "meta_imdb": "tt4440001",
+                        "resolution": "1080p",
+                        "media_processing": "WEB-DL",
+                        "source": "WEB",
+                        "external_id": "445001",
+                        "category": "Movies :: Bluray",
+                    },
+                },
+            }
+            raw_bytes = json.dumps(webdl_body).encode("utf-8")
+            receipt = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-webdl-1", raw_bytes)
+            snap = {
+                "indexer_raw": "TorrentLeech",
+                "indexer_norm": "torrentleech",
+                "external_id_norm": "445001",
+                "exact_release_name": "North.Field.2021.1080p.WEB-DL-GROUP",
+                "hint_title": "North Field",
+                "hint_year": 2021,
+                "category": "Movies :: Bluray",
+                "meta_imdb": "tt4440001",
+                "resolution": "1080p",
+                "source": "WEB",
+                "media_processing": "WEB-DL",
+                "action_rejected": False,
+                "action_is_radarr": False,
+                "rejections": [],
+            }
+            conn = sqlite3.connect(str(cfg.intake_db_path))
+            conn.execute(
+                """
+                INSERT INTO releases (
+                    release_id, indexer_norm, external_id_norm, exact_release_name,
+                    first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                    card_revision, state, pending_reprocess,
+                    incoming_evidence_digest, incoming_snapshot_json,
+                    pending_eval_reply_json, next_attempt_at, created_at, updated_at
+                ) VALUES (?, 'torrentleech', '445001', ?, 'occ-legacy-webdl-1', 'occ-legacy-webdl-1', 'occ-legacy-webdl-1',
+                          0, 'queued', 0, 'legacy-dig-webdl', ?, ?, '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z')
+                """,
+                (
+                    "rel-legacy-webdl-1",
+                    "North.Field.2021.1080p.WEB-DL-GROUP",
+                    json.dumps(snap),
+                    json.dumps({"release_id": "rel-legacy-webdl-1", "text": "stale"}),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO occurrences (
+                    occurrence_id, received_at, archive_relpath, archive_sha256,
+                    payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                ) VALUES ('occ-legacy-webdl-1', '2026-11-26T00:00:00Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-webdl-1', NULL)
+                """,
+                (receipt.archive_relpath, receipt.archive_sha256, receipt.payload_bytes),
+            )
+            conn.commit()
+            conn.close()
+
+            actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+            triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="invented"))
+            tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+            app = create_app(
+                cfg,
+                db=db,
+                triage_client=triage,
+                actions_client=actions,
+                tl_scraper=tracker,
+                tmdb_client=tmdb,
+                start_worker=False,
+            )
+
+            with TestClient(app):
+                asyncio.run(app.state.worker.process_next_queued())
+
+            self.assertEqual(len(tracker.calls), 0)
+            self.assertEqual(len(triage.calls), 0)
+            self.assertEqual(len(actions.card_calls), 0)
+            self.assertEqual(len(actions.eval_reply_calls), 0)
+            rel = db.get_release("rel-legacy-webdl-1")
+            assert rel is not None
+            self.assertEqual(rel["state"], "suppressed")
+            self.assertEqual(rel["suppression_reason"], "pre_upgrade_ineligible_scope")
+            self.assertIsNone(rel["pending_eval_reply_json"])
+            archived_file = cfg.webhook_archive_dir / receipt.archive_relpath
+            self.assertTrue(archived_file.exists())
+            self.assertEqual(archived_file.read_bytes(), raw_bytes)
+
+    def test_pr18_r2_blocker_4_missing_or_corrupt_legacy_archive_preserves_correction(self) -> None:
+        """
+        PR #18 Round 2 Blocker 4: After upgrading from pre-upgrade schema, if an earlier
+        occurrence's archive is missing or fails SHA-256 verification, a re-wrapped replay of A
+        must preserve correction B and still archive all three deliveries.
+        """
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _payload(imdb: str, event_id: str) -> dict[str, Any]:
+            return {
+                "id": event_id,
+                "event": "action.rejected",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"id": 7, "name": "Movies Remux"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                        "type": "movie",
+                        "title": "North Field",
+                        "year": 2021,
+                        "meta_imdb": imdb,
+                        "resolution": "1080p",
+                        "media_processing": "REMUX",
+                        "source": "BluRay",
+                        "external_id": "445001",
+                        "category": "Movies :: Bluray",
+                    },
+                },
+            }
+
+        for mode in ("missing", "changed"):
+            with self.subTest(archive_mode=mode), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                cfg = _make_config(root)
+                db = IntakeDB(cfg.intake_db_path)
+                db.init_db()
+
+                raw_a = json.dumps(_payload("tt4440001", "alpha")).encode("utf-8")
+                raw_b = json.dumps(_payload("tt4440002", "beta")).encode("utf-8")
+                rec_a = archive_raw_webhook(cfg.webhook_archive_dir, "occ-a", raw_a)
+                rec_b = archive_raw_webhook(cfg.webhook_archive_dir, "occ-b", raw_b)
+
+                snap_b = {
+                    "indexer_raw": "TorrentLeech",
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": "445001",
+                    "exact_release_name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                    "hint_title": "North Field",
+                    "hint_year": 2021,
+                    "category": "Movies :: Bluray",
+                    "meta_imdb": "tt4440002",
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "action_rejected": True,
+                    "action_is_radarr": True,
+                    "rejections": ["Unknown Movie"],
+                }
+                conn = sqlite3.connect(str(cfg.intake_db_path))
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES ('rel-1', 'torrentleech', '445001', 'North.Field.2021.1080p.BluRay.REMUX-GROUP',
+                              'occ-a', 'occ-b', 'occ-b', 0, 'queued', 0, 'old-v0-digest-b', ?,
+                              '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z', '2026-11-26T00:00:01Z')
+                    """,
+                    (json.dumps(snap_b),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                    ) VALUES ('occ-a', '2026-11-26T00:00:00Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-1', NULL)
+                    """,
+                    (rec_a.archive_relpath, rec_a.archive_sha256, rec_a.payload_bytes),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                    ) VALUES ('occ-b', '2026-11-26T00:00:01Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-1', NULL)
+                    """,
+                    (rec_b.archive_relpath, rec_b.archive_sha256, rec_b.payload_bytes),
+                )
+                conn.commit()
+                conn.close()
+
+                arch_a = cfg.webhook_archive_dir / rec_a.archive_relpath
+                if mode == "missing":
+                    arch_a.unlink()
+                else:
+                    arch_a.write_bytes(b"{}")
+
+                app = create_app(cfg, db=db, start_worker=False)
+                with TestClient(app) as client:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        json=_payload("tt4440001", "rewrapped-after-upgrade"),
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertEqual(resp.json()["status"], "coalesced_duplicate")
+
+                rows = db.list_all_releases()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(json.loads(rows[0]["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 3)
+
+    def test_pr18_r2_blocker_5_accepted_hint_title_privacy_end_to_end(self) -> None:
+        """
+        PR #18 Round 2 Blocker 5: Synthetic credential-like markers in an accepted title hint
+        are kept intact in the private raw archive, but scrubbed from SQLite incoming_snapshot_json,
+        the outgoing evaluator request, and the final provider prompt built locally.
+        """
+        from gemini_client import build_user_prompt
+        from schemas import EvaluateRequest
+
+        markers = [
+            "SYNTH_ACC_TOK_101",
+            "SYNTH_QUOTED_PASS_202",
+            "SYNTH_AUTH_BEARER_303",
+            "SYNTH_COOKIE_SESS_404",
+            "SYNTH_COOKIE_TLPASS_505",
+            "SYNTH_SK_KEY_606707808909",
+            "SYNTH_INLINE_PWD_707",
+        ]
+        dirty_title = (
+            "North Field "
+            f"access_token={markers[0]} "
+            f'passkey="{markers[1]}" '
+            f"Authorization: Bearer {markers[2]} "
+            f"Cookie: PHPSESSID={markers[3]}; tlpass={markers[4]} "
+            f"sk-proj-{markers[5]} "
+            f"user:{markers[6]}@tracker.invalid"
+        )
+        body = {
+            "id": "privacy-accepted-1",
+            "event": "action.rejected",
+            "data": {
+                "indexer": "TorrentLeech",
+                "action": {"type": "RADARR"},
+                "filter": {"id": 7, "name": "Movies Remux"},
+                "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                "release": {
+                    "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                    "type": "movie",
+                    "title": dirty_title,
+                    "year": 2021,
+                    "meta_imdb": "tt4440001",
+                    "resolution": "1080p",
+                    "media_processing": "REMUX",
+                    "source": "BluRay",
+                    "external_id": "445001",
+                    "category": "Movies :: Bluray",
+                },
+            },
+        }
+        raw_bytes = json.dumps(body).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+            triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+            tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+            app = create_app(
+                cfg,
+                db=db,
+                triage_client=triage,
+                actions_client=actions,
+                tl_scraper=tracker,
+                tmdb_client=tmdb,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                resp = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_bytes,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["status"], "accepted")
+                asyncio.run(app.state.worker.process_next_queued())
+
+            # 1) Authorized private raw archive preserves exact incoming bytes
+            archived_files = list(cfg.webhook_archive_dir.rglob("*.json"))
+            self.assertEqual(len(archived_files), 1)
+            self.assertEqual(archived_files[0].read_bytes(), raw_bytes)
+
+            # 2) Ordinary SQLite snapshot scrubs every synthetic marker
+            rel_rows = db.list_all_releases()
+            self.assertEqual(len(rel_rows), 1)
+            snap_text = str(rel_rows[0]["incoming_snapshot_json"])
+            for m in markers:
+                self.assertNotIn(m, snap_text)
+
+            # 3) Outgoing evaluator request scrubs every synthetic marker
+            self.assertEqual(len(triage.calls), 1)
+            eval_req_dict = triage.calls[0]
+            eval_req_text = json.dumps(eval_req_dict)
+            for m in markers:
+                self.assertNotIn(m, eval_req_text)
+
+            # 4) Final provider prompt built locally scrubs every synthetic marker
+            provider_prompt = build_user_prompt(EvaluateRequest(**eval_req_dict))
+            for m in markers:
+                self.assertNotIn(m, provider_prompt)
+
+    def test_pr18_r3_findings_2_and_5_scope_transition_and_archive_recovery(self) -> None:
+        """
+        PR #18 Round 3 Findings 2 & 5 (Intake):
+          - Case 101: valid queued pre-upgrade control is evaluated once.
+          - Case 102: excluded pre-upgrade filter with missing archive makes 0 external calls.
+          - Case 103: allowed occurrence followed by excluded occurrence never evaluates the
+            excluded occurrence's snapshot (tt4440002).
+          - Case 104: pre-upgrade excluded row suppressed at startup wakes exactly once on a
+            fresh qualifying delivery (and duplicate is coalesced, while later correction works).
+          - Case 105: missing historical archive withholds incoming C to protect accepted B,
+            and after restoring the archive + restart, redelivered C advances cleanly to tt4440003
+            while replaying original A never reverts back to tt4440001.
+        """
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _make_payload(case: str, *, source_filter: str = "Movies Remux", ident: str = "tt4440001", nonce: str = "") -> bytes:
+            body = {
+                "id": f"{case}-{ident}-{nonce}",
+                "event": "action.rejected",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": source_filter},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        "title": "North Field",
+                        "type": "movie",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "category": "Movies :: Bluray",
+                        "meta_imdb": ident,
+                        "external_id": case,
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_pre_upgrade_row(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            occurrences_spec: list[tuple[str, str, str, bool]],
+        ) -> list[tuple[str, Path, bytes]]:
+            """
+            Seed a pre-upgrade release row (with NULL occurrence digests as before migration)
+            whose snapshot reflects the final occurrence in `occurrences_spec`.
+            Each tuple is (occ_id, source_filter, meta_imdb, keep_archive_file).
+            """
+            created: list[tuple[str, Path, bytes]] = []
+            rel_id = f"rel-pre-{case}"
+            last_snap: dict[str, Any] = {}
+            last_digest = ""
+            for idx, (occ_id, filt, imdb, keep_file) in enumerate(occurrences_spec):
+                raw = _make_payload(case, source_filter=filt, ident=imdb, nonce=f"pre-{idx}")
+                rec = archive_raw_webhook(archive_dir, occ_id, raw)
+                path = archive_dir / rec.archive_relpath
+                if not keep_file:
+                    path.unlink()
+                created.append((occ_id, path, raw))
+                last_snap = {
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": case,
+                    "exact_release_name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                    "action_type": "RADARR",
+                    "action_is_radarr": True,
+                    "action_rejected": True,
+                    "rejection_reasons": ["Unknown Movie"],
+                    "title": "North Field",
+                    "year": 2021,
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "category": "Movies :: Bluray",
+                    "meta_imdb": imdb,
+                }
+                last_digest = f"legacy-v0-{case}-{imdb}"
+
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'queued', 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rel_id,
+                        "torrentleech",
+                        case,
+                        f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        occurrences_spec[0][0],
+                        occurrences_spec[-1][0],
+                        occurrences_spec[-1][0],
+                        last_digest,
+                        json.dumps(last_snap),
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:05+00:00",
+                    ),
+                )
+                for idx, (occ_id, path, raw) in enumerate(created):
+                    import hashlib
+
+                    sha = hashlib.sha256(raw).hexdigest()
+                    relpath = str(path.relative_to(archive_dir))
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (
+                            occ_id,
+                            f"2026-11-26T00:00:0{idx}+00:00",
+                            relpath,
+                            sha,
+                            len(raw),
+                            rel_id,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return created
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            _seed_pre_upgrade_row(db, cfg.webhook_archive_dir, "101", [("occ-101-a", "Movies Remux", "tt4440001", True)])
+            _seed_pre_upgrade_row(db, cfg.webhook_archive_dir, "102", [("occ-102-a", "Other Filter", "tt4440001", False)])
+            _seed_pre_upgrade_row(
+                db,
+                cfg.webhook_archive_dir,
+                "103",
+                [
+                    ("occ-103-a", "Movies Remux", "tt4440001", True),
+                    ("occ-103-b", "Other Filter", "tt4440002", True),
+                ],
+            )
+            _seed_pre_upgrade_row(db, cfg.webhook_archive_dir, "104", [("occ-104-a", "Other Filter", "tt4440001", True)])
+            seeded_105 = _seed_pre_upgrade_row(
+                db,
+                cfg.webhook_archive_dir,
+                "105",
+                [
+                    ("occ-105-a", "Movies Remux", "tt4440001", False),
+                    ("occ-105-b", "Movies Remux", "tt4440002", True),
+                ],
+            )
+            occ_105_a_path, occ_105_a_bytes = seeded_105[0][1], seeded_105[0][2]
+
+            def _make_runtime():
+                actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+                app = create_app(
+                    cfg,
+                    db=db,
+                    actions_client=actions,
+                    triage_client=triage,
+                    tl_scraper=tracker,
+                    tmdb_client=tmdb,
+                    start_worker=False,
+                )
+                return app, actions, triage, tracker
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            # Phase 1: Startup after upgrade while 102 and 105-a archives are missing
+            app1, actions1, triage1, tracker1 = _make_runtime()
+            with TestClient(app1) as client1:
+                self.assertEqual(_row("104")["state"], "suppressed")
+                self.assertEqual(_row("104")["suppression_reason"], "pre_upgrade_ineligible_scope")
+
+                # Fresh qualifying event wakes 104 exactly once; duplicate is coalesced
+                r104_wake = client1.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("104", source_filter="Movies Remux", ident="tt4440001", nonce="now-valid"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r104_wake.status_code, 200)
+                self.assertEqual(r104_wake.json()["status"], "accepted")
+
+                r104_dup = client1.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("104", source_filter="Movies Remux", ident="tt4440001", nonce="now-valid-dup"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r104_dup.status_code, 200)
+                self.assertEqual(r104_dup.json()["status"], "coalesced_duplicate")
+
+                # 105 incoming C while A's archive is missing must be withheld to protect B
+                r105_withheld = client1.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("105", source_filter="Movies Remux", ident="tt4440003", nonce="while-missing"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r105_withheld.status_code, 200)
+                self.assertEqual(r105_withheld.json()["status"], "coalesced_duplicate")
+                self.assertEqual(json.loads(_row("105")["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+
+                for _ in range(20):
+                    if not asyncio.run(app1.state.worker.process_next_queued()):
+                        break
+
+                for case, exp_state, exp_eval, exp_imdbs in (
+                    ("101", "completed", 1, ["tt4440001"]),
+                    ("102", "suppressed", 0, []),
+                    ("103", "suppressed", 0, []),
+                    ("104", "completed", 1, ["tt4440001"]),
+                ):
+                    evaluated = [q for q in triage1.calls if f".{case}." in q["raw_text"]]
+                    searches = [v for v in tracker1.calls if v["external_id"] == case]
+                    cards = [x for x in actions1.card_calls if x.get("external_id") == case]
+                    self.assertEqual(_row(case)["state"], exp_state, case)
+                    self.assertEqual(len(evaluated), exp_eval, case)
+                    self.assertEqual(len(searches), exp_eval, case)
+                    self.assertEqual(len(cards), exp_eval, case)
+                    self.assertEqual(
+                        [q.get("torrent_info", {}).get("imdb_id") for q in evaluated],
+                        exp_imdbs,
+                        case,
+                    )
+
+            # Phase 2: Restore 105's missing archive, restart, redeliver C -> advances to tt4440003,
+            # and replaying original A never reverts B/C.
+            occ_105_a_path.write_bytes(occ_105_a_bytes)
+            os.chmod(occ_105_a_path, 0o600)
+
+            app2, _actions2, _triage2, _tracker2 = _make_runtime()
+            with TestClient(app2) as client2:
+                r105_recover = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("105", source_filter="Movies Remux", ident="tt4440003", nonce="after-repair"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r105_recover.status_code, 200)
+                self.assertEqual(r105_recover.json()["status"], "updated_correction")
+                self.assertEqual(json.loads(_row("105")["incoming_snapshot_json"])["meta_imdb"], "tt4440003")
+
+                r105_old_a = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("105", source_filter="Movies Remux", ident="tt4440001", nonce="late-replay-a"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r105_old_a.status_code, 200)
+                self.assertEqual(r105_old_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(json.loads(_row("105")["incoming_snapshot_json"])["meta_imdb"], "tt4440003")
+
+    def test_pr18_r4_findings_3_and_4_upgrade_history_and_card_reassessment(self) -> None:
+        """
+        PR #18 Round 4 Findings 3 & 4 (Intake):
+          - Case 201: allowed A -> excluded B -> upgrade suppressed -> genuinely new allowed C
+            wakes and is accepted WITHOUT relabeling proven A; delayed exact replay of A is
+            coalesced and retains C (tt4440003).
+          - Case 202: allowed A -> allowed B (with B's archive missing at migration) -> upgrade
+            suppressed -> exact replay of A is coalesced and retains B (tt4440002).
+          - Case 203: actionable card issued for A (card_revision=1) -> excluded B -> upgrade
+            suppressed -> fresh qualifying B wakes via updated_correction and triggers tracker,
+            evaluator, and card reassessment/supersession.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _make_payload(
+            case: str,
+            version: str,
+            *,
+            approved_filter: bool = True,
+            envelope: str = "",
+        ) -> bytes:
+            observed_id = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[version]
+            body = {
+                "event": "action.rejected",
+                "id": f"{case}{version}{envelope}",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": "Movies Remux" if approved_filter else "Other Filter"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        "title": "North Field",
+                        "type": "movie",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "category": "Movies :: Bluray",
+                        "meta_imdb": observed_id,
+                        "external_id": case,
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_legacy_release(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            specs: list[tuple[str, str, bool, bool]],
+            *,
+            card_revision: int = 0,
+            ack_message_id: Optional[int] = None,
+        ) -> None:
+            rel_id = f"rel-r4-{case}"
+            occs: list[tuple[str, Path, bytes, str]] = []
+            last_snap: dict[str, Any] = {}
+            last_digest = ""
+            for idx, (occ_id, version, approved_filter, keep_archive) in enumerate(specs):
+                imdb = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[version]
+                raw = _make_payload(case, version, approved_filter=approved_filter)
+                rec = archive_raw_webhook(archive_dir, occ_id, raw)
+                path = archive_dir / rec.archive_relpath
+                if not keep_archive:
+                    path.unlink()
+                occs.append((occ_id, path, raw, imdb))
+                last_snap = {
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": case,
+                    "exact_release_name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                    "action_type": "RADARR",
+                    "action_is_radarr": True,
+                    "action_rejected": True,
+                    "rejection_reasons": ["Unknown Movie"],
+                    "title": "North Field",
+                    "year": 2021,
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "category": "Movies :: Bluray",
+                    "meta_imdb": imdb,
+                }
+                last_digest = f"legacy-r4-{case}-{imdb}"
+
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        ack_chat_id, ack_message_id,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'torrentleech', ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rel_id,
+                        case,
+                        f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        specs[0][0],
+                        specs[-1][0],
+                        specs[-1][0],
+                        card_revision,
+                        last_digest,
+                        json.dumps(last_snap),
+                        "-100123456" if ack_message_id is not None else None,
+                        ack_message_id,
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:00+00:00",
+                        "2026-11-26T00:00:05+00:00",
+                    ),
+                )
+                for idx, (occ_id, path, raw, _imdb) in enumerate(occs):
+                    sha = hashlib.sha256(raw).hexdigest()
+                    relpath = str(path.relative_to(archive_dir))
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (
+                            occ_id,
+                            f"2026-11-26T00:00:0{idx}+00:00",
+                            relpath,
+                            sha,
+                            len(raw),
+                            rel_id,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            # 201: allowed A, then excluded B
+            _seed_legacy_release(
+                db,
+                cfg.webhook_archive_dir,
+                "201",
+                [("occ-201-a", "a", True, True), ("occ-201-b", "b", False, True)],
+            )
+            # 202: allowed A, then allowed B whose archive is missing
+            _seed_legacy_release(
+                db,
+                cfg.webhook_archive_dir,
+                "202",
+                [("occ-202-a", "a", True, True), ("occ-202-b", "b", True, False)],
+            )
+            # 203: allowed A already issued actionable card at revision 1, then excluded B
+            _seed_legacy_release(
+                db,
+                cfg.webhook_archive_dir,
+                "203",
+                [("occ-203-a", "a", True, True), ("occ-203-b", "b", False, True)],
+                card_revision=1,
+                ack_message_id=777,
+            )
+
+            actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+            triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+            tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+            tmdb = StubTmdbClient(
+                cfg.tmdb_cache_path,
+                {123: TmdbMovieRecord(123, "North Field 203", year=2021, imdb_id="tt4440001")},
+                {"tt4440001": [123]},
+            )
+            app = create_app(
+                cfg,
+                db=db,
+                actions_client=actions,
+                triage_client=triage,
+                tl_scraper=tracker,
+                tmdb_client=tmdb,
+                start_worker=False,
+            )
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            def _current(case: str) -> str:
+                return str(json.loads(_row(case)["incoming_snapshot_json"])["meta_imdb"])
+
+            with TestClient(app) as client:
+                self.assertEqual(_row("201")["state"], "suppressed")
+                self.assertEqual(_row("202")["state"], "suppressed")
+                self.assertEqual(_row("203")["state"], "suppressed")
+
+                # 203: fresh qualifying B wakes card_revision=1 release and reassesses card
+                r203 = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("203", "b", approved_filter=True, envelope="now-qualified"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r203.status_code, 200)
+                self.assertEqual(r203.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app.state.worker.process_next_queued()))
+                self.assertEqual(_row("203")["state"], "completed")
+                self.assertEqual(len(tracker.calls), 1)
+                self.assertEqual(len(triage.calls), 1)
+                self.assertEqual(len(actions.card_calls), 1)
+                self.assertEqual(_current("203"), "tt4440002")
+
+                # 203 duplicate of B and old replay of A both coalesce
+                r203_dup = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("203", "b", approved_filter=True, envelope="dup"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r203_dup.json()["status"], "coalesced_duplicate")
+                r203_old_a = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("203", "a", approved_filter=True),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r203_old_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(_current("203"), "tt4440002")
+
+                # 201: admit genuinely new C, verify ledger preserved A, then exact replay A coalesces
+                r201_c = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("201", "c", approved_filter=True),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r201_c.json()["status"], "accepted")
+                ledger_201 = [o["classification"] for o in db.list_occurrences_for_release(_row("201")["release_id"])]
+                self.assertEqual(ledger_201, ["movie_candidate", "pre_upgrade_ineligible_scope", "movie_candidate"])
+                r201_a = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("201", "a", approved_filter=True),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r201_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(_current("201"), "tt4440003")
+
+                # 202: latest B archive missing; exact replay of A and ambiguous C must both keep B
+                r202_a = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("202", "a", approved_filter=True),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r202_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(_current("202"), "tt4440002")
+
+                r202_c = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_make_payload("202", "c", approved_filter=True),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r202_c.json()["status"], "coalesced_duplicate")
+                self.assertEqual(_current("202"), "tt4440002")
+
+    def test_pr18_r5_finding_3_unsent_upgrade_recovery_duplicate_filter_and_restored_archive(self) -> None:
+        """
+        PR #18 Round 5 Finding 3 (Intake):
+          - control: intact queued pre-upgrade release runs once and exact redelivery coalesces.
+          - duplicate_filter: queued pre-upgrade release whose latest_occurrence_id became an
+            excluded-filter duplicate of the same movie is suppressed at startup, then wakes once
+            on a fresh qualifying delivery (eval=1, cards=1), and a subsequent repeat coalesces.
+          - restore: queued pre-upgrade release whose archive was temporarily missing during
+            migration is suppressed while missing, then automatically re-queues after restoring
+            the archive byte-for-byte + restart (eval=1, cards=1) while redelivery coalesces.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _make_body(*, filt: str = "Movies Remux") -> bytes:
+            body = {
+                "event": "action.rejected",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": filt},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": "Field.Light.2021.1080p.BluRay.REMUX-GRP",
+                        "title": "Field Light",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "type": "movie",
+                        "category": "Movies :: Bluray",
+                        "external_id": "9312",
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        for mode in ("control", "duplicate_filter", "restore"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                cfg = _make_config(root)
+                db = IntakeDB(cfg.intake_db_path)
+                db.init_db()
+
+                raw_ok = _make_body(filt="Movies Remux")
+                rec1 = archive_raw_webhook(cfg.webhook_archive_dir, "occ-r5-1", raw_ok)
+                p1 = cfg.webhook_archive_dir / rec1.archive_relpath
+                occs: list[tuple[str, str, str, int]] = [
+                    ("occ-r5-1", rec1.archive_relpath, hashlib.sha256(raw_ok).hexdigest(), len(raw_ok))
+                ]
+                latest_id = "occ-r5-1"
+                if mode == "duplicate_filter":
+                    raw_other = _make_body(filt="Other Filter")
+                    rec2 = archive_raw_webhook(cfg.webhook_archive_dir, "occ-r5-2", raw_other)
+                    occs.append(
+                        ("occ-r5-2", rec2.archive_relpath, hashlib.sha256(raw_other).hexdigest(), len(raw_other))
+                    )
+                    latest_id = "occ-r5-2"
+                elif mode == "restore":
+                    p1.rename(root / "temporarily-away")
+
+                snap = {
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": "9312",
+                    "exact_release_name": "Field.Light.2021.1080p.BluRay.REMUX-GRP",
+                    "action_type": "RADARR",
+                    "action_is_radarr": True,
+                    "action_rejected": True,
+                    "rejection_reasons": ["Unknown Movie"],
+                    "title": "Field Light",
+                    "year": 2021,
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "category": "Movies :: Bluray",
+                }
+                conn = db._connect()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO releases (
+                            release_id, indexer_norm, external_id_norm, exact_release_name,
+                            first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                            card_revision, state, pending_reprocess,
+                            incoming_evidence_digest, incoming_snapshot_json,
+                            next_attempt_at, created_at, updated_at
+                        ) VALUES ('rel-r5', 'torrentleech', '9312', 'Field.Light.2021.1080p.BluRay.REMUX-GRP',
+                                  'occ-r5-1', ?, 'occ-r5-1', 0, 'queued', 0, 'legacy-r5-dig', ?,
+                                  '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:01+00:00')
+                        """,
+                        (latest_id, json.dumps(snap)),
+                    )
+                    for idx, (oid, relp, sha, nbytes) in enumerate(occs):
+                        conn.execute(
+                            """
+                            INSERT INTO occurrences (
+                                occurrence_id, received_at, archive_relpath, archive_sha256,
+                                payload_bytes, classification, diagnostic_note, release_id,
+                                incoming_evidence_digest
+                            ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-r5', NULL)
+                            """,
+                            (oid, f"2026-11-26T00:00:0{idx}+00:00", relp, sha, nbytes),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                def _make_runtime():
+                    actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                    triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                    tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                    app = create_app(
+                        cfg,
+                        db=db,
+                        actions_client=actions,
+                        triage_client=triage,
+                        tl_scraper=tracker,
+                        tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                        start_worker=False,
+                    )
+                    return app, actions, triage
+
+                # Phase 1: startup while excluded / missing
+                app1, actions1, triage1 = _make_runtime()
+                with TestClient(app1):
+                    if mode != "control":
+                        self.assertEqual(db.list_all_releases()[0]["state"], "suppressed", mode)
+                        self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()), mode)
+                        self.assertEqual(len(triage1.calls), 0, mode)
+                        self.assertEqual(len(actions1.card_calls), 0, mode)
+                        if mode == "restore":
+                            (root / "temporarily-away").rename(p1)
+
+                # Phase 2: restart after restoration / fresh qualifying redelivery
+                app2, actions2, triage2 = _make_runtime()
+                with TestClient(app2) as client2:
+                    rel_id = db.list_all_releases()[0]["release_id"]
+                    eligible = db.is_release_currently_eligible(rel_id, cfg.webhook_archive_dir)[0]
+                    self.assertEqual(eligible, mode != "duplicate_filter", mode)
+                    worked = asyncio.run(app2.state.worker.process_next_queued())
+                    r_post = client2.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw_ok,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r_post.status_code, 200, mode)
+                    worked_again = asyncio.run(app2.state.worker.process_next_queued())
+                    if mode == "duplicate_filter":
+                        self.assertFalse(worked, mode)
+                        self.assertEqual(r_post.json()["status"], "accepted", mode)
+                        self.assertTrue(worked_again, mode)
+                    else:
+                        self.assertTrue(worked, mode)
+                        self.assertEqual(r_post.json()["status"], "coalesced_duplicate", mode)
+                        self.assertFalse(worked_again, mode)
+                    self.assertEqual(len(triage2.calls), 1, mode)
+                    self.assertEqual(len(actions2.card_calls), 1, mode)
+                    self.assertEqual(db.list_all_releases()[0]["state"], "completed", mode)
+
+                    # One more identical repeat must always coalesce with zero extra calls
+                    r_repeat = client2.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw_ok,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r_repeat.json()["status"], "coalesced_duplicate", mode)
+                    self.assertFalse(asyncio.run(app2.state.worker.process_next_queued()), mode)
+                    self.assertEqual(len(triage2.calls), 1, mode)
+                    self.assertEqual(len(actions2.card_calls), 1, mode)
+
+    def test_pr18_r6_finding_1_ordered_eligible_history_after_excluded_duplicate(self) -> None:
+        """
+        PR #18 Round 6 Finding 1 (Intake):
+          - 401 (control): unsent allowed A followed by excluded A -> suppressed on upgrade ->
+            replaying allowed A wakes once (eval=A, cards=1); repeats coalesce.
+          - 402 (superseded A -> corrected B -> excluded A): suppressed on upgrade ->
+            delayed replay of superseded allowed A MUST coalesce (0 evals, 0 cards, recorded
+            as `movie_superseded_replay` so it never masks B) -> redelivering allowed B MUST
+            wake once (eval=B, cards=1) -> further repeats of B and A coalesce.
+          - 403 (allowed A -> allowed B -> excluded C): replay of A coalesces; redelivery of
+            latest verified eligible B wakes once.
+          - 404 (allowed A intact -> allowed B missing archive -> excluded A intact): missing
+            eligible archive blocks waking A or B until B's archive is restored and restarted,
+            after which A still coalesces and B wakes once.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _payload(case: str, version: str, *, approved_filter: bool = True, envelope: str = "") -> bytes:
+            obs_id = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[version]
+            body = {
+                "event": "action.rejected",
+                "id": f"{case}{version}{envelope}",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": "Movies Remux" if approved_filter else "Other Filter"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        "title": "North Field",
+                        "type": "movie",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "category": "Movies :: Bluray",
+                        "meta_imdb": obs_id,
+                        "external_id": case,
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_pre_upgrade(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            specs: list[tuple[str, str, bool, bool]],
+            missing_backup: Optional[Path] = None,
+        ) -> Optional[Path]:
+            rel_id = f"rel-r6-{case}"
+            occs: list[tuple[str, str, str, int, str]] = []
+            missing_target: Optional[Path] = None
+            last_version = "a"
+            for idx, (oid, ver, approved, keep_archive) in enumerate(specs):
+                raw = _payload(case, ver, approved_filter=approved)
+                rec = archive_raw_webhook(archive_dir, oid, raw)
+                if not keep_archive:
+                    src = archive_dir / rec.archive_relpath
+                    if missing_backup is not None:
+                        src.rename(missing_backup)
+                        missing_target = src
+                    else:
+                        src.unlink()
+                occs.append(
+                    (
+                        oid,
+                        rec.archive_relpath,
+                        hashlib.sha256(raw).hexdigest(),
+                        len(raw),
+                        f"2026-11-26T00:00:0{idx}+00:00",
+                    )
+                )
+                last_version = ver
+
+            obs_id = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[last_version]
+            snap = {
+                "indexer_norm": "torrentleech",
+                "external_id_norm": case,
+                "exact_release_name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                "action_type": "RADARR",
+                "action_is_radarr": True,
+                "action_rejected": True,
+                "rejection_reasons": ["Unknown Movie"],
+                "title": "North Field",
+                "year": 2021,
+                "resolution": "1080p",
+                "source": "BluRay",
+                "media_processing": "REMUX",
+                "category": "Movies :: Bluray",
+                "meta_imdb": obs_id,
+            }
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'torrentleech', ?, ?, ?, ?, ?, 0, 'queued', 0, ?, ?,
+                              '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:05+00:00')
+                    """,
+                    (
+                        rel_id,
+                        case,
+                        snap["exact_release_name"],
+                        occs[0][0],
+                        occs[-1][0],
+                        occs[0][0],
+                        f"legacy-r6-{case}-{last_version}",
+                        json.dumps(snap),
+                    ),
+                )
+                for oid, relp, sha, nbytes, ts in occs:
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (oid, ts, relp, sha, nbytes, rel_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return missing_target
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "401",
+                [("occ-401-a1", "a", True, True), ("occ-401-a2", "a", False, True)],
+            )
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "402",
+                [
+                    ("occ-402-a1", "a", True, True),
+                    ("occ-402-b1", "b", True, True),
+                    ("occ-402-a2", "a", False, True),
+                ],
+            )
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "403",
+                [
+                    ("occ-403-a1", "a", True, True),
+                    ("occ-403-b1", "b", True, True),
+                    ("occ-403-c1", "c", False, True),
+                ],
+            )
+            backup_404 = root / "occ-404-b1.backup"
+            missing_target_404 = _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "404",
+                [
+                    ("occ-404-a1", "a", True, True),
+                    ("occ-404-b1", "b", True, False),
+                    ("occ-404-a2", "a", False, True),
+                ],
+                missing_backup=backup_404,
+            )
+            assert missing_target_404 is not None
+
+            def _make_runtime():
+                actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                app = create_app(
+                    cfg,
+                    db=db,
+                    actions_client=actions,
+                    triage_client=triage,
+                    tl_scraper=tracker,
+                    tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                    start_worker=False,
+                )
+                return app, actions, triage
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            app1, actions1, triage1 = _make_runtime()
+            with TestClient(app1) as client:
+                for c in ("401", "402", "403", "404"):
+                    self.assertEqual(_row(c)["state"], "suppressed", c)
+
+                def _post(case: str, ver: str, env: str = "") -> str:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=_payload(case, ver, approved_filter=True, envelope=env),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    return str(resp.json()["status"])
+
+                def _assessed(case: str) -> list[str]:
+                    return [v["torrent_info"]["imdb_id"] for v in triage1.calls if f".{case}." in v["raw_text"]]
+
+                def _cards(case: str) -> list[dict[str, Any]]:
+                    return [v for v in actions1.card_calls if v.get("external_id") == case]
+
+                # 401 control: allowed A wakes once, repeat coalesces
+                self.assertEqual(_post("401", "a"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("401"), ["tt4440001"])
+                self.assertEqual(len(_cards("401")), 1)
+                self.assertEqual(_post("401", "a", "dup"), "coalesced_duplicate")
+
+                # 402: delayed replay of superseded A coalesces (even twice!), then B wakes once
+                self.assertEqual(_post("402", "a"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), [])
+                self.assertEqual(len(_cards("402")), 0)
+                self.assertEqual(_row("402")["state"], "suppressed")
+                self.assertEqual(_post("402", "a", "dup2"), "coalesced_duplicate")
+                self.assertEqual(_post("402", "b"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), ["tt4440002"])
+                self.assertEqual(len(_cards("402")), 1)
+                self.assertEqual(_post("402", "b", "dup"), "coalesced_duplicate")
+                self.assertEqual(_post("402", "a", "late"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), ["tt4440002"])
+                self.assertEqual(len(_cards("402")), 1)
+
+                # 403: excluded C does not hide eligible B either
+                self.assertEqual(_post("403", "a"), "coalesced_duplicate")
+                self.assertEqual(_post("403", "b"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("403"), ["tt4440002"])
+                self.assertEqual(len(_cards("403")), 1)
+
+                # 404: missing B archive blocks waking both A and B until restored
+                self.assertEqual(_post("404", "a"), "coalesced_duplicate")
+                self.assertEqual(_post("404", "b"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("404"), [])
+                self.assertEqual(len(_cards("404")), 0)
+
+            # Restore 404 B archive + restart: A still coalesces, B wakes once
+            backup_404.rename(missing_target_404)
+            app2, actions2, triage2 = _make_runtime()
+            with TestClient(app2) as client2:
+                self.assertEqual(_row("404")["state"], "suppressed")
+                r404_a = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("404", "a", approved_filter=True, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r404_a.json()["status"], "coalesced_duplicate")
+                r404_b = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("404", "b", approved_filter=True, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r404_b.json()["status"], "accepted")
+                self.assertTrue(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage2.calls if ".404." in v["raw_text"]],
+                    ["tt4440002"],
+                )
+                self.assertEqual(
+                    len([v for v in actions2.card_calls if v.get("external_id") == "404"]),
+                    1,
+                )
+
+            # 405 & 406: Pre-upgrade card_revision>=1 releases suppressed behind an excluded A:
+            #   - 405: A was acknowledged (card_revision=1), B queued but never delivered, then
+            #     excluded A suppressed the queue -> delayed A coalesces, redelivered B wakes
+            #     once via `updated_correction` to supersede the stale card for A.
+            #   - 406: Both A and B were acknowledged (ack_incoming_digest == baseline B), then
+            #     excluded A suppressed the queue -> neither A nor already-delivered B wakes.
+            from services.movie_intake_api.classifier import compute_baseline_legacy_evidence_digest
+
+            def _seed_acked_case(case: str, ack_version: str, card_rev: int) -> None:
+                _seed_pre_upgrade(
+                    db,
+                    cfg.webhook_archive_dir,
+                    case,
+                    [
+                        (f"occ-{case}-a1", "a", True, True),
+                        (f"occ-{case}-b1", "b", True, True),
+                        (f"occ-{case}-a2", "a", False, True),
+                    ],
+                )
+                ack_raw = json.loads(_payload(case, ack_version, approved_filter=True).decode("utf-8"))
+                ack_base_dig = compute_baseline_legacy_evidence_digest(ack_raw)
+                assert ack_base_dig is not None
+                conn = db._connect()
+                try:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET card_revision = ?,
+                            ack_chat_id = '-100123456',
+                            ack_message_id = 777,
+                            ack_incoming_digest = ?,
+                            last_evaluated_digest = 'legacy-eval-digest'
+                        WHERE release_id = ?
+                        """,
+                        (card_rev, ack_base_dig, f"rel-r6-{case}"),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            _seed_acked_case("405", "a", 1)
+            _seed_acked_case("406", "b", 2)
+
+            app3, actions3, triage3 = _make_runtime()
+            with TestClient(app3) as client3:
+                self.assertEqual(_row("405")["state"], "suppressed")
+                self.assertEqual(_row("406")["state"], "suppressed")
+
+                # 405: replay A coalesces; redelivering undelivered B wakes once via updated_correction
+                r405_a = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "a", approved_filter=True, envelope="r1"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_a.json()["status"], "coalesced_duplicate")
+                r405_b = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "b", approved_filter=True, envelope="r2"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_b.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app3.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage3.calls if ".405." in v["raw_text"]],
+                    ["tt4440002"],
+                )
+                self.assertEqual(len([v for v in actions3.card_calls if v.get("external_id") == "405"]), 1)
+                r405_b_dup = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("405", "b", approved_filter=True, envelope="r3"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r405_b_dup.json()["status"], "coalesced_duplicate")
+
+                # 406: B was already delivered before upgrade -> neither A nor B wakes
+                r406_a = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("406", "a", approved_filter=True, envelope="r1"),
+                    headers={"Content-Type": "application/json"},
+                )
+                r406_b = client3.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("406", "b", approved_filter=True, envelope="r2"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r406_a.json()["status"], "coalesced_duplicate")
+                self.assertEqual(r406_b.json()["status"], "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app3.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage3.calls if ".406." in v["raw_text"]],
+                    [],
+                )
+                self.assertEqual(len([v for v in actions3.card_calls if v.get("external_id") == "406"]), 0)
+
+    def test_pr18_r7_finding_1_historical_ack_lacking_current_scope_does_not_drop_eligible_correction(self) -> None:
+        """
+        PR #18 Round 7 Finding 1 (Intake):
+          - 801 (control): baseline delivered A with complete REMUX metadata, B corrected, excluded A,
+            upgrade -> redelivering eligible B wakes once via `updated_correction` (1 eval for B, 1 card).
+          - 802 (Finding 1): baseline delivered A lacking structured `media_processing` (container='MKV'),
+            B corrected with full `media_processing='REMUX'`, excluded A, upgrade -> verified historical
+            ack of A still proves A was sent while current eligibility applies to B -> redelivering B
+            wakes once via `updated_correction` (1 eval for B, 1 card) and repeats coalesce.
+          - 803 (superseded replay guard): baseline delivered A under excluded filter (complete REMUX),
+            B queued under allowed filter, excluded A arrived -> after upgrade, replaying A under
+            allowed filter MUST coalesce (`movie_superseded_replay`) while B still wakes once.
+          - 804 (missing archive fail-closed + restore recovery): Case 802 with A's archive missing
+            blocks waking B; restoring A's archive + restart upgrades `ack_incoming_digest` and lets
+            B wake once via `updated_correction`.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+        from services.movie_intake_api.classifier import compute_baseline_legacy_evidence_digest
+
+        def _payload(
+            case: str,
+            identity: str,
+            *,
+            allowed: bool = True,
+            omit_media_processing: bool = False,
+            envelope: str = "",
+        ) -> bytes:
+            rel: dict[str, Any] = {
+                "name": f"Granite.Bay.{case}.1994.1080p.BluRay.REMUX-GROUP",
+                "title": "Granite Bay",
+                "year": 1994,
+                "type": "movie",
+                "category": "Movies :: Bluray",
+                "source": "BluRay",
+                "resolution": "1080p",
+                "media_processing": "REMUX",
+                "container": "MKV",
+                "meta_imdb": "tt1111111" if identity == "A" else "tt2222222",
+                "external_id": case,
+            }
+            if omit_media_processing:
+                del rel["media_processing"]
+            body = {
+                "event": "action.rejected",
+                "id": f"{case}-{identity}-{envelope}",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": "Movies Remux" if allowed else "Other Filter"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": rel,
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_acked_pre_upgrade(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            *,
+            a_allowed: bool = True,
+            a_omit_mp: bool = False,
+            missing_a_backup: Optional[Path] = None,
+        ) -> Optional[Path]:
+            rel_id = f"rel-r7-{case}"
+            raw_a1 = _payload(case, "A", allowed=a_allowed, omit_media_processing=a_omit_mp, envelope="a1")
+            raw_b1 = _payload(case, "B", allowed=True, omit_media_processing=False, envelope="b1")
+            raw_a2 = _payload(case, "A", allowed=False, omit_media_processing=a_omit_mp, envelope="a2")
+            ack_base_digest = compute_baseline_legacy_evidence_digest(json.loads(raw_a1.decode("utf-8")))
+            assert ack_base_digest is not None
+            latest_base_digest = compute_baseline_legacy_evidence_digest(json.loads(raw_a2.decode("utf-8")))
+            assert latest_base_digest is not None
+
+            missing_target: Optional[Path] = None
+            occs: list[tuple[str, str, str, int, str]] = []
+            for idx, (oid, raw) in enumerate(
+                ((f"occ-{case}-a1", raw_a1), (f"occ-{case}-b1", raw_b1), (f"occ-{case}-a2", raw_a2))
+            ):
+                rec = archive_raw_webhook(archive_dir, oid, raw)
+                if idx == 0 and missing_a_backup is not None:
+                    src = archive_dir / rec.archive_relpath
+                    src.rename(missing_a_backup)
+                    missing_target = src
+                occs.append(
+                    (
+                        oid,
+                        rec.archive_relpath,
+                        hashlib.sha256(raw).hexdigest(),
+                        len(raw),
+                        f"2026-11-26T00:00:0{idx}+00:00",
+                    )
+                )
+
+            snap = {
+                "indexer_norm": "torrentleech",
+                "external_id_norm": case,
+                "exact_release_name": f"Granite.Bay.{case}.1994.1080p.BluRay.REMUX-GROUP",
+                "action_type": "RADARR",
+                "action_is_radarr": True,
+                "action_rejected": True,
+                "rejection_reasons": ["Unknown Movie"],
+                "title": "Granite Bay",
+                "year": 1994,
+                "resolution": "1080p",
+                "source": "BluRay",
+                "media_processing": "MKV" if a_omit_mp else "REMUX",
+                "category": "Movies :: Bluray",
+                "meta_imdb": "tt1111111",
+            }
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        ack_chat_id, ack_message_id, ack_incoming_digest, last_evaluated_digest,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'torrentleech', ?, ?, ?, ?, ?, 1, 'queued', 0, ?, ?,
+                              '-100123456', 777, ?, 'legacy-eval-digest',
+                              '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:05+00:00')
+                    """,
+                    (
+                        rel_id,
+                        case,
+                        snap["exact_release_name"],
+                        occs[0][0],
+                        occs[-1][0],
+                        occs[-1][0],
+                        latest_base_digest,
+                        json.dumps(snap),
+                        ack_base_digest,
+                    ),
+                )
+                for oid, relp, sha, nbytes, ts in occs:
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (oid, ts, relp, sha, nbytes, rel_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return missing_target
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "801", a_allowed=True, a_omit_mp=False)
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "802", a_allowed=True, a_omit_mp=True)
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "803", a_allowed=False, a_omit_mp=False)
+            backup_804 = root / "occ-804-a1.backup"
+            missing_target_804 = _seed_acked_pre_upgrade(
+                db, cfg.webhook_archive_dir, "804", a_allowed=True, a_omit_mp=True, missing_a_backup=backup_804
+            )
+            assert missing_target_804 is not None
+
+            def _make_runtime():
+                actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                app = create_app(
+                    cfg,
+                    db=db,
+                    actions_client=actions,
+                    triage_client=triage,
+                    tl_scraper=tracker,
+                    tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                    start_worker=False,
+                )
+                return app, actions, triage
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            app1, actions1, triage1 = _make_runtime()
+            with TestClient(app1) as client:
+                for c in ("801", "802", "803", "804"):
+                    self.assertEqual(_row(c)["state"], "suppressed", c)
+
+                def _post(case: str, identity: str, env: str = "") -> str:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=_payload(case, identity, allowed=True, omit_media_processing=False, envelope=env),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    return str(resp.json()["status"])
+
+                def _assessed(case: str) -> list[str]:
+                    return [v["torrent_info"]["imdb_id"] for v in triage1.calls if f".{case}." in v["raw_text"]]
+
+                def _cards(case: str) -> list[dict[str, Any]]:
+                    return [v for v in actions1.card_calls if v.get("external_id") == case]
+
+                # 801 (control) & 802 (A lacked structured REMUX metadata): B wakes once via updated_correction
+                for case in ("801", "802"):
+                    self.assertEqual(_post(case, "B", "redeliver"), "updated_correction", case)
+                    self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()), case)
+                    self.assertEqual(_assessed(case), ["tt2222222"], case)
+                    self.assertEqual(len(_cards(case)), 1, case)
+                    self.assertEqual(_post(case, "B", "dup"), "coalesced_duplicate", case)
+                    self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()), case)
+
+                # 803: replaying previously acked A (reclassified to pre_upgrade_ineligible_scope) MUST coalesce,
+                # then B wakes once via updated_correction
+                self.assertEqual(_post("803", "A", "replay"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("803"), [])
+                self.assertEqual(len(_cards("803")), 0)
+                self.assertEqual(_post("803", "B", "redeliver"), "updated_correction")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("803"), ["tt2222222"])
+                self.assertEqual(len(_cards("803")), 1)
+
+                # 804: missing historical A archive refuses to wake B
+                self.assertEqual(_post("804", "B", "while-missing"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("804"), [])
+                self.assertEqual(len(_cards("804")), 0)
+
+            # Restore 804 A archive + restart -> backfill upgrades ack_incoming_digest -> B wakes once
+            backup_804.rename(missing_target_804)
+            app2, actions2, triage2 = _make_runtime()
+            with TestClient(app2) as client2:
+                r804 = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("804", "B", allowed=True, omit_media_processing=False, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r804.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage2.calls if ".804." in v["raw_text"]],
+                    ["tt2222222"],
+                )
+                self.assertEqual(len([v for v in actions2.card_calls if v.get("external_id") == "804"]), 1)
 
 
 if __name__ == "__main__":

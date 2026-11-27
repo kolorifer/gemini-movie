@@ -175,10 +175,35 @@ def create_app(
         if not constant_time_equals(x_internal_token, cfg.internal_api_secret):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    legacy_digests_backfilled = False
+    legacy_backfill_lock = asyncio.Lock()
+
+    async def _ensure_legacy_digests_backfilled() -> None:
+        nonlocal legacy_digests_backfilled
+        if legacy_digests_backfilled:
+            return
+        async with legacy_backfill_lock:
+            if legacy_digests_backfilled:
+                return
+            await asyncio.to_thread(
+                intake_db.backfill_legacy_occurrence_digests,
+                cfg.webhook_archive_dir,
+                allowed_filter_names=cfg.allowed_filter_names,
+                allowed_filter_ids=cfg.allowed_filter_ids,
+            )
+            await asyncio.to_thread(
+                intake_db.recheck_pre_upgrade_actionable_releases,
+                cfg.webhook_archive_dir,
+                allowed_filter_names=cfg.allowed_filter_names,
+                allowed_filter_ids=cfg.allowed_filter_ids,
+            )
+            legacy_digests_backfilled = True
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await asyncio.to_thread(intake_db.init_db)
         await asyncio.to_thread(verify_archive_root, cfg.webhook_archive_dir)
+        await _ensure_legacy_digests_backfilled()
         if start_worker:
             await worker.start()
         try:
@@ -221,7 +246,11 @@ def create_app(
             logger.error("Required raw archive persistence failed: %s", redact_secrets(str(exc), max_chars=160))
             raise HTTPException(status_code=503, detail="Archive persistence unavailable") from exc
 
-        classified = classify_webhook_payload(parsed)
+        classified = classify_webhook_payload(
+            parsed,
+            allowed_filter_names=cfg.allowed_filter_names,
+            allowed_filter_ids=cfg.allowed_filter_ids,
+        )
         if classified.classification != "movie_candidate":
             if classified.classification == "movie_category_type_conflict":
                 logger.warning(
@@ -243,6 +272,7 @@ def create_app(
                 "release_id": None,
             }
 
+        await _ensure_legacy_digests_backfilled()
         claim = await asyncio.to_thread(
             intake_db.record_movie_occurrence,
             occurrence_id=occurrence_id,

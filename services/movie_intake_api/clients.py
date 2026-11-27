@@ -58,6 +58,19 @@ class TriageEvalResult:
     error_redacted: Optional[str] = None
 
 
+MAX_EVALUATOR_ERROR_CHARS = 16_384
+
+
+def _bound_sanitized_evaluator_error(raw: str, *, max_chars: int = MAX_EVALUATOR_ERROR_CHARS) -> str:
+    """Scrub secrets from evaluator error text and apply an explicit truncation label if bound exceeded."""
+    clean = redact_secrets(raw, max_chars=None)
+    if len(clean) <= max_chars:
+        return clean
+    notice = f" [truncated: exceeded {max_chars}-character safety bound]"
+    keep = max(0, max_chars - len(notice))
+    return clean[:keep].rstrip() + notice
+
+
 class TriageApiClient:
     """Async client calling local movie-triage-api POST /evaluate with X-Internal-Token."""
 
@@ -94,19 +107,28 @@ class TriageApiClient:
                 headers=headers,
             )
             if resp.status_code != 200:
-                detail = redact_secrets(resp.text, max_chars=240)
+                prefix = f"Evaluator returned HTTP {resp.status_code}: "
+                detail = _bound_sanitized_evaluator_error(
+                    resp.text,
+                    max_chars=max(256, MAX_EVALUATOR_ERROR_CHARS - len(prefix)),
+                )
                 return TriageEvalResult(
                     ok=False,
-                    error_redacted=f"Evaluator returned HTTP {resp.status_code}: {detail}",
+                    error_redacted=f"{prefix}{detail}",
                 )
             data = resp.json()
             if not isinstance(data, dict):
                 return TriageEvalResult(ok=False, error_redacted="Evaluator returned non-object JSON")
             return TriageEvalResult(ok=True, payload=data)
         except Exception as exc:
+            prefix = "Evaluator request failed: "
+            detail = _bound_sanitized_evaluator_error(
+                str(exc) or exc.__class__.__name__,
+                max_chars=max(256, MAX_EVALUATOR_ERROR_CHARS - len(prefix)),
+            )
             return TriageEvalResult(
                 ok=False,
-                error_redacted=f"Evaluator request failed: {redact_secrets(str(exc), max_chars=240) or exc.__class__.__name__}",
+                error_redacted=f"{prefix}{detail or exc.__class__.__name__}",
             )
         finally:
             if owns_client:

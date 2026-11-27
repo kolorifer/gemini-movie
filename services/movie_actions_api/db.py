@@ -107,6 +107,8 @@ class ActionGroupSnapshot:
     group_actions: tuple[dict[str, Any], ...]
     group_attempts: tuple[dict[str, Any], ...]
     promoted_stale_attempts: int = 0
+    delivery: Optional[dict[str, Any]] = None
+    release_actions: tuple[dict[str, Any], ...] = ()
 
 
 class ActionsDB:
@@ -121,16 +123,24 @@ class ActionsDB:
         ensure_private_dir(self.db_path.parent)
         for suffix in ("", "-wal", "-shm"):
             p = Path(f"{self.db_path}{suffix}")
-            if os.path.islink(str(p)):
-                raise PrivateFileError(f"Refusing symlinked SQLite file: {p.name}")
-            if p.exists():
+            is_sidecar = suffix in ("-wal", "-shm")
+            try:
                 st = os.lstat(str(p))
-                if not stat.S_ISREG(st.st_mode):
-                    raise PrivateFileError(f"SQLite path is not a regular file: {p.name}")
-                if st.st_uid != os.getuid():
-                    raise PrivateFileError(f"SQLite file not owned by current user: {p.name}")
-                if (st.st_mode & 0o077) != 0:
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                raise PrivateFileError(f"Refusing symlinked SQLite file: {p.name}")
+            if not stat.S_ISREG(st.st_mode):
+                raise PrivateFileError(f"SQLite path is not a regular file: {p.name}")
+            if st.st_uid != os.getuid():
+                raise PrivateFileError(f"SQLite file not owned by current user: {p.name}")
+            if (st.st_mode & 0o077) != 0:
+                try:
                     os.chmod(str(p), 0o600)
+                except FileNotFoundError:
+                    if is_sidecar:
+                        continue
+                    raise
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_private_db_files()
@@ -614,7 +624,7 @@ class ActionsDB:
                     conn.execute("COMMIT;")
                     return CardDeliveryPlan(mode="ambiguous", detail="existing_ambiguous_delivery")
 
-                if status == "delivered":
+                if status in ("delivered", "edit_failed"):
                     prev_rev = int(row["card_revision"])
                     prev_kind = str(row["delivery_kind"])
                     ack_chat = str(row["ack_chat_id"] or "")
@@ -636,7 +646,7 @@ class ActionsDB:
                         conn.execute("COMMIT;")
                         return CardDeliveryPlan(mode="ambiguous", detail="missing_ack_message_id")
 
-                    if card_revision <= prev_rev:
+                    if status == "delivered" and card_revision <= prev_rev:
                         conn.execute("COMMIT;")
                         return CardDeliveryPlan(
                             mode="already_delivered",
@@ -649,19 +659,53 @@ class ActionsDB:
                             eval_reply_status=str(row["eval_reply_status"] or "pending"),
                         )
 
-                    # Higher card_revision edit: check if any Radarr-mutating action already started/completed
-                    locked_row = conn.execute(
-                        """
-                        SELECT action_id, status FROM actions
-                        WHERE release_id = ?
-                          AND action_type != 'skip'
-                          AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
-                        LIMIT 1
-                        """,
-                        (release_id,),
-                    ).fetchone()
+                    if status == "edit_failed" and card_revision < prev_rev:
+                        conn.execute("COMMIT;")
+                        return CardDeliveryPlan(
+                            mode="already_delivered",
+                            ack_chat_id=ack_chat,
+                            ack_message_id=int(ack_msg),
+                            ack_thread_id=int(ack_thread) if ack_thread is not None else None,
+                            used_poster=used_poster,
+                            previous_card_revision=prev_rev,
+                            previous_delivery_kind=prev_kind,
+                            eval_reply_status=str(row["eval_reply_status"] or "pending"),
+                        )
+
+                    # Higher card_revision edit (PR #18 Blocker 2 & Round 2 Blocker 3a):
+                    # - `retired` NEVER reopens actions (0 minted buttons); always proceed with the edit,
+                    #   persist card_revision/delivery_kind='retired', and supersede active tokens so any
+                    #   in-flight pre-push Phase 1 (radarr_add_movie) immediately sees the retirement.
+                    # - `evidence_review`, `verified_proposal`, and `alternative_grab` lock ONLY if an
+                    #   irreversible write (`completed_radarr`, `completed_all`, or a push/watched/qbit
+                    #   attempt in attempting/ambiguous/succeeded) has already started or completed.
+                    #   An in-flight pre-push Phase 1 (`radarr_add_movie`) MUST NOT block a verified
+                    #   correction: we persist the new revision immediately so Phase 1 aborts before
+                    #   issuing any release push for the stale identity.
+                    locked_row = None
+                    if delivery_kind != "retired":
+                        locked_row = conn.execute(
+                            """
+                            SELECT a.action_id, a.status
+                            FROM actions a
+                            WHERE a.release_id = ?
+                              AND a.action_type != 'skip'
+                              AND (
+                                  a.status IN ('completed_radarr', 'completed_all')
+                                  OR EXISTS (
+                                      SELECT 1 FROM write_attempts w
+                                      WHERE w.action_id = a.action_id
+                                        AND w.phase IN ('radarr_release_push', 'radarr_watched', 'qbit_alternative_grab')
+                                        AND w.status IN ('attempting', 'ambiguous', 'succeeded')
+                                  )
+                              )
+                            LIMIT 1
+                            """,
+                            (release_id,),
+                        ).fetchone()
+
                     if locked_row is not None:
-                        # Never overwrite or reopen a release whose Radarr write is in-flight/completed.
+                        # Never overwrite or reopen a release whose irreversible Radarr/qBit write is in-flight/completed.
                         # If a conflict downgrade arrived anyway, still supersede any unclicked active tokens.
                         if delivery_kind == "evidence_review":
                             conn.execute(
@@ -702,16 +746,21 @@ class ActionsDB:
                         )
 
                     minted_ids = self._insert_actions_locked(conn, new_actions, now_iso=now_iso)
+                    # Persist the higher card_revision & delivery_kind immediately BEFORE
+                    # calling Telegram so any concurrent pre-push eligibility check sees the
+                    # correction/retirement/downgrade atomically and invalidates stale pushes.
                     conn.execute(
                         """
                         UPDATE deliveries
-                        SET status = 'sending',
+                        SET card_revision = ?,
+                            delivery_kind = ?,
+                            status = 'sending',
                             process_instance_id = ?,
                             lease_expires_at = ?,
                             updated_at = ?
                         WHERE release_id = ?
                         """,
-                        (process_instance_id, lease_expires_at, now_iso, release_id),
+                        (card_revision, delivery_kind, process_instance_id, lease_expires_at, now_iso, release_id),
                     )
                     conn.execute("COMMIT;")
                     return CardDeliveryPlan(
@@ -956,30 +1005,44 @@ class ActionsDB:
                     [now_iso, *newly_minted_action_ids],
                 )
             if is_edit:
-                if not keep_prior_superseded and superseded_action_ids:
-                    placeholders = ",".join("?" for _ in superseded_action_ids)
+                if keep_prior_superseded:
                     conn.execute(
-                        f"""
-                        UPDATE actions
-                        SET status = 'active', updated_at = ?
-                        WHERE action_id IN ({placeholders}) AND status = 'superseded'
+                        """
+                        UPDATE deliveries
+                        SET status = 'edit_failed',
+                            process_instance_id = NULL,
+                            lease_expires_at = NULL,
+                            last_error_redacted = ?,
+                            updated_at = ?
+                        WHERE release_id = ?
                         """,
-                        [now_iso, *superseded_action_ids],
+                        (clean_err, now_iso, release_id),
                     )
-                conn.execute(
-                    """
-                    UPDATE deliveries
-                    SET card_revision = ?,
-                        delivery_kind = ?,
-                        status = 'delivered',
-                        process_instance_id = NULL,
-                        lease_expires_at = NULL,
-                        last_error_redacted = ?,
-                        updated_at = ?
-                    WHERE release_id = ?
-                    """,
-                    (restore_card_revision, restore_delivery_kind, clean_err, now_iso, release_id),
-                )
+                else:
+                    if superseded_action_ids:
+                        placeholders = ",".join("?" for _ in superseded_action_ids)
+                        conn.execute(
+                            f"""
+                            UPDATE actions
+                            SET status = 'active', updated_at = ?
+                            WHERE action_id IN ({placeholders}) AND status = 'superseded'
+                            """,
+                            [now_iso, *superseded_action_ids],
+                        )
+                    conn.execute(
+                        """
+                        UPDATE deliveries
+                        SET card_revision = ?,
+                            delivery_kind = ?,
+                            status = 'delivered',
+                            process_instance_id = NULL,
+                            lease_expires_at = NULL,
+                            last_error_redacted = ?,
+                            updated_at = ?
+                        WHERE release_id = ?
+                        """,
+                        (restore_card_revision, restore_delivery_kind, clean_err, now_iso, release_id),
+                    )
             else:
                 conn.execute(
                     """
@@ -1058,6 +1121,7 @@ class ActionsDB:
         card_revision: int,
         expected_ack_chat_id: Optional[str],
         expected_ack_message_id: Optional[int],
+        expected_ack_thread_id: Optional[int] = None,
         process_instance_id: str,
         lease_expires_at: str,
     ) -> EvalReplyPlan:
@@ -1105,6 +1169,7 @@ class ActionsDB:
             ack_chat = str(row["ack_chat_id"] or "")
             ack_msg = row["ack_message_id"]
             ack_thread = row["ack_thread_id"]
+            target_thread = row["target_thread_id"]
             if (
                 del_status == "ambiguous_delivery"
                 or del_status != "delivered"
@@ -1118,6 +1183,17 @@ class ActionsDB:
                     detail=f"cannot_reply_to_delivery_status:{del_status}",
                 )
 
+            # Issue #13 §6c: Distinguish topic chats (`target_thread_id IS NOT NULL`) from known
+            # non-topic chats (`target_thread_id IS NULL`). If a topic was requested but Telegram
+            # omitted `message_thread_id` in its acknowledgement, topic correlation is unknown and
+            # dependent replies MUST NOT guess the destination.
+            if target_thread is not None and ack_thread is None:
+                conn.execute("COMMIT;")
+                return EvalReplyPlan(
+                    mode="reject_unanchored",
+                    detail="ack_thread_id_omitted_for_topic_chat",
+                )
+
             if expected_ack_message_id is not None and int(expected_ack_message_id) != int(ack_msg):
                 conn.execute("COMMIT;")
                 return EvalReplyPlan(
@@ -1129,6 +1205,14 @@ class ActionsDB:
                 return EvalReplyPlan(
                     mode="reject_receipt_mismatch",
                     detail="ack_chat_id_mismatch",
+                )
+            if expected_ack_thread_id is not None and (
+                ack_thread is None or int(expected_ack_thread_id) != int(ack_thread)
+            ):
+                conn.execute("COMMIT;")
+                return EvalReplyPlan(
+                    mode="reject_receipt_mismatch",
+                    detail="ack_thread_id_mismatch",
                 )
 
             current_card_rev = int(row["card_revision"] or 0)
@@ -1302,6 +1386,7 @@ class ActionsDB:
                 return ActionGroupSnapshot(action=None, group_actions=(), group_attempts=())
             action = dict(row)
             group = str(action["completion_group"])
+            release_id = str(action["release_id"])
             g_actions = conn.execute(
                 "SELECT * FROM actions WHERE completion_group = ? ORDER BY created_at ASC, action_id ASC",
                 (group,),
@@ -1314,10 +1399,20 @@ class ActionsDB:
                 """,
                 (group,),
             ).fetchall()
+            del_row = conn.execute(
+                "SELECT * FROM deliveries WHERE release_id = ?",
+                (release_id,),
+            ).fetchone()
+            rel_actions = conn.execute(
+                "SELECT * FROM actions WHERE release_id = ? ORDER BY created_at ASC, action_id ASC",
+                (release_id,),
+            ).fetchall()
             return ActionGroupSnapshot(
                 action=action,
                 group_actions=tuple(dict(r) for r in g_actions),
                 group_attempts=tuple(dict(r) for r in g_attempts),
+                delivery=dict(del_row) if del_row is not None else None,
+                release_actions=tuple(dict(r) for r in rel_actions),
             )
         finally:
             conn.close()
@@ -1329,7 +1424,7 @@ class ActionsDB:
         current_process_instance_id: str,
         now_iso: Optional[str] = None,
     ) -> ActionGroupSnapshot:
-        """Atomically promote any expired/orphaned attempts in completion_group and return snapshot."""
+        """Atomically promote any expired/orphaned attempts on release/group and return snapshot."""
         ts = now_iso or utc_now_iso()
         conn = self._connect()
         try:
@@ -1342,11 +1437,12 @@ class ActionsDB:
                 conn.execute("COMMIT;")
                 return ActionGroupSnapshot(action=None, group_actions=(), group_attempts=())
             group = str(row["completion_group"])
+            release_id = str(row["release_id"])
             promoted = self._promote_stale_attempts_locked(
                 conn,
                 current_process_instance_id=current_process_instance_id,
                 now_iso=ts,
-                completion_group=group,
+                release_id=release_id,
             )
             action = dict(
                 conn.execute(
@@ -1366,13 +1462,48 @@ class ActionsDB:
                 """,
                 (group,),
             ).fetchall()
+            del_row = conn.execute(
+                "SELECT * FROM deliveries WHERE release_id = ?",
+                (release_id,),
+            ).fetchone()
+            rel_actions = conn.execute(
+                "SELECT * FROM actions WHERE release_id = ? ORDER BY created_at ASC, action_id ASC",
+                (release_id,),
+            ).fetchall()
             conn.execute("COMMIT;")
             return ActionGroupSnapshot(
                 action=action,
                 group_actions=tuple(dict(r) for r in g_actions),
                 group_attempts=tuple(dict(r) for r in g_attempts),
                 promoted_stale_attempts=promoted,
+                delivery=dict(del_row) if del_row is not None else None,
+                release_actions=tuple(dict(r) for r in rel_actions),
             )
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
+    def mark_action_superseded(self, *, action_id: str, detail: Optional[str] = None) -> bool:
+        """Mark an active action superseded when its card revision is stale or retired."""
+        ts = utc_now_iso()
+        clean_err = redact_secrets(detail, max_chars=240) if detail else None
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute(
+                """
+                UPDATE actions
+                SET status = 'superseded',
+                    last_error_redacted = COALESCE(?, last_error_redacted),
+                    updated_at = ?
+                WHERE action_id = ? AND status = 'active'
+                """,
+                (clean_err, ts, action_id),
+            )
+            conn.execute("COMMIT;")
+            return cur.rowcount == 1
         except Exception:
             conn.execute("ROLLBACK;")
             raise
@@ -1406,11 +1537,20 @@ class ActionsDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            action_row = conn.execute(
+                "SELECT * FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if action_row is None:
+                conn.execute("COMMIT;")
+                return False, None, "not_found"
+
+            release_id = str(action_row["release_id"])
             self._promote_stale_attempts_locked(
                 conn,
                 current_process_instance_id=process_instance_id,
                 now_iso=ts,
-                completion_group=completion_group,
+                release_id=release_id,
             )
 
             action_row = conn.execute(
@@ -1425,6 +1565,83 @@ class ActionsDB:
             if act_status not in allowed_action_statuses:
                 conn.execute("COMMIT;")
                 return False, None, f"status:{act_status}"
+
+            # Issue #13 §2b & PR #18 Blocker 2:
+            # 1) For fresh initiation (`active`) OR any pre-push/acquisition claim (including Phase A
+            #    timeout recovery), atomically re-verify latest delivery revision/kind so a retired
+            #    or superseded card can NEVER start a release push or qBittorrent add.
+            is_pre_push_phase = phase in (
+                "radarr_add_movie",
+                "radarr_release_push",
+                "qbit_alt_preflight",
+                "qbit_alternative_grab",
+            )
+            if act_status == "active" or is_pre_push_phase:
+                del_row = conn.execute(
+                    "SELECT card_revision, delivery_kind, status FROM deliveries WHERE release_id = ?",
+                    (release_id,),
+                ).fetchone()
+                if del_row is not None:
+                    latest_rev = int(del_row["card_revision"] or 0)
+                    latest_kind = str(del_row["delivery_kind"] or "")
+                    if latest_rev > int(action_row["card_revision"] or 0):
+                        conn.execute(
+                            "UPDATE actions SET status = 'superseded', updated_at = ? WHERE action_id = ? AND status IN ('active', 'ambiguous_radarr')",
+                            (ts, action_id),
+                        )
+                        conn.execute("COMMIT;")
+                        return False, None, "stale_card_revision"
+                    if latest_kind in ("retired", "evidence_review"):
+                        conn.execute(
+                            "UPDATE actions SET status = 'superseded', updated_at = ? WHERE action_id = ? AND status IN ('active', 'ambiguous_radarr')",
+                            (ts, action_id),
+                        )
+                        conn.execute("COMMIT;")
+                        return False, None, f"delivery_{latest_kind}"
+
+            # 2) Bidirectional mutual exclusion between acquisition pushes and Watched choices:
+            #    - Any acquisition phase is blocked once a sibling watched_* started/completed/ambiguous.
+            #    - Any radarr_watched phase is blocked once an irreversible push/grab
+            #      (radarr_release_push / qbit_alternative_grab) has entered attempting/ambiguous/succeeded
+            #      or add_grab/alternative_grab completed.
+            if is_pre_push_phase:
+                watched_sib = conn.execute(
+                    """
+                    SELECT action_id, status FROM actions
+                    WHERE release_id = ?
+                      AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated')
+                      AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
+                    LIMIT 1
+                    """,
+                    (release_id,),
+                ).fetchone()
+                if watched_sib is not None:
+                    conn.execute("COMMIT;")
+                    return False, None, f"sibling_watched:{watched_sib['status']}"
+
+            if phase == "radarr_watched":
+                grab_push_sib = conn.execute(
+                    """
+                    SELECT a.action_id, a.status
+                    FROM actions a
+                    WHERE a.release_id = ?
+                      AND a.action_type IN ('add_grab', 'alternative_grab')
+                      AND (
+                          a.status IN ('completed_radarr', 'completed_all')
+                          OR EXISTS (
+                              SELECT 1 FROM write_attempts w
+                              WHERE w.action_id = a.action_id
+                                AND w.phase IN ('radarr_release_push', 'qbit_alternative_grab')
+                                AND w.status IN ('attempting', 'ambiguous', 'succeeded')
+                          )
+                      )
+                    LIMIT 1
+                    """,
+                    (release_id,),
+                ).fetchone()
+                if grab_push_sib is not None:
+                    conn.execute("COMMIT;")
+                    return False, None, f"sibling_grab:{grab_push_sib['status']}"
 
             # Check if another attempt is currently active in this completion_group
             active_att = conn.execute(
@@ -1728,6 +1945,51 @@ class ActionsDB:
         finally:
             conn.close()
 
+    @staticmethod
+    def _check_pre_push_db_authorization_locked(
+        conn: sqlite3.Connection,
+        action_row: sqlite3.Row,
+        *,
+        now_iso: str,
+    ) -> Optional[str]:
+        """
+        Atomically verify inside BEGIN IMMEDIATE that a release is still authorized to enter
+        its FIRST release push / qBittorrent add (latest revision, not retired/evidence_review,
+        not expired, and no conflicting sibling watched_* action).
+        Returns None when authorized, or a short disqualification reason code.
+        """
+        release_id = str(action_row["release_id"])
+        act_rev = int(action_row["card_revision"] or 0)
+        del_row = conn.execute(
+            "SELECT card_revision, delivery_kind, status FROM deliveries WHERE release_id = ?",
+            (release_id,),
+        ).fetchone()
+        if del_row is not None:
+            latest_rev = int(del_row["card_revision"] or 0)
+            latest_kind = str(del_row["delivery_kind"] or "")
+            if latest_rev > act_rev:
+                return "stale_card_revision"
+            if latest_kind in ("retired", "evidence_review"):
+                return f"delivery_{latest_kind}"
+
+        exp_raw = action_row["expires_at"]
+        if isinstance(exp_raw, str) and exp_raw.strip() and exp_raw <= now_iso:
+            return "expired"
+
+        watched_sib = conn.execute(
+            """
+            SELECT action_id, status FROM actions
+            WHERE release_id = ?
+              AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated')
+              AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
+            LIMIT 1
+            """,
+            (release_id,),
+        ).fetchone()
+        if watched_sib is not None:
+            return f"sibling_watched:{watched_sib['status']}"
+        return None
+
     def mark_phase1_add_movie_reconciled(
         self,
         *,
@@ -1739,8 +2001,8 @@ class ActionsDB:
     ) -> bool:
         """
         Mark ambiguous Phase 1 (radarr_add_movie) succeeded before entering Phase 2.
-        Returns False if a prior radarr_release_push attempt already exists (attempting/ambiguous/succeeded)
-        or if the action is no longer ambiguous_radarr.
+        Returns False if a prior radarr_release_push attempt already exists (attempting/ambiguous/succeeded),
+        if the action is no longer ambiguous_radarr, or if the release was retired/superseded/watched.
         """
         now_iso = utc_now_iso()
         clean_outcome = redact_secrets(outcome_summary, max_chars=300)
@@ -1748,10 +2010,19 @@ class ActionsDB:
         try:
             conn.execute("BEGIN IMMEDIATE;")
             act_row = conn.execute(
-                "SELECT status FROM actions WHERE action_id = ?",
+                "SELECT * FROM actions WHERE action_id = ?",
                 (action_id,),
             ).fetchone()
             if act_row is None or str(act_row["status"]) != "ambiguous_radarr":
+                conn.execute("COMMIT;")
+                return False
+            disqual = self._check_pre_push_db_authorization_locked(conn, act_row, now_iso=now_iso)
+            if disqual is not None:
+                if disqual in ("stale_card_revision", "delivery_retired", "delivery_evidence_review"):
+                    conn.execute(
+                        "UPDATE actions SET status = 'superseded', last_error_redacted = ?, updated_at = ? WHERE action_id = ? AND status = 'ambiguous_radarr'",
+                        (f"blocked_before_push:{disqual}", now_iso, action_id),
+                    )
                 conn.execute("COMMIT;")
                 return False
             prior_push = conn.execute(
@@ -1846,8 +2117,9 @@ class ActionsDB:
     ) -> Optional[str]:
         """
         Atomically mark Phase 1 (radarr_add_movie) succeeded and open Phase 2 (radarr_release_push).
-        Returns None if a prior radarr_release_push attempt already exists in completion_group
-        or if phase1_attempt_id no longer owns the active attempting claim.
+        Returns None if a prior radarr_release_push attempt already exists in completion_group,
+        if phase1_attempt_id no longer owns the active attempting claim, or if the release was
+        retired/superseded/expired or blocked by a sibling watched action while Phase 1 ran.
         """
         now_iso = utc_now_iso()
         phase2_attempt_id = generate_uuid7()
@@ -1864,6 +2136,43 @@ class ActionsDB:
                 (phase1_attempt_id, action_id),
             ).fetchone()
             if p1_row is None or str(p1_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            act_row = conn.execute(
+                "SELECT * FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if act_row is None or str(act_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            disqual = self._check_pre_push_db_authorization_locked(conn, act_row, now_iso=now_iso)
+            if disqual is not None:
+                # Phase 1 add_movie completed on Radarr, but the action is NO LONGER authorized
+                # to push a release (retired card, newer revision, expired, or Watched won).
+                # Close Phase 1 cleanly and supersede this action so zero push can proceed.
+                conn.execute(
+                    """
+                    UPDATE write_attempts
+                    SET status = 'succeeded',
+                        outcome_summary = ?,
+                        finished_at = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (redact_secrets(f"{clean_outcome};blocked_before_push:{disqual}", max_chars=300), now_iso, phase1_attempt_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE actions
+                    SET status = 'superseded',
+                        radarr_movie_id = ?,
+                        last_error_redacted = ?,
+                        updated_at = ?
+                    WHERE action_id = ? AND status = 'attempting'
+                    """,
+                    (radarr_movie_id, redact_secrets(f"blocked_before_push:{disqual}", max_chars=300), now_iso, action_id),
+                )
                 conn.execute("COMMIT;")
                 return None
 
@@ -1959,6 +2268,40 @@ class ActionsDB:
                 (preflight_attempt_id, action_id),
             ).fetchone()
             if p1_row is None or str(p1_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            act_row = conn.execute(
+                "SELECT * FROM actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if act_row is None or str(act_row["status"]) != "attempting":
+                conn.execute("COMMIT;")
+                return None
+
+            disqual = self._check_pre_push_db_authorization_locked(conn, act_row, now_iso=now_iso)
+            if disqual is not None:
+                conn.execute(
+                    """
+                    UPDATE write_attempts
+                    SET status = 'failed_definitive',
+                        outcome_summary = ?,
+                        finished_at = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (redact_secrets(f"blocked_before_qbit_add:{disqual}", max_chars=300), now_iso, preflight_attempt_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE actions
+                    SET status = 'superseded',
+                        radarr_movie_id = ?,
+                        last_error_redacted = ?,
+                        updated_at = ?
+                    WHERE action_id = ? AND status = 'attempting'
+                    """,
+                    (radarr_movie_id, redact_secrets(f"blocked_before_qbit_add:{disqual}", max_chars=300), now_iso, action_id),
+                )
                 conn.execute("COMMIT;")
                 return None
 

@@ -12,6 +12,20 @@ TELEGRAM_TEXT_UTF16_LIMIT = 4096
 
 _SAFE_POSTER_PATH_RE = re.compile(r"^/[A-Za-z0-9_.-]+\.(?:jpg|jpeg|png|webp)$")
 _IMDB_ID_RE = re.compile(r"^tt\d{7,10}$", re.IGNORECASE)
+_NUMERIC_LISTING_ID_RE = re.compile(r"^\d{1,18}$")
+MAX_TELEGRAM_ERROR_REPORT_CHARS = 32_768
+
+
+def _canonical_tracker_listing_link(indexer: str, external_id: Any) -> Optional[str]:
+    """
+    Issue #13 §6a: Build a canonical public listing HTML anchor for an eligible tracker
+    and validated numeric listing ID. NEVER builds or emits download URLs.
+    """
+    idx_norm = str(indexer or "").strip().lower()
+    ext_str = str(external_id or "").strip()
+    if idx_norm == "torrentleech" and _NUMERIC_LISTING_ID_RE.fullmatch(ext_str):
+        return f'<a href="https://www.torrentleech.org/torrent/{ext_str}">TL Listing ({ext_str})</a>'
+    return None
 
 
 def utf16_len(text: str) -> int:
@@ -109,19 +123,25 @@ def build_card_html(
     """Format Telegram HTML card strictly within `max_utf16_units` (1024 caption or 4096 text)."""
     delivery_kind = str(card_payload.get("delivery_kind") or "evidence_review")
     release_name = redact_secrets(str(card_payload.get("exact_release_name") or ""), max_chars=260)
-    indexer = redact_secrets(str(card_payload.get("indexer") or "unknown"), max_chars=60)
+    indexer_raw = str(card_payload.get("indexer") or "unknown")
+    indexer = redact_secrets(indexer_raw, max_chars=60)
+    external_id = card_payload.get("external_id")
     category = redact_secrets(str(card_payload.get("category") or ""), max_chars=80)
     size_gb = card_payload.get("size_gb")
     freeleech = card_payload.get("freeleech")
     radarr_note = redact_secrets(str(card_payload.get("radarr_note") or ""), max_chars=160)
     conflict_reason = redact_secrets(str(card_payload.get("conflict_reason") or ""), max_chars=300)
     tl_outcome = redact_secrets(str(card_payload.get("tl_outcome") or ""), max_chars=60)
+    accepted_evidence = redact_secrets(str(card_payload.get("accepted_evidence") or ""), max_chars=220)
+    checks_passed = card_payload.get("checks_passed")
+    checks_failed = card_payload.get("checks_failed")
 
     verified_title = redact_secrets(str(card_payload.get("verified_title") or ""), max_chars=160)
     verified_year = card_payload.get("verified_year")
     verified_tmdb = card_payload.get("verified_tmdb_id")
     verified_imdb = card_payload.get("verified_imdb_id")
     card_revision = int(card_payload.get("card_revision") or 1)
+    listing_anchor = _canonical_tracker_listing_link(indexer_raw, external_id)
 
     lines: list[tuple[str, str, str]] = []
     if delivery_kind == "actionable_grab":
@@ -137,6 +157,15 @@ def build_card_html(
         rej_class = redact_secrets(str(card_payload.get("bound_rejection_class") or ""), max_chars=80)
         if rej_class:
             lines.append(("<b>Quality Policy:</b> ", rej_class, ""))
+    elif delivery_kind == "retired":
+        header = (
+            f"{verified_title} ({verified_year})"
+            if verified_title and verified_year
+            else (verified_title or "Release Proposal")
+        )
+        if card_revision > 1:
+            header = f"{header} [Updated rev {card_revision}]"
+        lines.append(("⛔ <b>Proposal Retired (No Longer Eligible): ", header, "</b>"))
     else:
         header = "Evidence Review (Manual Check Required)"
         if card_revision > 1:
@@ -185,8 +214,39 @@ def build_card_html(
             obs_parts.append(f"tl_imdb={redact_secrets(str(card_payload['observed_tl_imdb']), max_chars=24)}")
         if obs_parts:
             lines.append(("<b>Observed IDs:</b> ", ", ".join(obs_parts), ""))
-    else:
+        if isinstance(checks_failed, list) and checks_failed:
+            clean_failed = [redact_secrets(str(c), max_chars=48) for c in checks_failed[:5] if str(c).strip()]
+            if clean_failed:
+                lines.append(("<b>Failed Checks:</b> ", ", ".join(clean_failed), ""))
+        if isinstance(checks_passed, list) and checks_passed:
+            clean_passed = [redact_secrets(str(c), max_chars=48) for c in checks_passed[:6] if str(c).strip()]
+            if clean_passed:
+                lines.append(("<b>Passed Checks:</b> ", ", ".join(clean_passed), ""))
+        if listing_anchor:
+            lines.append((listing_anchor, "", ""))
+    elif delivery_kind == "retired":
+        if conflict_reason:
+            lines.append(("<b>Status:</b> ", conflict_reason, ""))
         link_bits: list[str] = []
+        if listing_anchor:
+            link_bits.append(listing_anchor)
+        if isinstance(verified_imdb, str) and _IMDB_ID_RE.fullmatch(verified_imdb.strip()):
+            clean_imdb = verified_imdb.strip().lower()
+            link_bits.append(f'<a href="https://www.imdb.com/title/{clean_imdb}/">IMDb ({clean_imdb})</a>')
+        if isinstance(verified_tmdb, int) and not isinstance(verified_tmdb, bool) and verified_tmdb > 0:
+            link_bits.append(f'<a href="https://www.themoviedb.org/movie/{verified_tmdb}">TMDB ({verified_tmdb})</a>')
+        if link_bits:
+            lines.append((" | ".join(link_bits), "", ""))
+    else:
+        if accepted_evidence:
+            lines.append(("<b>Accepted Evidence:</b> ", accepted_evidence, ""))
+        elif isinstance(checks_passed, list) and checks_passed:
+            clean_passed = [redact_secrets(str(c), max_chars=48) for c in checks_passed[:6] if str(c).strip()]
+            if clean_passed:
+                lines.append(("<b>Verified Checks:</b> ", ", ".join(clean_passed), ""))
+        link_bits = []
+        if listing_anchor:
+            link_bits.append(listing_anchor)
         if isinstance(verified_imdb, str) and _IMDB_ID_RE.fullmatch(verified_imdb.strip()):
             clean_imdb = verified_imdb.strip().lower()
             link_bits.append(f'<a href="https://www.imdb.com/title/{clean_imdb}/">IMDb ({clean_imdb})</a>')
@@ -204,8 +264,8 @@ def build_inline_keyboard(
     public_base_url: str,
     action_tokens: dict[str, str],
 ) -> dict[str, Any]:
-    """Build Telegram InlineKeyboardMarkup for verified cards; empty keyboard for evidence_review."""
-    if delivery_kind == "evidence_review" or not action_tokens:
+    """Build Telegram InlineKeyboardMarkup for verified cards; empty keyboard for evidence_review/retired."""
+    if delivery_kind in ("evidence_review", "retired") or not action_tokens:
         return {"inline_keyboard": []}
 
     base = public_base_url.rstrip("/")
@@ -306,18 +366,51 @@ def format_evaluation_reply(
 ) -> FormattedEvaluationReply:
     """
     Format evaluation reply strictly within Telegram's 4,096 UTF-16 budget.
-    When full details exceed budget, returns a compact summary within budget + full `.txt` attachment.
+    When full details (or full sanitized evaluator error details) exceed budget, returns a
+    compact summary within budget + private `.txt` attachment, explicitly labeling any safety-bound truncation.
     """
     if not isinstance(evaluation, dict):
-        clean_err = redact_secrets(error_redacted or "Evaluator unavailable", max_chars=600)
-        html_text = _assemble_lines_within_budget(
-            [
-                ("⚠️ <b>Evaluation Unavailable</b>", "", ""),
-                ("<code>", clean_err, "</code>"),
-            ],
-            max_utf16_units,
+        # Issue #13 §6b: Retain full bounded sanitized error; inline if it fits, else attach .txt
+        raw_clean = redact_secrets(error_redacted or "Evaluator unavailable", max_chars=None)
+        if not raw_clean:
+            raw_clean = "Evaluator unavailable"
+        was_bound_truncated = False
+        if len(raw_clean) > MAX_TELEGRAM_ERROR_REPORT_CHARS:
+            notice = f" [truncated: exceeded {MAX_TELEGRAM_ERROR_REPORT_CHARS}-character safety bound]"
+            keep = max(0, MAX_TELEGRAM_ERROR_REPORT_CHARS - len(notice))
+            bounded_err = raw_clean[:keep].rstrip() + notice
+            was_bound_truncated = True
+        else:
+            bounded_err = raw_clean
+
+        full_inline_html = f"⚠️ <b>Evaluation Unavailable</b>\n<code>{escape_html(bounded_err)}</code>"
+        if utf16_len(full_inline_html) <= max_utf16_units:
+            return FormattedEvaluationReply(html_text=full_inline_html, attach_txt=False)
+
+        preview_len = min(400, max(120, max_utf16_units // 4))
+        tail_note = (
+            "Full sanitized error details attached as .txt below (output truncated at safety bound)."
+            if (was_bound_truncated or "[truncated:" in bounded_err)
+            else "Full sanitized error details attached as .txt below."
         )
-        return FormattedEvaluationReply(html_text=html_text, attach_txt=False)
+        summary_lines: list[tuple[str, str, str]] = [
+            ("⚠️ <b>Evaluation Unavailable</b>", "", ""),
+            ("<code>", bounded_err[:preview_len].rstrip() + "...", "</code>"),
+            ("<i>", tail_note, "</i>"),
+        ]
+        summary_html = _assemble_lines_within_budget(summary_lines, max_utf16_units)
+        short_id = re.sub(r"[^a-zA-Z0-9_-]", "", release_id)[:12] or "report"
+        txt_content = (
+            f"Movie Evaluation Error Report (release={release_id})\n"
+            f"Safety-Bound Truncated: {'yes' if (was_bound_truncated or '[truncated:' in bounded_err) else 'no'}\n\n"
+            f"{bounded_err}\n"
+        )
+        return FormattedEvaluationReply(
+            html_text=summary_html,
+            attach_txt=True,
+            txt_filename=f"evaluation_error_{short_id}.txt",
+            txt_content=txt_content,
+        )
 
     ident = evaluation.get("identification") if isinstance(evaluation.get("identification"), dict) else {}
     ratings = evaluation.get("ratings") if isinstance(evaluation.get("ratings"), dict) else {}

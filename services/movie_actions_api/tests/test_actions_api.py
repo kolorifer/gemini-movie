@@ -925,7 +925,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     # --- 5c: HTTP 200 rejected push (approved=false, rejected=true) ---
                     r_card5c = await client.post(
                         "/internal/deliver/card",
-                        json=_verified_card_payload(release_id="rel-5c", tmdb_id=600502, title="Rejected Push"),
+                        json=_verified_card_payload(
+                            release_id="rel-5c",
+                            tmdb_id=600502,
+                            imdb_id="tt6005020",
+                            title="Rejected Push",
+                        ),
                         headers=headers,
                     )
                     self.assertEqual(r_card5c.status_code, 200)
@@ -1180,19 +1185,40 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                         bound_rejection_class=None,
                         expires_at=expires_future,
                     ),
+                ],
+            )
+            db.finish_card_delivery_success(
+                "rel-crash-1",
+                card_revision=1,
+                delivery_kind="actionable_grab",
+                ack_chat_id="-100",
+                ack_message_id=9001,
+                ack_thread_id=20,
+                used_poster=False,
+                is_edit=False,
+            )
+            db.begin_card_delivery(
+                release_id="rel-crash-watched",
+                card_revision=1,
+                delivery_kind="actionable_grab",
+                target_chat_id="-100",
+                target_thread_id=20,
+                process_instance_id=dead_proc,
+                lease_expires_at=future_lease,
+                new_actions=[
                     NewActionRecord(
                         action_id=act_watched_id,
                         token_sha256=hash_token(tok_watched),
-                        release_id="rel-crash-1",
+                        release_id="rel-crash-watched",
                         card_revision=1,
-                        source_occurrence_id="occ-1",
+                        source_occurrence_id="occ-w",
                         action_type="watched_good",
-                        completion_group="watched:rel-crash-1:800101",
-                        bound_tmdb_id=800101,
-                        bound_imdb_id="tt8001010",
-                        bound_title="Crash Grab",
+                        completion_group="watched:rel-crash-watched:800102",
+                        bound_tmdb_id=800102,
+                        bound_imdb_id="tt8001020",
+                        bound_title="Crash Watched",
                         bound_year=2025,
-                        bound_release_name="Crash.Grab.2025.2160p.REMUX-GRP",
+                        bound_release_name="Crash.Watched.2025.2160p.REMUX-GRP",
                         bound_existing_movie_id=None,
                         bound_existing_file_id=None,
                         bound_existing_file_quality=None,
@@ -1202,11 +1228,11 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             db.finish_card_delivery_success(
-                "rel-crash-1",
+                "rel-crash-watched",
                 card_revision=1,
                 delivery_kind="actionable_grab",
                 ack_chat_id="-100",
-                ack_message_id=9001,
+                ack_message_id=9002,
                 ack_thread_id=20,
                 used_poster=False,
                 is_edit=False,
@@ -1225,13 +1251,13 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ok_p)
             ok_w, _, _ = db.begin_write_attempt(
                 action_id=act_watched_id,
-                completion_group="watched:rel-crash-1:800101",
+                completion_group="watched:rel-crash-watched:800102",
                 phase="radarr_watched",
                 process_instance_id=dead_proc,
                 lease_expires_at=future_lease,
-                request_fingerprint='{"tmdb_id":800101}',
+                request_fingerprint='{"tmdb_id":800102}',
                 allowed_action_statuses=frozenset({"active"}),
-                radarr_movie_id=501,
+                radarr_movie_id=502,
             )
             self.assertTrue(ok_w)
 
@@ -1298,6 +1324,14 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                 "id": 501,
                 "tmdbId": 800101,
                 "imdbId": "tt8001010",
+                "monitored": True,
+                "hasFile": False,
+                "tags": [],
+            }
+            radarr.movies[502] = {
+                "id": 502,
+                "tmdbId": 800102,
+                "imdbId": "tt8001020",
                 "monitored": False,
                 "hasFile": False,
                 "tags": [7],
@@ -1555,9 +1589,12 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                             transport=httpx.ASGITransport(app=actions_app), base_url="http://actions.local"
                         ) as actions_c:
                             webhook_payload = {
-                                "action": {"rejected": False},
+                                "event": "action.rejected",
                                 "data": {
                                     "indexer": "TorrentLeech",
+                                    "action": {"type": "RADARR"},
+                                    "filter": {"id": 7, "name": "Movies Remux"},
+                                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
                                     "release": {
                                         "external_id": "999001",
                                         "name": "Integration.Cinema.2025.2160p.UHD.BluRay.REMUX.DV-CiNEPHiLES",
@@ -1565,6 +1602,9 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                                         "year": 2025,
                                         "type": "movie",
                                         "category": "Movies :: 4K",
+                                        "resolution": "2160p",
+                                        "source": "UHD BluRay",
+                                        "media_processing": "REMUX",
                                         "meta_imdb": "tt9009010",
                                         "meta_tmdb": 900901,
                                         "download_url": passkey_url,
@@ -2789,6 +2829,1485 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
                     row_unsent = app.state.db.get_delivery("rel-preserve-unsent")
                     assert row_unsent is not None
                     self.assertEqual(row_unsent["eval_reply_status"], "pending")
+
+    async def test_issue_13_2a_and_2b_retired_card_and_final_button_rechecks_after_get(self) -> None:
+        """Issue #13 §2a & §2b: Card retirement, post-GET Radarr drift checks, and Watched-then-Grab block."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            intake_push = ShadowStubIntakePushClient()
+            app = create_actions_app(
+                cfg,
+                telegram_client=tg,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=intake_push,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. §2a: Deliver actionable_grab rev 1 + eval reply -> retire at rev 2 -> buttons removed & 410!
+                    r_del1 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-retire-1",
+                            card_revision=1,
+                            tmdb_id=910001,
+                            imdb_id="tt9100010",
+                            title="Retire Film",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_del1.status_code, 200)
+                    ack_r1 = r_del1.json()
+                    toks_r1 = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+                    self.assertIn("add_grab", toks_r1)
+                    self.assertIn("watched_good", toks_r1)
+
+                    r_eval1 = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-retire-1",
+                            "card_revision": 1,
+                            "ack_chat_id": ack_r1["ack_chat_id"],
+                            "ack_message_id": ack_r1["ack_message_id"],
+                            "evaluation": {
+                                "identification": {"canonical_title": "Retire Film", "year": 2025},
+                                "ratings": {},
+                                "decision_aid": {"verdict": "MAYBE", "verdict_reason": "Initial eval"},
+                            },
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval1.status_code, 200)
+
+                    r_ret2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-retire-1",
+                            card_revision=2,
+                            delivery_kind="retired",
+                            tmdb_id=910001,
+                            imdb_id="tt9100010",
+                            title="Retire Film",
+                            poster_path=None,
+                            extra={
+                                "radarr_note": "Disqualified by later Radarr rejection: Quality is not wanted in profile",
+                                "conflict_reason": "Disqualified by later Radarr rejection: Quality is not wanted in profile",
+                                "preserve_eval_reply": True,
+                            },
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_ret2.status_code, 200)
+                    self.assertTrue(r_ret2.json().get("eval_reply_preserved"))
+                    self.assertEqual(tg.edited_texts[-1]["reply_markup"], {"inline_keyboard": []})
+                    self.assertIn("Proposal Retired", tg.edited_texts[-1]["text_html"])
+
+                    # Pressing retired buttons MUST return 410 with ZERO Radarr writes
+                    r_post_ret = await client.post(
+                        f"/action/{toks_r1['add_grab']}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_post_ret.status_code, 410)
+                    self.assertEqual(len(radarr.add_calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2. §2b: State changes AFTER GET confirmation page opens!
+                    r_del2 = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-drift-2",
+                            card_revision=1,
+                            tmdb_id=910002,
+                            imdb_id="tt9100020",
+                            title="Drift Film",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_del2.status_code, 200)
+                    toks_d2 = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+
+                    # Open GET while movie is ABSENT -> 200 confirmation page opens!
+                    r_get_open = await client.get(f"/action/{toks_d2['add_grab']}")
+                    self.assertEqual(r_get_open.status_code, 200)
+
+                    # 2a) After GET opened, movie becomes watched + unmonitored in Radarr -> POST MUST refuse 409!
+                    radarr.movies[92] = {
+                        "id": 92,
+                        "tmdbId": 910002,
+                        "imdbId": "tt9100020",
+                        "title": "Drift Film",
+                        "monitored": False,
+                        "hasFile": False,
+                        "tags": [7],  # watched
+                    }
+                    r_post_watched = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                    )
+                    self.assertEqual(r_post_watched.status_code, 409)
+                    self.assertIn("watched", r_post_watched.text.lower())
+                    self.assertEqual(len(radarr.add_calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2b) Movie now owns a file (hasFile=True, monitored=True) -> POST MUST refuse 409!
+                    radarr.movies[92].update({"monitored": True, "hasFile": True, "tags": []})
+                    r_post_owned = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_owned.status_code, 409)
+                    self.assertIn("file", r_post_owned.text.lower())
+                    self.assertEqual(len(radarr.push_calls), 0)
+
+                    # 2c) Movie's IMDb ID on its TMDb row drifted -> POST MUST refuse 409 (both Grab & Watched)!
+                    radarr.movies[92].update({"monitored": True, "hasFile": False, "imdbId": "tt9999999", "tags": []})
+                    r_post_imdb_drift = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_imdb_drift.status_code, 409)
+                    self.assertIn("imdb", r_post_imdb_drift.text.lower())
+                    r_post_watched_drift = await client.post(
+                        f"/action/{toks_d2['watched_good']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_watched_drift.status_code, 409)
+                    self.assertEqual(len(radarr.push_calls), 0)
+                    self.assertEqual(len(radarr.update_calls), 0)
+
+                    # 2d) Control: monitored movie with NO file & matching IMDb remains eligible -> succeeds!
+                    radarr.movies[92].update({"monitored": True, "hasFile": False, "imdbId": "tt9100020", "tags": []})
+                    r_post_ok = await client.post(
+                        f"/action/{toks_d2['add_grab']}",
+                        data={"confirm": "1"},
+                    )
+                    self.assertEqual(r_post_ok.status_code, 200)
+                    self.assertEqual(len(radarr.push_calls), 1)
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(fb.calls[-1]["note"], "Grabbed via Telegram")
+
+                    # 3. §2b: Watched Good / Bad followed by pressing previously issued Grab link -> 409 blocked!
+                    for suffix, watched_key, expected_dec, tid, iid in (
+                        ("good", "watched_good", "watch", 910003, "tt9100030"),
+                        ("bad", "watched_bad", "skip", 910004, "tt9100040"),
+                    ):
+                        r_del_w = await client.post(
+                            "/internal/deliver/card",
+                            json=_verified_card_payload(
+                                release_id=f"rel-watched-then-grab-{suffix}",
+                                card_revision=1,
+                                tmdb_id=tid,
+                                imdb_id=iid,
+                                title=f"Watched Block {suffix}",
+                                poster_path=None,
+                            ),
+                            headers=headers,
+                        )
+                        self.assertEqual(r_del_w.status_code, 200)
+                        toks_w = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+
+                        # Open Grab confirmation page BEFORE clicking Watched
+                        r_get_g = await client.get(f"/action/{toks_w['add_grab']}")
+                        self.assertEqual(r_get_g.status_code, 200)
+
+                        # User clicks Watched Good / Bad -> succeeds in Radarr + feedback
+                        r_w_post = await client.post(
+                            f"/action/{toks_w[watched_key]}",
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        self.assertEqual(r_w_post.status_code, 200)
+                        self.assertEqual(fb.calls[-1]["decision"], expected_dec)
+                        self.assertEqual(fb.calls[-1]["note"], "watched")
+
+                        # Now user submits the previously opened Grab link -> MUST refuse 409, ZERO pushes!
+                        pushes_before = len(radarr.push_calls)
+                        r_g_after_w = await client.post(
+                            f"/action/{toks_w['add_grab']}",
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        self.assertEqual(r_g_after_w.status_code, 409)
+                        self.assertIn("watched", r_g_after_w.text.lower())
+                        self.assertEqual(len(radarr.push_calls), pushes_before)
+
+    async def test_issue_13_4b_and_4c_alt_grab_strictness_and_missing_timestamp_reconciliation(self) -> None:
+        """Issue #13 §4b & §4c: Raw rejection validation, positive qBit autorun=false, and strict reconcile timestamps."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alt_cfg_path = self._write_alt_grab_config(tmpdir)
+            cfg = self._make_config(tmpdir, alt_policy_path=alt_cfg_path)
+            tg = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            qbit = ShadowStubQbitClient(category="movies")
+
+            valid_torrent = _build_synthetic_v1_torrent(b"Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP.mkv")
+            fetcher = ShadowStubTorrentFetcher(torrent_bytes=valid_torrent)
+
+            class _MapPushStub(ShadowStubIntakePushClient):
+                async def fetch_push_payload(
+                    self, *, release_id: str, source_occurrence_id: str
+                ) -> IntakePushPayloadResult:
+                    return IntakePushPayloadResult(
+                        ok=True,
+                        push_payload={
+                            "title": "Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP",
+                            "downloadUrl": "https://www.torrentleech.org/rss/download/920001/QBIT_SECRET_PASS/Strict.torrent",
+                            "protocol": "torrent",
+                            "publishDate": "2026-11-26T00:00:00Z",
+                            "indexer": "TorrentLeech",
+                        },
+                    )
+
+            radarr.download_clients = [
+                {
+                    "id": 1,
+                    "enable": True,
+                    "implementation": "QBittorrent",
+                    "fields": [
+                        {"name": "host", "value": "qbit.seedbox.invalid"},
+                        {"name": "port", "value": 443},
+                        {"name": "useSsl", "value": True},
+                        {"name": "urlBase", "value": "/qbittorrent"},
+                        {"name": "movieCategory", "value": "movies"},
+                    ],
+                }
+            ]
+            radarr.movies[88] = {
+                "id": 88,
+                "tmdbId": 920001,
+                "imdbId": "tt9200010",
+                "title": "Strict Film",
+                "year": 2025,
+                "monitored": True,
+                "qualityProfileId": 4,
+                "hasFile": True,
+                "tags": [],
+                "movieFile": {
+                    "id": 880,
+                    "relativePath": "Strict.Film.2025.1080p.BluRay.REMUX.mkv",
+                    "edition": "",
+                    "releaseGroup": "OLDGRP",
+                    "size": 30_000_000_000,
+                    "quality": {"quality": {"name": "Remux-1080p"}},
+                },
+            }
+            app = create_actions_app(
+                cfg,
+                telegram_client=tg,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=_MapPushStub(),
+                qbit_client=qbit,
+                torrent_fetcher=fetcher,
+            )
+            headers = {"X-Internal-Token": cfg.internal_api_secret}
+
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    # 1. §4b: Malformed non-string rejection entries MUST be refused at /internal/deliver/card (422)
+                    bad_alt_card = _verified_card_payload(
+                        release_id="rel-alt-bad-rej",
+                        delivery_kind="alternative_grab",
+                        tmdb_id=920001,
+                        imdb_id="tt9200010",
+                        title="Strict Film",
+                        release_name="Strict.Film.2025.2160p.UHD.BluRay.REMUX-GRP",
+                        poster_path=None,
+                        extra={
+                            "indexer": "TorrentLeech",
+                            "external_id": "920001",
+                            "bound_existing_movie_id": 88,
+                            "bound_existing_file_id": 880,
+                            "bound_rejection_class": "cutoff_met",
+                            "rejection_reasons": ["Existing file meets cutoff: Remux-1080p", 999],
+                            "bound_movie_file_snapshot": {
+                                "movie_id": 88,
+                                "file_id": 880,
+                                "monitored": True,
+                                "quality_profile_id": 4,
+                                "relative_path": "Strict.Film.2025.1080p.BluRay.REMUX.mkv",
+                                "edition": "",
+                                "release_group": "OLDGRP",
+                                "size": 30_000_000_000,
+                                "quality": "Remux-1080p",
+                            },
+                        },
+                    )
+                    r_bad = await client.post("/internal/deliver/card", json=bad_alt_card, headers=headers)
+                    self.assertEqual(r_bad.status_code, 400)
+
+                    # 2. §4b: Missing qBittorrent autorun preference keys MUST refuse (409) with 0 adds!
+                    good_alt_card = dict(bad_alt_card)
+                    good_alt_card["release_id"] = "rel-alt-missing-prefs"
+                    good_alt_card["rejection_reasons"] = ["Existing file meets cutoff: Remux-1080p"]
+                    r_ok_card = await client.post("/internal/deliver/card", json=good_alt_card, headers=headers)
+                    self.assertEqual(r_ok_card.status_code, 200)
+                    alt_tok = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["alternative_grab"]
+
+                    for bad_prefs in (
+                        {},
+                        {"autorun_enabled": False},  # missing autorun_on_torrent_added_enabled
+                        {"autorun_on_torrent_added_enabled": False},  # missing autorun_enabled
+                        {"autorun_enabled": None, "autorun_on_torrent_added_enabled": False},
+                        {"autorun_enabled": False, "autorun_on_torrent_added_enabled": "false"},
+                    ):
+                        qbit.preferences = dict(bad_prefs)
+                        r_pref = await client.post(f"/action/{alt_tok}", data={"confirm": "1"})
+                        self.assertEqual(r_pref.status_code, 409, f"Expected 409 for prefs={bad_prefs!r}")
+                        self.assertEqual(len(qbit.add_calls), 0)
+
+                    # 3. §4c: Ambiguous Radarr push reconciliation MUST reject absent/unreadable/stale timestamps
+                    # and NEVER emit 'Grabbed via Telegram' feedback when uncertain!
+                    rel_name = "Timestamp.Strict.2025.2160p.UHD.BluRay.REMUX-GRP"
+                    radarr.movies[99] = {
+                        "id": 99,
+                        "tmdbId": 920002,
+                        "imdbId": "tt9200020",
+                        "title": "Timestamp Strict",
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    r_ts_card = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-ts-strict",
+                            tmdb_id=920002,
+                            imdb_id="tt9200020",
+                            title="Timestamp Strict",
+                            release_name=rel_name,
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_ts_card.status_code, 200)
+                    add_tok = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["add_grab"]
+
+                    # Trigger ambiguous release push (lost ack)
+                    radarr.push_outcome_queue.append(
+                        RadarrWriteResult(outcome="ambiguous", error_redacted="radarr_push_ambiguous:ReadTimeout")
+                    )
+                    r_amb = await client.post(f"/action/{add_tok}", data={"confirm": "1"})
+                    self.assertEqual(r_amb.status_code, 503)
+                    self.assertEqual(len(radarr.push_calls), 1)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3a) Queue/history/file match by release name with MISSING timestamps -> stays ambiguous_radarr!
+                    radarr.queue = [{"movieId": 99, "title": rel_name}]
+                    radarr.history = [{"movieId": 99, "eventType": "grabbed", "sourceTitle": rel_name, "data": {}}]
+                    radarr.movies[99]["movieFile"] = {"id": 990, "sceneName": rel_name}
+                    r_rec_missing = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_missing.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_missing.text)
+                    self.assertEqual(len(fb.calls), 0)
+                    self.assertEqual(len(radarr.push_calls), 1)
+
+                    # 3b) UNREADABLE timestamps -> stays ambiguous_radarr, 0 feedback!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": "not-a-timestamp"}]
+                    radarr.history = [
+                        {"movieId": 99, "eventType": "grabbed", "sourceTitle": rel_name, "date": "bad-date", "data": {}}
+                    ]
+                    radarr.movies[99]["movieFile"] = {"id": 990, "sceneName": rel_name, "dateAdded": "???"}
+                    r_rec_bad = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_bad.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_bad.text)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3c) Stale timestamp (from 2020) -> stays ambiguous_radarr, 0 feedback!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": "2020-01-01T00:00:00Z"}]
+                    radarr.history = []
+                    radarr.movies[99].pop("movieFile", None)
+                    r_rec_stale = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_stale.status_code, 200)
+                    self.assertIn("ambiguous_radarr", r_rec_stale.text)
+                    self.assertEqual(len(fb.calls), 0)
+
+                    # 3d) Valid in-window timestamp + exact release -> reconciles cleanly & sends feedback ONCE!
+                    radarr.queue = [{"movieId": 99, "title": rel_name, "added": utc_now_iso()}]
+                    r_rec_ok = await client.post(f"/action/{add_tok}", data={"confirm": "1", "reconcile": "1"})
+                    self.assertEqual(r_rec_ok.status_code, 200)
+                    self.assertNotIn("ambiguous_radarr", r_rec_ok.text)
+                    self.assertEqual(len(fb.calls), 1)
+                    self.assertEqual(fb.calls[0]["note"], "Grabbed via Telegram")
+                    self.assertEqual(len(radarr.push_calls), 1)
+
+    async def test_issue_13_6a_6b_6c_listing_link_error_attachments_and_omitted_topic_handling(self) -> None:
+        """Issue #13 §6a, §6b, §6c: Canonical TL listing links, bounded error .txt attachments, and omitted topic handling."""
+        from services.movie_actions_api.telegram_format import (
+            MAX_TELEGRAM_ERROR_REPORT_CHARS,
+            TELEGRAM_TEXT_UTF16_LIMIT,
+            build_card_html,
+            format_evaluation_reply,
+            utf16_len,
+        )
+
+        # 1. §6a: Canonical TorrentLeech listing link on BOTH evidence_review and verified cards; never download links!
+        ev_card_html = build_card_html(
+            {
+                "delivery_kind": "evidence_review",
+                "exact_release_name": "North.Crossing.2021.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566",
+                "category": "Movies :: 4K",
+                "conflict_reason": "Release title 'North Crossing' does not match TMDB 'North Crossing II'",
+                "tl_outcome": "listing_no_imdb",
+                "observed_meta_imdb": "tt1111111",
+                "observed_tl_imdb": "tt2222222",
+                "checks_passed": ["source_tl_integrity"],
+                "checks_failed": ["release_title_mismatch"],
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertIn('https://www.torrentleech.org/torrent/445566', ev_card_html)
+        self.assertIn("TL Listing (445566)", ev_card_html)
+        self.assertNotIn("/download/", ev_card_html)
+        self.assertIn("Failed Checks:", ev_card_html)
+        self.assertIn("Passed Checks:", ev_card_html)
+        self.assertIn("meta_imdb=tt1111111", ev_card_html)
+        self.assertIn("tl_imdb=tt2222222", ev_card_html)
+
+        ver_card_html = build_card_html(
+            {
+                "delivery_kind": "actionable_grab",
+                "exact_release_name": "North.Crossing.2021.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566",
+                "category": "Movies :: 4K",
+                "verified_title": "North Crossing",
+                "verified_year": 2021,
+                "verified_imdb_id": "tt1111111",
+                "verified_tmdb_id": 654321,
+                "accepted_evidence": "tt1111111 / TMDB 654321 via TL listing IMDb, TMDB bidirectional + title/year verified",
+                "checks_passed": ["source_tl_integrity", "release_title_year_match", "imdb_tmdb_bidirectional_agreement"],
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertIn('https://www.torrentleech.org/torrent/445566', ver_card_html)
+        self.assertIn("TL Listing (445566)", ver_card_html)
+        self.assertIn("IMDb (tt1111111)", ver_card_html)
+        self.assertIn("TMDB (654321)", ver_card_html)
+        self.assertIn("Accepted Evidence:", ver_card_html)
+        self.assertNotIn("/download/", ver_card_html)
+
+        # Malformed non-numeric external_id or ineligible indexer MUST NOT emit a TL link
+        bad_id_html = build_card_html(
+            {
+                "delivery_kind": "evidence_review",
+                "exact_release_name": "Example.2025.2160p.UHD.BluRay.REMUX-GRP",
+                "indexer": "TorrentLeech",
+                "external_id": "445566/../download/secret",
+            },
+            max_utf16_units=TELEGRAM_TEXT_UTF16_LIMIT,
+        )
+        self.assertNotIn("torrentleech.org/torrent/", bad_id_html)
+
+        # 2. §6b: Evaluator error rendering: inline when it fits (> 600 chars preserved!), .txt when > 4096, explicit truncation notice!
+        med_err = ("error detail segment " * 50) + "passkey=ERR_SECRET_111 DIAGNOSTIC_ENDING_999"
+        fmt_med = format_evaluation_reply(release_id="rel-err-med", evaluation=None, error_redacted=med_err)
+        self.assertFalse(fmt_med.attach_txt)
+        self.assertIn("DIAGNOSTIC_ENDING_999", fmt_med.html_text)
+        self.assertNotIn("ERR_SECRET_111", fmt_med.html_text)
+        self.assertLessEqual(utf16_len(fmt_med.html_text), TELEGRAM_TEXT_UTF16_LIMIT)
+
+        long_err = ("long diagnostic stack " * 250) + "token=LONG_SECRET_222 FINAL_TAIL_TOKEN_888"
+        fmt_long = format_evaluation_reply(release_id="rel-err-long", evaluation=None, error_redacted=long_err)
+        self.assertTrue(fmt_long.attach_txt)
+        self.assertLessEqual(utf16_len(fmt_long.html_text), TELEGRAM_TEXT_UTF16_LIMIT)
+        self.assertIsNotNone(fmt_long.txt_content)
+        assert fmt_long.txt_content is not None
+        self.assertIn("FINAL_TAIL_TOKEN_888", fmt_long.txt_content)
+        self.assertIn("Safety-Bound Truncated: no", fmt_long.txt_content)
+        self.assertNotIn("LONG_SECRET_222", fmt_long.txt_content)
+
+        oversized_err = (
+            ("upstream diagnostic trace line " * ((MAX_TELEGRAM_ERROR_REPORT_CHARS // 30) + 200))
+            + " api_key=HUGE_SECRET_333"
+        )
+        fmt_huge = format_evaluation_reply(release_id="rel-err-huge", evaluation=None, error_redacted=oversized_err)
+        self.assertTrue(fmt_huge.attach_txt)
+        self.assertIn("truncated at safety bound", fmt_huge.html_text.lower())
+        assert fmt_huge.txt_content is not None
+        self.assertIn("Safety-Bound Truncated: yes", fmt_huge.txt_content)
+        self.assertIn("[truncated:", fmt_huge.txt_content)
+        self.assertNotIn("HUGE_SECRET_333", fmt_huge.txt_content)
+
+        # 3. §6c: Omitted Telegram topic on topic chat vs known non-topic chat
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 3a) Topic chat configured (telegram_add_grab_topic_id=20), Telegram omits message_thread_id!
+            cfg_topic = self._make_config(tmpdir)
+            tg_topic = ControllableTelegramStub()
+            radarr = ControllableRadarrStub()
+            fb = ControllableFeedbackStub()
+            app_topic = create_actions_app(
+                cfg_topic,
+                telegram_client=tg_topic,
+                radarr_client=radarr,
+                triage_feedback_client=fb,
+                intake_push_client=ShadowStubIntakePushClient(),
+            )
+            headers = {"X-Internal-Token": cfg_topic.internal_api_secret}
+
+            async with app_topic.router.lifespan_context(app_topic):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app_topic), base_url="http://test"
+                ) as client:
+                    # Photo send omits ack_thread_id -> DB MUST store ack_thread_id=None (NOT 20!)
+                    tg_topic.photo_outcome_queue.append(
+                        TelegramSendResult(
+                            outcome="ok",
+                            ack_chat_id=cfg_topic.telegram_chat_id,
+                            ack_message_id=701,
+                            ack_thread_id=None,
+                        )
+                    )
+                    r_p = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-omitted-photo-topic",
+                            poster_path="/poster.jpg",
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_p.status_code, 200)
+                    self.assertIsNone(r_p.json()["ack_thread_id"])
+                    del_p = app_topic.state.db.get_delivery("rel-omitted-photo-topic")
+                    assert del_p is not None
+                    self.assertEqual(del_p["target_thread_id"], 20)
+                    self.assertIsNone(del_p["ack_thread_id"])
+
+                    # Dependent evaluation reply MUST refuse (409) because topic was omitted!
+                    sent_before = len(tg_topic.sent_messages)
+                    r_eval_p = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-omitted-photo-topic",
+                            "card_revision": 1,
+                            "ack_chat_id": cfg_topic.telegram_chat_id,
+                            "ack_message_id": 701,
+                            "evaluation": None,
+                            "error_redacted": long_err,
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval_p.status_code, 409)
+                    self.assertEqual(len(tg_topic.sent_messages), sent_before)
+
+                    # Text send omits ack_thread_id -> DB MUST also store ack_thread_id=None (NOT 20!)
+                    tg_topic.message_outcome_queue.append(
+                        TelegramSendResult(
+                            outcome="ok",
+                            ack_chat_id=cfg_topic.telegram_chat_id,
+                            ack_message_id=702,
+                            ack_thread_id=None,
+                        )
+                    )
+                    r_t = await client.post(
+                        "/internal/deliver/card",
+                        json=_verified_card_payload(
+                            release_id="rel-omitted-text-topic",
+                            poster_path=None,
+                        ),
+                        headers=headers,
+                    )
+                    self.assertEqual(r_t.status_code, 200)
+                    self.assertIsNone(r_t.json()["ack_thread_id"])
+                    del_t = app_topic.state.db.get_delivery("rel-omitted-text-topic")
+                    assert del_t is not None
+                    self.assertEqual(del_t["target_thread_id"], 20)
+                    self.assertIsNone(del_t["ack_thread_id"])
+
+                    r_eval_t = await client.post(
+                        "/internal/deliver/evaluation",
+                        json={
+                            "release_id": "rel-omitted-text-topic",
+                            "card_revision": 1,
+                            "ack_chat_id": cfg_topic.telegram_chat_id,
+                            "ack_message_id": 702,
+                            "evaluation": None,
+                            "error_redacted": "err",
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(r_eval_t.status_code, 409)
+
+            # 3b) Known non-topic chat (all topic IDs None) -> ack_thread_id=None is valid & eval reply + .txt succeed!
+            with tempfile.TemporaryDirectory() as tmpdir_nt:
+                base_nt = self._make_config(tmpdir_nt)
+                cfg_nontopic = ActionsConfig(
+                    host=base_nt.host,
+                    port=base_nt.port,
+                    public_base_url=base_nt.public_base_url,
+                    internal_api_secret=base_nt.internal_api_secret,
+                    radarr_url=base_nt.radarr_url,
+                    radarr_api_key=base_nt.radarr_api_key,
+                    telegram_bot_token=base_nt.telegram_bot_token,
+                    telegram_chat_id=base_nt.telegram_chat_id,
+                    telegram_topic_id=None,
+                    telegram_add_grab_topic_id=None,
+                    telegram_grab_anyway_topic_id=None,
+                    action_ttl_seconds=base_nt.action_ttl_seconds,
+                    standalone_skip_enabled=base_nt.standalone_skip_enabled,
+                    alternative_grab_config_path=None,
+                    actions_db_path=base_nt.actions_db_path,
+                    intake_api_url=base_nt.intake_api_url,
+                    triage_api_url=base_nt.triage_api_url,
+                    shadow_replay_enabled=False,
+                )
+                tg_nt = ControllableTelegramStub()
+                app_nt = create_actions_app(
+                    cfg_nontopic,
+                    telegram_client=tg_nt,
+                    radarr_client=ControllableRadarrStub(),
+                    triage_feedback_client=ControllableFeedbackStub(),
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with app_nt.router.lifespan_context(app_nt):
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app_nt), base_url="http://test"
+                    ) as client_nt:
+                        r_nt = await client_nt.post(
+                            "/internal/deliver/card",
+                            json=_verified_card_payload(
+                                release_id="rel-nontopic-1",
+                                poster_path=None,
+                            ),
+                            headers=headers,
+                        )
+                        self.assertEqual(r_nt.status_code, 200)
+                        ack_nt = r_nt.json()
+                        self.assertIsNone(ack_nt["ack_thread_id"])
+
+                        # Long sanitized error reply succeeds in non-topic chat AND attaches .txt!
+                        r_eval_nt = await client_nt.post(
+                            "/internal/deliver/evaluation",
+                            json={
+                                "release_id": "rel-nontopic-1",
+                                "card_revision": 1,
+                                "ack_chat_id": ack_nt["ack_chat_id"],
+                                "ack_message_id": ack_nt["ack_message_id"],
+                                "evaluation": None,
+                                "error_redacted": long_err,
+                            },
+                            headers=headers,
+                        )
+                        self.assertEqual(r_eval_nt.status_code, 200)
+                        self.assertEqual(r_eval_nt.json()["status"], "sent")
+                        self.assertEqual(len(tg_nt.sent_documents), 1)
+                        self.assertIn(b"FINAL_TAIL_TOKEN_888", tg_nt.sent_documents[0]["content_bytes"])
+                        self.assertNotIn(b"LONG_SECRET_222", tg_nt.sent_documents[0]["content_bytes"])
+                        self.assertIsNone(tg_nt.sent_documents[0]["thread_id"])
+
+    async def test_pr18_blocker_2_all_five_unsafe_push_races_and_sidecar_disappearance(self) -> None:
+        """PR #18 Blocker 2 & Gap 5: All five unsafe push scenarios yield 0 pushes & 0 grab feedback, reverse Watched-during-push blocked, and WAL sidecar disappearance handled."""
+        async def _run_scenario(mode: str) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = self._make_config(tmpdir)
+                radarr = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=tg,
+                    radarr_client=radarr,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with app.router.lifespan_context(app), httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    headers = {"X-Internal-Token": cfg.internal_api_secret}
+                    payload = _verified_card_payload(poster_path=None)
+                    init_r = await client.post("/internal/deliver/card", headers=headers, json=payload)
+                    init_r.raise_for_status()
+                    tokens = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+                    form = {"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"}
+
+                    async def _post(btn: str) -> httpx.Response:
+                        return await client.post(f"/action/{tokens[btn]}", data=form)
+
+                    out: dict[str, Any] = {"mode": mode}
+                    row = {
+                        "id": 101,
+                        "tmdbId": payload["verified_tmdb_id"],
+                        "imdbId": payload["verified_imdb_id"],
+                        "monitored": True,
+                        "hasFile": False,
+                        "tags": [],
+                    }
+                    if mode == "ambiguous_phase1":
+                        radarr.add_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        out["first_http"] = (await _post("add_grab")).status_code
+                        radarr.movies[101] = {
+                            **row,
+                            "imdbId": "tt9999111",
+                            "tags": [7],
+                            "monitored": False,
+                            "hasFile": True,
+                        }
+                        out["reconcile_http"] = (await _post("add_grab")).status_code
+                    elif mode == "conflicting_tmdb":
+                        row["tmdbId"] += 1
+                        radarr.movies[101] = row
+                        out["grab_http"] = (await _post("add_grab")).status_code
+                    elif mode == "positive_file_id":
+                        row["movieFileId"] = 111
+                        radarr.movies[101] = row
+                        out["grab_http"] = (await _post("add_grab")).status_code
+                    elif mode == "watched_during_push":
+                        # Reverse direction: Add & Grab already in radarr_release_push -> Watched MUST be blocked (409)
+                        radarr.movies[101] = row
+                        entered, resume = asyncio.Event(), asyncio.Event()
+                        orig_push = radarr.push_release
+
+                        async def _hold_push(body: dict[str, Any]) -> RadarrWriteResult:
+                            entered.set()
+                            await resume.wait()
+                            return await orig_push(body)
+
+                        radarr.push_release = _hold_push  # type: ignore[method-assign]
+                        grab_task = asyncio.create_task(_post("add_grab"))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 5)
+                            out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                        finally:
+                            resume.set()
+                            out["grab_http"] = (await asyncio.wait_for(grab_task, 5)).status_code
+                    else:
+                        entered, resume = asyncio.Event(), asyncio.Event()
+                        orig_add = radarr.add_movie
+
+                        async def _hold_add(body: dict[str, Any]) -> RadarrWriteResult:
+                            res = await orig_add(body)
+                            entered.set()
+                            await resume.wait()
+                            return res
+
+                        radarr.add_movie = _hold_add  # type: ignore[method-assign]
+                        grab_task = asyncio.create_task(_post("add_grab"))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 5)
+                            if mode == "watched_during_grab":
+                                out["watched_http"] = (await asyncio.wait_for(_post("watched_bad"), 5)).status_code
+                            else:
+                                ret_r = await asyncio.wait_for(
+                                    client.post(
+                                        "/internal/deliver/card",
+                                        headers=headers,
+                                        json={**payload, "delivery_kind": "retired", "card_revision": 2},
+                                    ),
+                                    5,
+                                )
+                                out["retirement_http"] = ret_r.status_code
+                                out["retirement_status"] = ret_r.json().get("status")
+                                out["stored_revision"] = app.state.db.get_delivery(payload["release_id"])["card_revision"]
+                        finally:
+                            resume.set()
+                            out["grab_http"] = (await asyncio.wait_for(grab_task, 5)).status_code
+
+                    out["add_attempts"] = len(radarr.add_calls)
+                    out["push_attempts"] = len(radarr.push_calls)
+                    out["feedback"] = [c.get("decision") for c in fb.calls]
+                    return out
+
+        r1 = await _run_scenario("ambiguous_phase1")
+        self.assertEqual(r1["first_http"], 503)
+        self.assertEqual(r1["reconcile_http"], 409)
+        self.assertEqual(r1["push_attempts"], 0)
+        self.assertEqual(r1["feedback"], [])
+
+        r2 = await _run_scenario("watched_during_grab")
+        self.assertEqual(r2["watched_http"], 200)
+        self.assertEqual(r2["grab_http"], 409)
+        self.assertEqual(r2["push_attempts"], 0)
+        self.assertEqual(r2["feedback"], ["skip"])
+
+        r3 = await _run_scenario("retired_during_grab")
+        self.assertEqual(r3["retirement_http"], 200)
+        self.assertEqual(r3["retirement_status"], "delivered")
+        self.assertEqual(r3["stored_revision"], 2)
+        self.assertEqual(r3["grab_http"], 410)
+        self.assertEqual(r3["push_attempts"], 0)
+        self.assertEqual(r3["feedback"], [])
+
+        r4 = await _run_scenario("conflicting_tmdb")
+        self.assertEqual(r4["grab_http"], 409)
+        self.assertEqual(r4["add_attempts"], 0)
+        self.assertEqual(r4["push_attempts"], 0)
+        self.assertEqual(r4["feedback"], [])
+
+        r5 = await _run_scenario("positive_file_id")
+        self.assertEqual(r5["grab_http"], 409)
+        self.assertEqual(r5["add_attempts"], 0)
+        self.assertEqual(r5["push_attempts"], 0)
+        self.assertEqual(r5["feedback"], [])
+
+        # Reverse direction: watched_bad blocked with 409 while radarr_release_push is active
+        r6 = await _run_scenario("watched_during_push")
+        self.assertEqual(r6["watched_http"], 409)
+        self.assertEqual(r6["grab_http"], 200)
+        self.assertEqual(r6["push_attempts"], 1)
+        self.assertEqual(r6["feedback"], ["watch"])
+
+        # Gap 5: SQLite -wal/-shm sidecar vanishing concurrently during lstat or chmod must not crash
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_sc = self._make_config(tmpdir)
+            db_sc = ActionsDB(cfg_sc.actions_db_path)
+            db_sc.init_db()
+            wal_path = Path(f"{cfg_sc.actions_db_path}-wal")
+            wal_path.write_bytes(b"")
+            os.chmod(wal_path, 0o644)
+
+            orig_lstat = os.lstat
+            orig_chmod = os.chmod
+
+            def _vanish_on_wal_lstat(path: str, *args: Any, **kwargs: Any) -> Any:
+                if path == str(wal_path):
+                    raise FileNotFoundError(path)
+                return orig_lstat(path, *args, **kwargs)
+
+            with mock.patch("services.movie_actions_api.db.os.lstat", side_effect=_vanish_on_wal_lstat):
+                db_sc._ensure_private_db_files()
+
+            def _vanish_on_wal_chmod(path: str, mode: int, *args: Any, **kwargs: Any) -> None:
+                if path == str(wal_path):
+                    raise FileNotFoundError(path)
+                orig_chmod(path, mode, *args, **kwargs)
+
+            with mock.patch("services.movie_actions_api.db.os.chmod", side_effect=_vanish_on_wal_chmod):
+                db_sc._ensure_private_db_files()
+
+    async def test_pr18_r2_blocker_3_action_interleavings_and_card_prep_status_parity(self) -> None:
+        """
+        PR #18 Round 2 Blocker 3 & Gap 1:
+          - Movie becoming watched/unmonitored/owned during archive payload read in Phase A timeout recovery
+            is caught before pushing (0 pushes, 0 updates, 0 feedback, HTTP 409).
+          - Watched - Bad already_exists race on a row with conflicting IMDb ID rejects with HTTP 409
+            without mutating the conflicting row (0 updates, 0 pushes, 0 feedback).
+          - Fresh verified correction (card_revision=2) arriving during in-flight Phase 1 add updates
+            stored_rev=2 immediately and invalidates the stale rev-1 push (HTTP 410, 0 pushes, 0 feedback).
+          - Card-prep /internal/radarr/status matches confirmation eligibility for positive movieFileId
+            with hasFile=False (owned_file -> suppress) and duplicate IMDb across distinct TMDb rows
+            (ambiguous -> evidence_review).
+        """
+        from services.movie_intake_api.clients import RadarrStatusResponse
+        from services.movie_intake_api.worker import IntakeWorker
+
+        async def _run_interleaving(mode: str) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                intake = ShadowStubIntakePushClient()
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=tg,
+                    radarr_client=rad,
+                    triage_feedback_client=fb,
+                    intake_push_client=intake,
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c,
+                ):
+                    hdr = {"X-Internal-Token": cfg.internal_api_secret}
+                    payload = _verified_card_payload(poster_path=None)
+                    initial = await c.post("/internal/deliver/card", headers=hdr, json=payload)
+                    self.assertEqual(initial.status_code, 200)
+                    tokens = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])
+
+                    async def _post(key: str) -> httpx.Response:
+                        return await c.post(
+                            "/action/" + tokens[key],
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+
+                    row = {
+                        "id": 101,
+                        "tmdbId": payload["verified_tmdb_id"],
+                        "imdbId": payload["verified_imdb_id"],
+                        "tags": [],
+                        "monitored": True,
+                        "hasFile": False,
+                    }
+                    out: dict[str, Any] = {"case": mode}
+                    if mode == "movie_changes_during_archive_read_in_recovery":
+                        rad.add_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        out["initial_http"] = (await _post("add_grab")).status_code
+                        rad.movies[101] = row
+                        orig_fetch = intake.fetch_push_payload
+
+                        async def _mutate_during_fetch(**kw: Any) -> Any:
+                            rad.movies[101].update({"monitored": False, "tags": [7], "hasFile": True})
+                            return await orig_fetch(**kw)
+
+                        intake.fetch_push_payload = _mutate_during_fetch  # type: ignore[method-assign]
+                        out["recover_http"] = (await _post("add_grab")).status_code
+                    elif mode == "identity_conflict_at_watched_already_exists":
+                        async def _competing_add(body: dict[str, Any]) -> RadarrWriteResult:
+                            rad.add_calls.append(dict(body))
+                            rad.movies[101] = {**row, "imdbId": "tt9999111"}
+                            return RadarrWriteResult(outcome="already_exists")
+
+                        rad.add_movie = _competing_add  # type: ignore[method-assign]
+                        out["watch_http"] = (await _post("watched_bad")).status_code
+                        out["marked_watched"] = not rad.movies[101]["monitored"] and 7 in rad.movies[101]["tags"]
+                    elif mode == "fresh_verified_correction_before_add_returns":
+                        start, resume = asyncio.Event(), asyncio.Event()
+                        orig_add = rad.add_movie
+
+                        async def _hold_add(body: dict[str, Any]) -> RadarrWriteResult:
+                            start.set()
+                            await resume.wait()
+                            return await orig_add(body)
+
+                        rad.add_movie = _hold_add  # type: ignore[method-assign]
+                        grab_task = asyncio.create_task(_post("add_grab"))
+                        try:
+                            await asyncio.wait_for(start.wait(), 5)
+                            new_card = {
+                                **payload,
+                                "card_revision": 2,
+                                "verified_tmdb_id": 900002,
+                                "verified_imdb_id": "tt9000022",
+                                "verified_title": "New identity",
+                            }
+                            ack = (await c.post("/internal/deliver/card", headers=hdr, json=new_card)).json()
+                            out["correction_status"] = ack["status"]
+                            out["correction_detail"] = ack.get("detail")
+                            deliv = app.state.db.get_delivery(payload["release_id"])
+                            assert deliv is not None
+                            out["stored_rev"] = deliv["card_revision"]
+                        finally:
+                            resume.set()
+                            out["grab_http"] = (await grab_task).status_code
+
+                    out["updates"] = len(rad.update_calls)
+                    out["pushes"] = len(rad.push_calls)
+                    out["feedback"] = list(fb.calls)
+                    return out
+
+        r_rec = await _run_interleaving("movie_changes_during_archive_read_in_recovery")
+        self.assertEqual(r_rec["initial_http"], 503)
+        self.assertEqual(r_rec["recover_http"], 409)
+        self.assertEqual(r_rec["pushes"], 0)
+        self.assertEqual(r_rec["updates"], 0)
+        self.assertEqual(r_rec["feedback"], [])
+
+        r_watch = await _run_interleaving("identity_conflict_at_watched_already_exists")
+        self.assertEqual(r_watch["watch_http"], 409)
+        self.assertFalse(r_watch["marked_watched"])
+        self.assertEqual(r_watch["updates"], 0)
+        self.assertEqual(r_watch["pushes"], 0)
+        self.assertEqual(r_watch["feedback"], [])
+
+        r_corr = await _run_interleaving("fresh_verified_correction_before_add_returns")
+        self.assertEqual(r_corr["correction_status"], "delivered")
+        self.assertIsNone(r_corr["correction_detail"])
+        self.assertEqual(r_corr["stored_rev"], 2)
+        self.assertEqual(r_corr["grab_http"], 410)
+        self.assertEqual(r_corr["pushes"], 0)
+        self.assertEqual(r_corr["updates"], 0)
+        self.assertEqual(r_corr["feedback"], [])
+
+        # Gap 1: Card-prep /internal/radarr/status parity
+        for case, expected_status, expected_mode in (
+            ("file", "owned_file", "suppress"),
+            ("conflict", "ambiguous", "evidence_review"),
+        ):
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                row = {
+                    "id": 101,
+                    "tmdbId": 445001,
+                    "imdbId": "tt4440001",
+                    "tags": [],
+                    "monitored": True,
+                    "hasFile": False,
+                }
+                rad.movies[101] = row
+                if case == "file":
+                    row["movieFileId"] = 111
+                else:
+                    rad.movies[102] = {**row, "id": 102, "tmdbId": 445002}
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=ControllableTelegramStub(),
+                    radarr_client=rad,
+                    triage_feedback_client=ControllableFeedbackStub(),
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c,
+                ):
+                    resp = await c.get(
+                        "/internal/radarr/status",
+                        params={"tmdb_id": row["tmdbId"], "imdb_id": row["imdbId"]},
+                        headers={"X-Internal-Token": cfg.internal_api_secret},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    status_obj = RadarrStatusResponse(**resp.json())
+                    mode, _, _ = IntakeWorker._decide_radarr_outcome(
+                        None,  # type: ignore[arg-type]
+                        radarr=status_obj,
+                        alt_grab_eligible=False,
+                        alt_grab_rejection_class=None,
+                    )
+                    self.assertEqual(status_obj.status, expected_status)
+                    self.assertEqual(mode, expected_mode)
+
+    async def test_pr18_r3_finding_1_radarr_two_lookup_snapshot_reconciliation(self) -> None:
+        """
+        PR #18 Round 3 Finding 1: Reconcile TMDb and IMDb observations of the same Radarr row
+        monotonically at both card preparation (/internal/radarr/status) and final grab
+        confirmation, while retaining normal absent/monitored positive controls.
+        """
+        from types import SimpleNamespace
+        from services.movie_intake_api.worker import IntakeWorker
+
+        async def _run_case(case: str) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    telegram_client=tg,
+                    radarr_client=rad,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(base_url="http://test", transport=httpx.ASGITransport(app=app)) as client,
+                ):
+                    hdr = {"X-Internal-Token": cfg.internal_api_secret}
+                    payload = _verified_card_payload(poster_path=None)
+                    tmdb_id = payload["verified_tmdb_id"]
+                    imdb_id = payload["verified_imdb_id"]
+                    row = {
+                        "id": 77,
+                        "tmdbId": tmdb_id,
+                        "imdbId": imdb_id,
+                        "hasFile": False,
+                        "monitored": True,
+                        "tags": [],
+                    }
+                    if case != "normal_absent":
+                        rad.movies[77] = dict(row)
+                    if case == "known_file_at_delivery":
+                        rad.movies[77]["movieFileId"] = 88
+                    if case == "duplicated_imdb_at_delivery":
+                        rad.movies[78] = {**row, "id": 78, "tmdbId": tmdb_id + 1}
+
+                    orig_tmdb = rad.get_movies_by_tmdb
+                    orig_imdb = rad.get_movies_by_imdb
+                    old_row_read = asyncio.Event()
+                    read_no = 0
+                    armed = case in ("owned_on_second_read_at_delivery", "identity_drift_on_second_read_at_delivery")
+                    triggered = False
+
+                    async def _first_snapshot(movie_id: int) -> RadarrResult:
+                        nonlocal read_no
+                        res = await orig_tmdb(movie_id)
+                        if armed:
+                            read_no += 1
+                            if case != "watched_on_second_read_at_final_push" or read_no == 2:
+                                old_row_read.set()
+                        return res
+
+                    async def _second_snapshot(movie_imdb: str) -> RadarrResult:
+                        nonlocal triggered
+                        if armed and not triggered and old_row_read.is_set():
+                            if case == "owned_on_second_read_at_delivery":
+                                rad.movies[77].update({"hasFile": True, "movieFileId": 88})
+                            elif case == "watched_on_second_read_at_final_push":
+                                rad.movies[77].update({"tags": [7], "monitored": False})
+                            elif case == "identity_drift_on_second_read_at_delivery":
+                                rad.movies[77].update({"tmdbId": tmdb_id + 500})
+                            triggered = True
+                        return await orig_imdb(movie_imdb)
+
+                    rad.get_movies_by_tmdb = _first_snapshot  # type: ignore[method-assign]
+                    rad.get_movies_by_imdb = _second_snapshot  # type: ignore[method-assign]
+
+                    r = await client.get(
+                        "/internal/radarr/status",
+                        headers=hdr,
+                        params={"tmdb_id": tmdb_id, "imdb_id": imdb_id},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    status = r.json()
+                    decision = IntakeWorker._decide_radarr_outcome(
+                        None,  # type: ignore[arg-type]
+                        radarr=SimpleNamespace(**status),
+                        alt_grab_eligible=False,
+                        alt_grab_rejection_class=None,
+                    )[0]
+                    out: dict[str, Any] = {
+                        "case": case,
+                        "radarr_status": status["status"],
+                        "intake_decision": decision,
+                    }
+                    if decision == "actionable_grab":
+                        card = await client.post("/internal/deliver/card", headers=hdr, json=payload)
+                        self.assertEqual(card.status_code, 200)
+                        token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["add_grab"]
+                        if case == "watched_on_second_read_at_final_push":
+                            armed = True
+                        grab = await client.post(
+                            "/action/" + token,
+                            data={"confirm": "1", "root_folder_path": "/media/movies", "quality_profile_id": "4"},
+                        )
+                        out["grab_http"] = grab.status_code
+                    out.update(
+                        triggered=triggered,
+                        radarr_adds=len(rad.add_calls),
+                        pushes=len(rad.push_calls),
+                        feedback=[c.get("decision") for c in fb.calls],
+                    )
+                    return out
+
+        for case in ("normal_existing", "normal_absent"):
+            res = await _run_case(case)
+            self.assertEqual(res["intake_decision"], "actionable_grab", res)
+            self.assertEqual(res["grab_http"], 200, res)
+            self.assertEqual(res["pushes"], 1, res)
+            self.assertEqual(res["feedback"], ["watch"], res)
+
+        r_known = await _run_case("known_file_at_delivery")
+        self.assertEqual(r_known["radarr_status"], "owned_file")
+        self.assertEqual(r_known["intake_decision"], "suppress")
+        self.assertEqual(r_known["pushes"], 0)
+        self.assertEqual(r_known["feedback"], [])
+
+        r_dup = await _run_case("duplicated_imdb_at_delivery")
+        self.assertEqual(r_dup["radarr_status"], "ambiguous")
+        self.assertEqual(r_dup["intake_decision"], "evidence_review")
+        self.assertEqual(r_dup["pushes"], 0)
+        self.assertEqual(r_dup["feedback"], [])
+
+        r_owned2 = await _run_case("owned_on_second_read_at_delivery")
+        self.assertTrue(r_owned2["triggered"])
+        self.assertEqual(r_owned2["radarr_status"], "owned_file")
+        self.assertEqual(r_owned2["intake_decision"], "suppress")
+        self.assertEqual(r_owned2["pushes"], 0)
+        self.assertEqual(r_owned2["feedback"], [])
+
+        r_drift = await _run_case("identity_drift_on_second_read_at_delivery")
+        self.assertTrue(r_drift["triggered"])
+        self.assertEqual(r_drift["radarr_status"], "ambiguous")
+        self.assertEqual(r_drift["intake_decision"], "evidence_review")
+        self.assertEqual(r_drift["pushes"], 0)
+        self.assertEqual(r_drift["feedback"], [])
+
+        r_watch2 = await _run_case("watched_on_second_read_at_final_push")
+        self.assertTrue(r_watch2["triggered"])
+        self.assertEqual(r_watch2["intake_decision"], "actionable_grab")
+        self.assertEqual(r_watch2["grab_http"], 409)
+        self.assertEqual(r_watch2["pushes"], 0)
+        self.assertEqual(r_watch2["feedback"], [])
+
+    async def test_pr18_r4_findings_1_and_2_watched_recovery_and_profile_preservation(self) -> None:
+        """
+        PR #18 Round 4 Findings 1 & 2:
+          - Explicit operation semantics on _lookup_live_radarr_state ensure Watched recovery
+            NEVER synthesizes {watched_tag, monitored=False} across two diverging observations;
+            it verifies BOTH on a single authoritative record before completing or posting feedback.
+          - Concurrent TMDb/IMDb reads where qualityProfileId changes mid-flight (in either read
+            completion order) NEVER overwrite the newer profile with a stale snapshot.
+          - Normal Watched remains green with exactly 1 update and 1 post-write readback.
+        """
+        async def _run_watched_case(mode: str, *, fail_retry_put: bool = False) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as temp:
+                cfg = self._make_config(temp)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    radarr_client=rad,
+                    telegram_client=tg,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c,
+                ):
+                    card = _verified_card_payload(poster_path=None)
+                    hdr = {"X-Internal-Token": cfg.internal_api_secret}
+                    sent = await c.post("/internal/deliver/card", headers=hdr, json=card)
+                    self.assertEqual(sent.status_code, 200)
+                    token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["watched_good"]
+                    url = "/action/" + token
+                    rad.movies[101] = {
+                        "id": 101,
+                        "tmdbId": card["verified_tmdb_id"],
+                        "imdbId": card["verified_imdb_id"],
+                        "hasFile": False,
+                        "tags": [],
+                        "monitored": True,
+                        "qualityProfileId": 4,
+                    }
+                    orig_tmdb = rad.get_movies_by_tmdb
+                    orig_imdb = rad.get_movies_by_imdb
+                    gate = asyncio.Event()
+
+                    if mode == "watched_recovery":
+                        rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        r_init = await c.post(url, data={"confirm": "1"})
+                        self.assertEqual(r_init.status_code, 503)
+                        if fail_retry_put:
+                            rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        rad.movies[101].update({"tags": [], "monitored": False})
+
+                        async def _first(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            gate.set()
+                            return val
+
+                        async def _second(key: str) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101].update({"tags": [7], "monitored": True})
+                            return await orig_imdb(key)
+
+                        rad.get_movies_by_tmdb = _first  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _second  # type: ignore[method-assign]
+                    elif mode == "watched_preserves_profile_imdb_first":
+                        async def _earlier(key: str) -> RadarrReadResult:
+                            val = await orig_imdb(key)
+                            gate.set()
+                            return val
+
+                        async def _later(key: int) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101]["qualityProfileId"] = 9
+                            return await orig_tmdb(key)
+
+                        rad.get_movies_by_imdb = _earlier  # type: ignore[method-assign]
+                        rad.get_movies_by_tmdb = _later  # type: ignore[method-assign]
+                    elif mode == "watched_preserves_profile_tmdb_first":
+                        async def _earlier_t(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            gate.set()
+                            return val
+
+                        async def _later_i(key: str) -> RadarrReadResult:
+                            await gate.wait()
+                            rad.movies[101]["qualityProfileId"] = 9
+                            return await orig_imdb(key)
+
+                        rad.get_movies_by_tmdb = _earlier_t  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _later_i  # type: ignore[method-assign]
+
+                    r = await c.post(url, data={"confirm": "1"})
+                    return {
+                        "http": r.status_code,
+                        "monitored": rad.movies[101]["monitored"],
+                        "tags": list(rad.movies[101]["tags"]),
+                        "profile_id": rad.movies[101]["qualityProfileId"],
+                        "feedback": [v["decision"] for v in fb.calls],
+                        "update_calls": len(rad.update_calls),
+                        "readback_calls": rad.readback_calls,
+                    }
+
+        r_norm = await _run_watched_case("watched_normal")
+        self.assertEqual(r_norm["http"], 200)
+        self.assertFalse(r_norm["monitored"])
+        self.assertIn(7, r_norm["tags"])
+        self.assertEqual(r_norm["profile_id"], 4)
+        self.assertEqual(r_norm["feedback"], ["watch"])
+        self.assertEqual(r_norm["update_calls"], 1)
+        self.assertEqual(r_norm["readback_calls"], 1)
+
+        r_rec = await _run_watched_case("watched_recovery")
+        self.assertEqual(r_rec["http"], 200)
+        self.assertFalse(r_rec["monitored"])
+        self.assertIn(7, r_rec["tags"])
+        self.assertEqual(r_rec["feedback"], ["watch"])
+        self.assertEqual(r_rec["update_calls"], 2)
+
+        r_rec_fail = await _run_watched_case("watched_recovery", fail_retry_put=True)
+        self.assertEqual(r_rec_fail["http"], 503)
+        self.assertTrue(r_rec_fail["monitored"])
+        self.assertEqual(r_rec_fail["feedback"], [])
+
+        for prof_mode in ("watched_preserves_profile_imdb_first", "watched_preserves_profile_tmdb_first"):
+            r_prof = await _run_watched_case(prof_mode)
+            self.assertEqual(r_prof["http"], 200, prof_mode)
+            self.assertEqual(r_prof["profile_id"], 9, prof_mode)
+            self.assertFalse(r_prof["monitored"], prof_mode)
+            self.assertIn(7, r_prof["tags"], prof_mode)
+            self.assertEqual(r_prof["feedback"], ["watch"], prof_mode)
+            self.assertEqual(r_prof["update_calls"], 1, prof_mode)
+
+    async def test_pr18_r5_finding_2_watched_partial_editor_and_authoritative_recovery(self) -> None:
+        """
+        PR #18 Round 5 Finding 2:
+          - Watched mutations send ONLY monitoring and additive tag edits (Radarr v3
+            PUT /api/v3/movie/editor) so concurrent external edits to qualityProfileId or
+            unrelated tags at write time are never overwritten.
+          - Watched recovery ALWAYS performs a fresh authoritative GET /api/v3/movie/{id}
+            AFTER all concurrent lookups (TMDb, IMDb, tags) finish before sealing an uncertain
+            attempt, preventing false completion when a concurrent edit re-monitors the movie.
+        """
+        from services.movie_actions_api.clients import RadarrClient
+
+        # 1) Direct wire-level verification that RadarrClient routes applyTags='add' to PUT /api/v3/movie/editor
+        captured: list[tuple[str, str, dict[str, Any]]] = []
+
+        def _mock_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            captured.append((request.method, request.url.path, body))
+            return httpx.Response(
+                202,
+                json=[{"id": 101, "monitored": False, "tags": [36, 7], "qualityProfileId": 9}],
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_handler)) as mock_http:
+            rc = RadarrClient(base_url="http://radarr.invalid", api_key="synth-key", http_client=mock_http)
+            w_res = await rc.update_movie(101, {"monitored": False, "tags": [7], "applyTags": "add"})
+            self.assertEqual(w_res.outcome, "ok")
+            self.assertEqual(len(captured), 1)
+            method, path, wire = captured[0]
+            self.assertEqual(method, "PUT")
+            self.assertEqual(path, "/api/v3/movie/editor")
+            self.assertEqual(wire, {"movieIds": [101], "monitored": False, "tags": [7], "applyTags": "add"})
+            self.assertNotIn("qualityProfileId", wire)
+
+        # 2) End-to-end ASGI scenarios (control, unrelated_edit_at_write, recovery_after_concurrent_remonitor)
+        async def _run_scenario(name: str, *, fail_retry: bool = False) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as private:
+                cfg = self._make_config(private)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    radarr_client=rad,
+                    telegram_client=tg,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+                ):
+                    card = _verified_card_payload(poster_path=None)
+                    resp = await client.post(
+                        "/internal/deliver/card",
+                        json=card,
+                        headers={"X-Internal-Token": cfg.internal_api_secret},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["watched_bad"]
+                    url = "/action/" + token
+                    row_id = 101
+                    rad.movies[row_id] = {
+                        "id": row_id,
+                        "imdbId": card["verified_imdb_id"],
+                        "tmdbId": card["verified_tmdb_id"],
+                        "hasFile": True,
+                        "qualityProfileId": 4,
+                        "monitored": True,
+                        "tags": [],
+                    }
+                    if name == "unrelated_edit_at_write":
+                        real_update = rad.update_movie
+
+                        async def _watched_write(movie_id: int, payload: dict[str, Any]) -> RadarrWriteResult:
+                            rad.movies[movie_id].update(qualityProfileId=9, tags=[36])
+                            return await real_update(movie_id, payload)
+
+                        rad.update_movie = _watched_write  # type: ignore[method-assign]
+                    elif name == "recovery_after_concurrent_remonitor":
+                        rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        self.assertEqual((await client.post(url, data={"confirm": "1"})).status_code, 503)
+                        if fail_retry:
+                            rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        rad.movies[row_id].update(monitored=False, tags=[7])
+                        orig_tmdb, orig_imdb, orig_tags = rad.get_movies_by_tmdb, rad.get_movies_by_imdb, rad.get_tags
+                        tmdb_done, imdb_done = asyncio.Event(), asyncio.Event()
+
+                        async def _obs_tmdb(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            tmdb_done.set()
+                            return val
+
+                        async def _obs_imdb(key: str) -> RadarrReadResult:
+                            val = await orig_imdb(key)
+                            imdb_done.set()
+                            return val
+
+                        async def _obs_tags() -> RadarrReadResult:
+                            await asyncio.gather(tmdb_done.wait(), imdb_done.wait())
+                            rad.movies[row_id].update(monitored=True)
+                            return await orig_tags()
+
+                        rad.get_movies_by_tmdb = _obs_tmdb  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _obs_imdb  # type: ignore[method-assign]
+                        rad.get_tags = _obs_tags  # type: ignore[method-assign]
+
+                    r = await client.post(url, data={"confirm": "1"})
+                    row = rad.movies[row_id]
+                    return {
+                        "http": r.status_code,
+                        "tags": list(row["tags"]),
+                        "profile": row["qualityProfileId"],
+                        "monitored": row["monitored"],
+                        "hasFile": row["hasFile"],
+                        "feedback": [v["decision"] for v in fb.calls],
+                        "get_by_id": rad.readback_calls,
+                        "updates": len(rad.update_calls),
+                    }
+
+        r_ctrl = await _run_scenario("control")
+        self.assertEqual(r_ctrl["http"], 200)
+        self.assertEqual(r_ctrl["feedback"], ["skip"])
+        self.assertEqual(r_ctrl["tags"], [7])
+        self.assertFalse(r_ctrl["monitored"])
+        self.assertTrue(r_ctrl["hasFile"])
+        self.assertEqual(r_ctrl["profile"], 4)
+        self.assertEqual(r_ctrl["get_by_id"], 1)
+        self.assertEqual(r_ctrl["updates"], 1)
+
+        r_edit = await _run_scenario("unrelated_edit_at_write")
+        self.assertEqual(r_edit["http"], 200)
+        self.assertEqual(r_edit["profile"], 9)
+        self.assertIn(36, r_edit["tags"])
+        self.assertIn(7, r_edit["tags"])
+        self.assertFalse(r_edit["monitored"])
+        self.assertTrue(r_edit["hasFile"])
+        self.assertEqual(r_edit["feedback"], ["skip"])
+
+        r_rec = await _run_scenario("recovery_after_concurrent_remonitor")
+        self.assertEqual(r_rec["http"], 200)
+        self.assertFalse(r_rec["monitored"])
+        self.assertIn(7, r_rec["tags"])
+        self.assertEqual(r_rec["feedback"], ["skip"])
+        self.assertGreaterEqual(r_rec["get_by_id"], 2)
+        self.assertEqual(r_rec["updates"], 2)
+
+        r_rec_fail = await _run_scenario("recovery_after_concurrent_remonitor", fail_retry=True)
+        self.assertEqual(r_rec_fail["http"], 503)
+        self.assertTrue(r_rec_fail["monitored"])
+        self.assertEqual(r_rec_fail["feedback"], [])
 
 
 if __name__ == "__main__":

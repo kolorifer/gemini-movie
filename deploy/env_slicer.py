@@ -34,6 +34,8 @@ INTAKE_ALLOWED_KEYS: tuple[str, ...] = (
     "TRIAGE_API_URL",
     "ACTIONS_API_URL",
     "SHADOW_REPLAY_ENABLED",
+    "MOVIE_INTEL_ALLOWED_FILTERS",
+    "MOVIE_INTEL_ALLOWED_FILTER_IDS",
 )
 
 ACTIONS_ALLOWED_KEYS: tuple[str, ...] = (
@@ -203,6 +205,12 @@ def atomic_write_env_file(target: Path, ordered_keys: tuple[str, ...], values: M
         os.close(fd)
         fd = None
         os.replace(str(tmp_path), str(target))
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        dir_fd = os.open(str(target.parent), dir_flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
         if fd is not None:
             try:
@@ -253,11 +261,44 @@ def build_sliced_envs(
     if not secret:
         secret = secrets.token_urlsafe(32)
 
+    def _validate_allowed_filters(raw: str) -> str:
+        clean = _validate_env_value("MOVIE_INTEL_ALLOWED_FILTERS", raw.strip())
+        if not clean:
+            return "Movies Remux"
+        parts = [p.strip() for p in clean.split(",") if p.strip()]
+        if not parts:
+            raise EnvSecurityError("MOVIE_INTEL_ALLOWED_FILTERS must contain at least one filter name")
+        return ",".join(parts)
+
+    def _validate_allowed_filter_ids(raw: str) -> str:
+        clean = _validate_env_value("MOVIE_INTEL_ALLOWED_FILTER_IDS", raw.strip())
+        if not clean:
+            return ""
+        ids: list[str] = []
+        for part in clean.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if not token.isdigit() or int(token) < 1:
+                raise EnvSecurityError(
+                    f"MOVIE_INTEL_ALLOWED_FILTER_IDS entries must be positive integers, got {token!r}"
+                )
+            ids.append(str(int(token)))
+        if not ids:
+            raise EnvSecurityError("MOVIE_INTEL_ALLOWED_FILTER_IDS contained no valid positive integer IDs")
+        return ",".join(ids)
+
     if shadow_mode:
         state_root = home_dir / ".local" / "state" / "movie-intel-shadow"
         shadow_webhook = (
             existing_intake_env.get("MOVIE_INTEL_WEBHOOK_SECRET", "").strip()
             or f"shadow-{secrets.token_urlsafe(24)}"
+        )
+        shadow_filters = _validate_allowed_filters(
+            (override_env.get("MOVIE_INTEL_ALLOWED_FILTERS") or existing_intake_env.get("MOVIE_INTEL_ALLOWED_FILTERS") or "Movies Remux")
+        )
+        shadow_filter_ids = _validate_allowed_filter_ids(
+            (override_env.get("MOVIE_INTEL_ALLOWED_FILTER_IDS") or existing_intake_env.get("MOVIE_INTEL_ALLOWED_FILTER_IDS") or "")
         )
         intake_env = {
             "MOVIE_INTEL_HOST": "127.0.0.1",
@@ -273,6 +314,8 @@ def build_sliced_envs(
             "TRIAGE_API_URL": "http://shadow-triage.invalid",
             "ACTIONS_API_URL": f"http://127.0.0.1:{port_actions}",
             "SHADOW_REPLAY_ENABLED": "true",
+            "MOVIE_INTEL_ALLOWED_FILTERS": shadow_filters,
+            "MOVIE_INTEL_ALLOWED_FILTER_IDS": shadow_filter_ids,
         }
         actions_env = {
             "ACTIONS_HOST": "127.0.0.1",
@@ -320,6 +363,12 @@ def build_sliced_envs(
         existing_intake_env,
         str(config_root / "torrentleech-cookies-pr42.json"),
     )
+    allowed_filters = _validate_allowed_filters(
+        _pick("MOVIE_INTEL_ALLOWED_FILTERS", existing_intake_env, "Movies Remux")
+    )
+    allowed_filter_ids = _validate_allowed_filter_ids(
+        _pick("MOVIE_INTEL_ALLOWED_FILTER_IDS", existing_intake_env, "")
+    )
     # Alternative Grab config contains download-client credentials: actions-only!
     alt_cfg = _pick("MOVIE_INTEL_ALTERNATIVE_GRAB_CONFIG", existing_actions_env, "")
 
@@ -337,6 +386,8 @@ def build_sliced_envs(
         "TRIAGE_API_URL": f"http://127.0.0.1:{port_triage}",
         "ACTIONS_API_URL": f"http://127.0.0.1:{port_actions}",
         "SHADOW_REPLAY_ENABLED": "false",
+        "MOVIE_INTEL_ALLOWED_FILTERS": allowed_filters,
+        "MOVIE_INTEL_ALLOWED_FILTER_IDS": allowed_filter_ids,
     }
 
     actions_env: dict[str, str] = {

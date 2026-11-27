@@ -12,16 +12,27 @@ from pathlib import Path
 from typing import Optional
 
 _SECRET_URL_RE = re.compile(
-    r"https?://\S+|magnet:\S+|www\.\S+"
-    r"|/webhook/[^/\s?\"']+"
-    r"|/action/[^/\s?\"']+"
-    r"|bot\d{5,15}:[A-Za-z0-9_-]{20,}"
-    r"|\b\d{5,15}:[A-Za-z0-9_-]{25,}\b"
-    r"|\b(?:passkey|authkey|api[_-]?key|apikey|secret|token|password|authorization|cookie|bearer|x-internal-token|x-api-key)\b\s*[:=]?\s*\S+"
-    r"|\bkey\s*=\s*\S+"
+    r"https?://\S+|ftps?://\S+|wss?://\S+|magnet:\S+|www\.\S+"
+    r"|(?<![A-Za-z0-9:])//[A-Za-z0-9.-]+/\S+"
+    r"|[A-Za-z0-9._%+-]+:[^@\s/\"']+@[A-Za-z0-9.-]+(?::\d+)?(?:/\S*)?"
+    r"|/(?:webhook|action|download|rss|announce)/[^\s?\"'<>]+"
+    r"|\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+)"
+    r"|\b(?:set-)?cookie\s*[:=]\s*(?:[A-Za-z0-9_.-]+\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+)(?:\s*;\s*[A-Za-z0-9_.-]+(?:\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+))?)*|(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+))"
+    r"|bot\d{5,15}:[A-Za-z0-9_-]{12,}"
+    r"|\b\d{5,15}:[A-Za-z0-9_-]{12,}\b"
+    r"|AIza[A-Za-z0-9_-]{16,}"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]*)?"
-    r"|\b[A-Fa-f0-9]{40,}\b"
-    r"|[A-Za-z0-9_]{48,}",
+    r"|\b(?:sk|pk|rk)[-_](?:proj[-_]|live[-_]|test[-_])?[A-Za-z0-9_-]{16,}"
+    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{16,}\b"
+    r"|\bglpat-[A-Za-z0-9_-]{16,}\b"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"
+    r"|(?<![A-Za-z0-9_-])[\"']?(?:[A-Za-z0-9_-]{0,40}(?:passkey|pass_key|authkey|auth_key|api[_-]?key|apikey|api[_-]?token|secret|token|password|passwd|pwd|torrent_pass|tlpass|tluid|phpsessid|cf_clearance|session[_-]?id|sessionid|jsessionid|xsrf|csrf|cookie|bearer|access[_-]?key|private[_-]?key|rss[_-]?key|download[_-]?key)[A-Za-z0-9_-]{0,20}|[A-Za-z0-9_-]{1,40}[_-](?:key|auth|pass|session|sid)|key|auth|pass|session|sid)[\"']?\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+)"
+    r"|(?<![A-Za-z0-9_-])(?:[A-Za-z0-9_-]{0,40}(?:passkey|pass_key|authkey|auth_key|api[_-]?key|apikey|api[_-]?token|x-internal-token|x-api-key|x-radarr-api-key|torrent_pass|tlpass|tluid|phpsessid|cf_clearance|session[_-]?id|sessionid))\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\"'&;,)\]}<>]+)"
+    r"|\b[A-Fa-f0-9]{32,}\b"
+    r"|(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9]{32,}(?![A-Za-z0-9_.-]))(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{32,}"
+    r"|\b[A-Za-z0-9_]{48,}\b",
     re.IGNORECASE,
 )
 
@@ -54,10 +65,9 @@ def redact_secrets(raw: Optional[str], *, max_chars: Optional[int] = 900) -> str
     def _replace(match: re.Match[str]) -> str:
         text = match.group(0)
         low = text.lower()
-        if low.startswith("/webhook/"):
-            return "/webhook/[REDACTED]"
-        if low.startswith("/action/"):
-            return "/action/[REDACTED]"
+        for prefix in ("/webhook/", "/action/", "/download/", "/rss/", "/announce/"):
+            if low.startswith(prefix):
+                return f"{prefix}[REDACTED]"
         return "[REDACTED]"
 
     scrubbed = _SECRET_URL_RE.sub(_replace, raw)
@@ -69,15 +79,24 @@ def redact_secrets(raw: Optional[str], *, max_chars: Optional[int] = 900) -> str
 
 
 class SecretRedactingLogFilter(logging.Filter):
-    """Logging filter scrubbing secret-bearing paths, URLs, bot tokens, and API keys."""
+    """Logging filter scrubbing secret-bearing paths, URLs, bot tokens, API keys, and active exceptions."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             rendered = record.getMessage()
             record.msg = redact_secrets(rendered, max_chars=2000)
             record.args = ()
+            if record.exc_info:
+                exc_type, exc_val, _tb = record.exc_info
+                exc_name = exc_type.__name__ if exc_type is not None else "Exception"
+                exc_msg = redact_secrets(str(exc_val), max_chars=400) if exc_val is not None else ""
+                record.exc_info = None
+                record.exc_text = f"{exc_name}: {exc_msg}" if exc_msg else exc_name
+            elif record.exc_text:
+                record.exc_text = redact_secrets(record.exc_text, max_chars=2000)
         except Exception:
-            pass
+            record.exc_info = None
+            record.exc_text = None
         return True
 
 
@@ -143,5 +162,15 @@ def read_owner_private_regular_file(path: Path, *, max_bytes: int) -> bytes:
                 raise PrivateFileError(f"Private file exceeded maximum size of {max_bytes} bytes while reading")
             chunks.append(chunk)
         return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def fsync_directory(path: Path) -> None:
+    """Sync directory metadata so newly created entries and renames survive host crashes."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
     finally:
         os.close(fd)

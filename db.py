@@ -4,12 +4,22 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "triage.db"
+EVALUATION_CACHE_VERSION = 2
+_CACHE_RATING_KEYS = (
+    "rotten_tomatoes_critics",
+    "rotten_tomatoes_audience",
+    "metacritic",
+    "imdb",
+    "letterboxd",
+)
 
 IMDB_ID_RE = re.compile(r"\b(tt\d{7,10})\b", re.IGNORECASE)
 YEAR_RE = re.compile(r"^(18[89]\d|19\d\d|20\d\d)$")
@@ -191,6 +201,61 @@ def _detect_dv_profile_and_el(
     return dv_profile, None, None
 
 
+_EDITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("directors_cut", re.compile(r"(?<![a-z0-9])(?:director['’]?s?[\s._-]*cut|dir[\s._-]*cut)(?![a-z0-9])", re.IGNORECASE)),
+    ("extended", re.compile(r"(?<![a-z0-9])(?:extended(?:[\s._-]*(?:cut|edition|version))?)(?![a-z0-9])", re.IGNORECASE)),
+    ("theatrical", re.compile(r"(?<![a-z0-9])(?:theatrical(?:[\s._-]*(?:cut|edition|version))?)(?![a-z0-9])", re.IGNORECASE)),
+    ("final_cut", re.compile(r"(?<![a-z0-9])final[\s._-]*cut(?![a-z0-9])", re.IGNORECASE)),
+    ("ultimate_cut", re.compile(r"(?<![a-z0-9])ultimate[\s._-]*(?:cut|edition)(?![a-z0-9])", re.IGNORECASE)),
+    ("assembly_cut", re.compile(r"(?<![a-z0-9])assembly[\s._-]*cut(?![a-z0-9])", re.IGNORECASE)),
+    ("alternate_cut", re.compile(r"(?<![a-z0-9])alternate[\s._-]*(?:cut|edition|ending)(?![a-z0-9])", re.IGNORECASE)),
+    ("special_edition", re.compile(r"(?<![a-z0-9])special[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("collectors_edition", re.compile(r"(?<![a-z0-9])collector['’]?s?[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("anniversary_edition", re.compile(r"(?<![a-z0-9])(?:\d{1,2}(?:th|st|nd|rd)[\s._-]*)?anniversary[\s._-]*edition(?![a-z0-9])", re.IGNORECASE)),
+    ("unrated", re.compile(r"(?<![a-z0-9])unrated(?![a-z0-9])", re.IGNORECASE)),
+    ("uncut", re.compile(r"(?<![a-z0-9])uncut(?![a-z0-9])", re.IGNORECASE)),
+    ("redux", re.compile(r"(?<![a-z0-9])redux(?![a-z0-9])", re.IGNORECASE)),
+    ("workprint", re.compile(r"(?<![a-z0-9])workprint(?![a-z0-9])", re.IGNORECASE)),
+    ("roadshow", re.compile(r"(?<![a-z0-9])roadshow(?![a-z0-9])", re.IGNORECASE)),
+    ("open_matte", re.compile(r"(?<![a-z0-9])open[\s._-]*matte(?![a-z0-9])", re.IGNORECASE)),
+    ("imax", re.compile(r"(?<![a-z0-9])imax(?:[\s._-]*enhanced)?(?![a-z0-9])", re.IGNORECASE)),
+    ("criterion", re.compile(r"(?<![a-z0-9])criterion(?![a-z0-9])", re.IGNORECASE)),
+    ("remastered", re.compile(r"(?<![a-z0-9])remastered(?![a-z0-9])", re.IGNORECASE)),
+    ("restored", re.compile(r"(?<![a-z0-9])restor(?:ed|ation)(?![a-z0-9])", re.IGNORECASE)),
+)
+_DC_TOKEN_RE = re.compile(r"(?<![a-z0-9])dc(?![a-z0-9])", re.IGNORECASE)
+
+
+def extract_edition_key(raw_text: str) -> str:
+    """
+    Extract canonical sorted edition/cut markers from the release string's post-year/tag section
+    so theatrical, extended, director's cut, unrated, IMAX, Criterion, etc. never collide in cache.
+    Scans forward for the release year (skipping adjacent title-embedded years like 'Blade Runner 2049 2017')
+    so a later restoration year (e.g. '2004.Extended.2020.Restoration') never erases the cut marker.
+    """
+    text = _TRAILING_EXT_RE.sub("", (raw_text or "").strip())
+    if not text:
+        return ""
+    # Focus on post-release-year text so title words before the release year are not misread as editions
+    tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", text) if t]
+    search_text = text
+    for idx in range(1, len(tokens)):
+        if YEAR_RE.match(tokens[idx]):
+            next_idx = idx + 1
+            while next_idx < len(tokens) and YEAR_RE.match(tokens[next_idx]):
+                next_idx += 1
+            search_text = " ".join(tokens[next_idx:])
+            break
+
+    found: list[str] = []
+    for label, pattern in _EDITION_PATTERNS:
+        if pattern.search(search_text):
+            found.append(label)
+    if "directors_cut" not in found and search_text != text and _DC_TOKEN_RE.search(search_text):
+        found.append("directors_cut")
+    return "+".join(sorted(set(found)))
+
+
 @dataclass(frozen=True)
 class ReleaseQuality:
     resolution: Optional[str] = None
@@ -204,6 +269,7 @@ class ReleaseQuality:
     format_label: str = "unknown"
     release_group: Optional[str] = None
     is_favorite_group: bool = False
+    edition_key: str = ""
     cache_key: str = ""
 
     def to_prompt_line(self) -> Optional[str]:
@@ -365,6 +431,8 @@ def parse_release_quality(
             parts.append(f"fav_{release_group.lower()}")
         cache_key = "_".join(parts)
 
+    edition_key = extract_edition_key(raw_text)
+
     return ReleaseQuality(
         resolution=detected_res,
         is_remux=is_remux,
@@ -377,6 +445,7 @@ def parse_release_quality(
         format_label=format_label,
         release_group=release_group,
         is_favorite_group=is_favorite_group,
+        edition_key=edition_key,
         cache_key=cache_key,
     )
 
@@ -490,6 +559,210 @@ def extract_imdb_id(*texts: Optional[str]) -> Optional[str]:
     return None
 
 
+_DATED_EDITION_YEAR_MARKERS = frozenset(
+    {
+        "restoration",
+        "restored",
+        "remaster",
+        "remastered",
+        "reissue",
+        "reissued",
+        "rerelease",
+        "re-release",
+        "master",
+        "mastered",
+        "transfer",
+        "scan",
+        "anniversary",
+        "criterion",
+        "print",
+    }
+)
+_DATED_EDITION_YEAR_PREFIXES = frozenset(
+    {"2k", "4k", "8k", "uhd", "hd", "new", "newly", "digital"}
+)
+
+
+def _is_dated_edition_year(
+    tokens: list[str],
+    idx: int,
+    *,
+    film_year: Optional[int] = None,
+    max_release_year: Optional[int] = None,
+) -> bool:
+    """
+    Return True when a 4-digit year token at `tokens[idx]` plausibly labels a
+    restoration/remaster/reissue edition (e.g. '2022.Restoration', '2022.4K.Restoration',
+    '2022.Remastered') rather than the film's own release year.
+    When `film_year` is supplied, requires chronological order (`edition_year > film_year`)
+    so a release year predating or matching a title numeral (e.g. 'Crew.Of.1999.1990.Remastered')
+    is never misclassified as a restoration year.
+    """
+    if idx < 0 or idx >= len(tokens):
+        return False
+    low = tokens[idx].lower()
+    if not YEAR_RE.match(low):
+        return False
+    edition_year = int(low)
+    if film_year is not None and edition_year <= film_year:
+        return False
+    if max_release_year is not None and edition_year > max_release_year:
+        return False
+    if idx + 1 < len(tokens):
+        nxt = tokens[idx + 1].lower().strip("'’")
+        if nxt in _DATED_EDITION_YEAR_MARKERS:
+            return True
+        if nxt in _DATED_EDITION_YEAR_PREFIXES and idx + 2 < len(tokens):
+            nxt2 = tokens[idx + 2].lower().strip("'’")
+            if nxt2 in _DATED_EDITION_YEAR_MARKERS:
+                return True
+    return False
+
+
+def is_title_numeral_token(tokens: list[str], idx: int, *, max_release_year: int) -> bool:
+    """
+    Return True when a 4-digit year-like token at `tokens[idx]` is part of the movie title
+    (e.g. '2049' in 'Road.2049.2017.1080p.BluRay.REMUX', '1999' in 'Crew.Of.1999.1990.Remastered',
+    or '1984' in 'Wonder.Woman.1984.2020') rather than the release year itself. Does NOT treat a
+    release year followed by a chronologically later labeled restoration/remaster year
+    (e.g. 'Granite.Bay.1994.2022.Restoration') as a title numeral.
+    """
+    low = tokens[idx].lower()
+    if not YEAR_RE.match(low):
+        return False
+    if idx == 0:
+        return True
+    year_val = int(low)
+    if year_val > max_release_year:
+        return True
+    if (
+        idx + 1 < len(tokens)
+        and YEAR_RE.match(tokens[idx + 1].lower())
+        and not _is_dated_edition_year(
+            tokens,
+            idx + 1,
+            film_year=year_val,
+            max_release_year=max_release_year,
+        )
+    ):
+        return True
+    return False
+
+
+def _normalize_title_compare(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z]+", " ", stripped).strip().lower())
+
+
+def extract_tokens_title_year_candidates(
+    tokens: list[str],
+    *,
+    max_release_year: int,
+    skip_imdb_tokens: bool = False,
+) -> list[tuple[list[str], Optional[int]]]:
+    """
+    Extract ordered `(title_tokens, detected_year)` candidates from tokenized release text.
+    Returns one candidate unless a chronologically plausible consecutive-year + dated-edition
+    marker pair (`Y1 < Y2 <= max_release_year`, e.g. `1984.2020.Remastered` or
+    `1994.2022.Restoration`) supports both:
+      1. Primary (dated restoration/remaster): `(title_tokens, Y1)`
+      2. Alternate (title-ending numeral on remastered disc): `(title_tokens + [Y1], Y2)`
+    """
+    title_tokens: list[str] = []
+    detected_year: Optional[int] = None
+    alternate: Optional[tuple[list[str], int]] = None
+
+    for idx, token in enumerate(tokens):
+        low = token.lower()
+        if YEAR_RE.match(low):
+            if is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
+                title_tokens.append(token)
+                continue
+            year_val = int(low)
+            detected_year = year_val
+            if (
+                idx > 0
+                and year_val <= max_release_year
+                and idx + 1 < len(tokens)
+                and _is_dated_edition_year(
+                    tokens,
+                    idx + 1,
+                    film_year=year_val,
+                    max_release_year=max_release_year,
+                )
+            ):
+                alternate = (title_tokens + [token], int(tokens[idx + 1]))
+            break
+        if low in RELEASE_STOP_TOKENS and title_tokens:
+            break
+        if skip_imdb_tokens and low.startswith("tt") and re.fullmatch(r"tt\d{7,10}", low):
+            continue
+        title_tokens.append(token)
+
+    candidates: list[tuple[list[str], Optional[int]]] = [(title_tokens, detected_year)]
+    if alternate is not None:
+        candidates.append(alternate)
+    return candidates
+
+
+def select_release_title_year_candidate(
+    candidates: list[tuple[list[str], Optional[int]]],
+    *,
+    hint_title: Optional[str] = None,
+    hint_year: Optional[int] = None,
+) -> tuple[list[str], Optional[int]]:
+    """
+    Resolve between chronologically valid consecutive-year interpretations using corroborating
+    title/year hints when available. Never overrides an unambiguous single-interpretation filename
+    and never lets a non-numeral title + contradictory year hint mask a release-year conflict.
+    """
+    if not candidates:
+        return ([], None)
+    if len(candidates) == 1 or (not hint_title and hint_year is None):
+        return candidates[0]
+
+    primary_tokens, primary_year = candidates[0]
+    alt_tokens, alt_year = candidates[1]
+    norm_primary = _normalize_title_compare(" ".join(primary_tokens))
+    norm_alt = _normalize_title_compare(" ".join(alt_tokens))
+    norm_hint = _normalize_title_compare(hint_title) if hint_title else ""
+
+    hint_words = norm_hint.split() if norm_hint else []
+    hint_contains_primary_year = bool(
+        primary_year is not None and str(primary_year) in hint_words
+    )
+    hint_title_matches_primary = bool(norm_hint and norm_primary and norm_hint == norm_primary)
+    hint_title_matches_alt = bool(norm_hint and norm_alt and norm_hint == norm_alt)
+    if (
+        norm_hint
+        and not hint_title_matches_primary
+        and not hint_title_matches_alt
+        and hint_contains_primary_year
+        and norm_primary
+    ):
+        if all(w in hint_words for w in norm_primary.split()):
+            hint_title_matches_alt = True
+
+    hint_year_matches_primary = (
+        hint_year is not None and primary_year is not None and abs(hint_year - primary_year) <= 1
+    )
+    hint_year_matches_alt = (
+        hint_year is not None and alt_year is not None and abs(hint_year - alt_year) <= 1
+    )
+
+    if hint_title_matches_alt and (hint_year is None or hint_year_matches_alt):
+        return candidates[1]
+    if (
+        hint_contains_primary_year
+        and not hint_title_matches_primary
+        and hint_year_matches_alt
+        and not hint_year_matches_primary
+    ):
+        return candidates[1]
+    return candidates[0]
+
+
 def normalize_release_key(
     raw_text: str,
     hint_title: Optional[str] = None,
@@ -505,17 +778,14 @@ def normalize_release_key(
     cleaned = re.sub(r"-[A-Za-z0-9]{2,20}$", "", cleaned)
     tokens = [t for t in re.split(r"[\s._\-\[\]\(\)\{\}/\\,:;]+", cleaned) if t]
 
-    title_tokens: list[str] = []
-    detected_year: Optional[int] = None
-
-    for idx, token in enumerate(tokens):
-        low = token.lower()
-        if YEAR_RE.match(low) and idx > 0:
-            detected_year = int(low)
-            break
-        if low in RELEASE_STOP_TOKENS and title_tokens:
-            break
-        title_tokens.append(low)
+    max_release_year = datetime.now(timezone.utc).year + 5
+    candidates = extract_tokens_title_year_candidates(tokens, max_release_year=max_release_year)
+    chosen_tokens, detected_year = select_release_title_year_candidate(
+        candidates,
+        hint_title=hint_title,
+        hint_year=hint_year,
+    )
+    title_tokens = [t.lower() for t in chosen_tokens]
 
     year = detected_year or hint_year
     if not title_tokens and hint_title:
@@ -557,7 +827,11 @@ class TriageDB:
             pass
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.db_path}{suffix}")
-            if candidate.is_symlink():
+            try:
+                st = os.lstat(str(candidate))
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
                 raise RuntimeError(f"Refusing to open symlinked database path: {candidate}")
         try:
             fd = os.open(
@@ -573,12 +847,20 @@ class TriageDB:
         for suffix in ("", "-wal", "-shm"):
             target = Path(f"{self.db_path}{suffix}")
             try:
-                if target.exists() and not target.is_symlink():
-                    st = target.stat()
-                    if st.st_uid == os.getuid():
-                        os.chmod(target, 0o600)
+                st = os.lstat(str(target))
+            except FileNotFoundError:
+                continue
             except OSError:
-                pass
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_uid == os.getuid() and (st.st_mode & 0o077) != 0:
+                try:
+                    os.chmod(str(target), 0o600)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_private_permissions()
@@ -598,7 +880,9 @@ class TriageDB:
                     raw_text_normalized TEXT NOT NULL,
                     release_key TEXT,
                     quality_key TEXT NOT NULL DEFAULT '',
+                    edition_key TEXT NOT NULL DEFAULT '',
                     evidence_key TEXT NOT NULL DEFAULT '',
+                    cache_version INTEGER NOT NULL DEFAULT 1,
                     raw_text_original TEXT NOT NULL,
                     imdb_id TEXT,
                     canonical_title TEXT NOT NULL,
@@ -623,6 +907,7 @@ class TriageDB:
                 CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     imdb_id TEXT,
+                    tmdb_id INTEGER,
                     title TEXT NOT NULL,
                     decision TEXT NOT NULL CHECK (decision IN ('WATCH', 'MAYBE', 'SKIP')),
                     note TEXT,
@@ -633,18 +918,33 @@ class TriageDB:
                     ON feedback (created_at DESC, id DESC);
                 """
             )
-            cols = {
+            eval_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
             }
-            if "quality_key" not in cols:
+            if "quality_key" not in eval_cols:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN quality_key TEXT NOT NULL DEFAULT ''"
                 )
-            if "evidence_key" not in cols:
+            if "edition_key" not in eval_cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN edition_key TEXT NOT NULL DEFAULT ''"
+                )
+            if "evidence_key" not in eval_cols:
                 conn.execute(
                     "ALTER TABLE evaluations ADD COLUMN evidence_key TEXT NOT NULL DEFAULT ''"
                 )
+            if "cache_version" not in eval_cols:
+                conn.execute(
+                    "ALTER TABLE evaluations ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 1"
+                )
+            fb_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(feedback)").fetchall()
+            }
+            if "tmdb_id" not in fb_cols:
+                conn.execute("ALTER TABLE feedback ADD COLUMN tmdb_id INTEGER")
+
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_quality
@@ -659,23 +959,62 @@ class TriageDB:
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_raw_qual_ev
-                    ON evaluations (raw_text_normalized, quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_raw_qual_ed_ev
+                    ON evaluations (raw_text_normalized, quality_key, edition_key, evidence_key, created_at DESC)
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_qual_ev
-                    ON evaluations (lower(imdb_id), quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_imdb_qual_ed_ev
+                    ON evaluations (lower(imdb_id), quality_key, edition_key, evidence_key, created_at DESC)
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_qual_ev
-                    ON evaluations (release_key, quality_key, evidence_key, created_at DESC)
+                CREATE INDEX IF NOT EXISTS idx_evaluations_rel_qual_ed_ev
+                    ON evaluations (release_key, quality_key, edition_key, evidence_key, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feedback_imdb_id
+                    ON feedback (lower(imdb_id))
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feedback_tmdb_id
+                    ON feedback (tmdb_id)
                 """
             )
         self._harden_db_file_permissions()
+
+    @staticmethod
+    def _validate_cached_payload(raw_json: str) -> Optional[dict[str, Any]]:
+        """Revalidate cached JSON against current schema, identity compatibility, and rating sources."""
+        from pydantic import ValidationError
+        from schemas import EvaluationPayload
+
+        try:
+            parsed = json.loads(raw_json)
+            validated = EvaluationPayload.model_validate(parsed)
+        except (ValueError, TypeError, ValidationError):
+            return None
+
+        if (
+            validated.catalogue_identification is not None
+            and not validated.catalogue_identification.compatible
+        ):
+            return None
+
+        sources = validated.ratings.sources or {}
+        for key in _CACHE_RATING_KEYS:
+            if getattr(validated.ratings, key, None) is not None:
+                src = sources.get(key)
+                if not isinstance(src, str) or not src.strip():
+                    return None
+
+        return validated.model_dump()
 
     def get_cached_evaluation(
         self,
@@ -685,8 +1024,10 @@ class TriageDB:
         hint_year: Optional[int] = None,
         extra_context: Optional[str] = None,
         quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
         evidence_key: str = "",
         allow_imdb_lookup: bool = True,
+        allow_release_key_fallback: bool = True,
         ttl_hours: int = 72,
     ) -> Optional[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
@@ -700,11 +1041,9 @@ class TriageDB:
             tail = rel_key.rsplit(" ", 1)[-1]
             if YEAR_RE.match(tail):
                 query_year = int(tail)
-        q_key = (
-            quality_key
-            if quality_key is not None
-            else parse_release_quality(raw_text).cache_key
-        )
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
         ev_key = (evidence_key or "").strip()
 
         with self._connect() as conn:
@@ -712,11 +1051,16 @@ class TriageDB:
                 """
                 SELECT response_json, year
                 FROM evaluations
-                WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                WHERE raw_text_normalized = ?
+                  AND quality_key = ?
+                  AND edition_key = ?
+                  AND evidence_key = ?
+                  AND cache_version = ?
+                  AND created_at >= ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (norm_raw, q_key, ev_key, cutoff),
+                (norm_raw, q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
             ).fetchone()
 
             if row is None and imdb_id:
@@ -724,33 +1068,43 @@ class TriageDB:
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE lower(imdb_id) = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                      AND cache_version = ?
+                      AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (imdb_id.lower(), q_key, ev_key, cutoff),
+                    (imdb_id.lower(), q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
                 ).fetchone()
                 if candidate is not None:
                     cached_year = int(candidate["year"])
                     if query_year is None or abs(cached_year - query_year) <= 1:
                         row = candidate
 
-            if row is None and rel_key:
+            if row is None and allow_release_key_fallback and rel_key:
                 row = conn.execute(
                     """
                     SELECT response_json, year
                     FROM evaluations
-                    WHERE release_key = ? AND quality_key = ? AND evidence_key = ? AND created_at >= ?
+                    WHERE release_key = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                      AND cache_version = ?
+                      AND created_at >= ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (rel_key, q_key, ev_key, cutoff),
+                    (rel_key, q_key, ed_key, ev_key, EVALUATION_CACHE_VERSION, cutoff),
                 ).fetchone()
 
         if row is None:
             return None
 
-        return json.loads(row["response_json"])
+        return self._validate_cached_payload(str(row["response_json"]))
 
     def save_evaluation(
         self,
@@ -760,6 +1114,7 @@ class TriageDB:
         hint_title: Optional[str] = None,
         hint_year: Optional[int] = None,
         quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
         evidence_key: str = "",
         created_at: Optional[str] = None,
     ) -> None:
@@ -776,30 +1131,28 @@ class TriageDB:
             normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
             or canonical_release_key(canonical_title, year)
         )
-        q_key = (
-            quality_key
-            if quality_key is not None
-            else parse_release_quality(raw_text).cache_key
-        )
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
         ev_key = (evidence_key or "").strip()
         ts = created_at or utc_now_iso()
         serialized = json.dumps(payload, ensure_ascii=False)
 
         with self._connect() as conn:
-            # Replace superseded entries for the same movie, quality tier, AND evidence digest
+            # Replace superseded entries for the same movie, quality tier, edition, AND evidence digest
             conn.execute(
-                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ? AND evidence_key = ?",
-                (norm_raw, q_key, ev_key),
+                "DELETE FROM evaluations WHERE raw_text_normalized = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                (norm_raw, q_key, ed_key, ev_key),
             )
             if imdb_id:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ? AND evidence_key = ?",
-                    (imdb_id, q_key, ev_key),
+                    "DELETE FROM evaluations WHERE lower(imdb_id) = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                    (imdb_id, q_key, ed_key, ev_key),
                 )
             elif rel_key:
                 conn.execute(
-                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ? AND evidence_key = ?",
-                    (rel_key, q_key, ev_key),
+                    "DELETE FROM evaluations WHERE release_key = ? AND quality_key = ? AND edition_key = ? AND evidence_key = ?",
+                    (rel_key, q_key, ed_key, ev_key),
                 )
 
             conn.execute(
@@ -808,7 +1161,9 @@ class TriageDB:
                     raw_text_normalized,
                     release_key,
                     quality_key,
+                    edition_key,
                     evidence_key,
+                    cache_version,
                     raw_text_original,
                     imdb_id,
                     canonical_title,
@@ -816,13 +1171,15 @@ class TriageDB:
                     verdict,
                     response_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm_raw,
                     rel_key,
                     q_key,
+                    ed_key,
                     ev_key,
+                    EVALUATION_CACHE_VERSION,
                     raw_text,
                     imdb_id,
                     canonical_title,
@@ -834,14 +1191,114 @@ class TriageDB:
             )
         self._harden_db_file_permissions()
 
+    def invalidate_evaluations(
+        self,
+        raw_text: str,
+        *,
+        hint_title: Optional[str] = None,
+        hint_year: Optional[int] = None,
+        extra_context: Optional[str] = None,
+        quality_key: Optional[str] = None,
+        edition_key: Optional[str] = None,
+        evidence_key: str = "",
+        imdb_ids: Optional[list[str]] = None,
+        include_release_key_fallback: bool = False,
+    ) -> int:
+        """
+        PR #18 Round 3 Finding 4 & Round 4 Cache Regression: Invalidate previously cached
+        evaluations actually reachable for this release (exact `raw_text_normalized` and
+        applicable IMDb aliases under the matching `(quality_key, edition_key, evidence_key)`).
+        Because evaluation reads disable `release_key` fallback (`allow_release_key_fallback=False`),
+        do NOT broadly delete by `release_key` unless explicitly requested, so distinct files
+        sharing a title/year with disjoint verified IMDb/TMDb IDs are never evicted.
+        """
+        norm_raw = normalize_raw_text(raw_text)
+        rel_key = normalize_release_key(raw_text, hint_title=hint_title, hint_year=hint_year)
+        parsed_q = parse_release_quality(raw_text) if (quality_key is None or edition_key is None) else None
+        q_key = quality_key if quality_key is not None else parsed_q.cache_key  # type: ignore[union-attr]
+        ed_key = edition_key if edition_key is not None else parsed_q.edition_key  # type: ignore[union-attr]
+        ev_key = (evidence_key or "").strip()
+
+        clean_imdbs: list[str] = []
+        extracted = extract_imdb_id(raw_text, extra_context)
+        if extracted:
+            clean_imdbs.append(extracted.lower())
+        for raw_id in imdb_ids or []:
+            if isinstance(raw_id, str) and raw_id.strip():
+                low = raw_id.strip().lower()
+                if low not in clean_imdbs:
+                    clean_imdbs.append(low)
+
+        rel_year: Optional[int] = None
+        if rel_key:
+            tail = rel_key.rsplit(" ", 1)[-1]
+            if YEAR_RE.match(tail):
+                rel_year = int(tail)
+        query_year: Optional[int] = rel_year if rel_year is not None else hint_year
+
+        deleted = 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM evaluations
+                WHERE raw_text_normalized = ?
+                  AND quality_key = ?
+                  AND edition_key = ?
+                  AND evidence_key = ?
+                """,
+                (norm_raw, q_key, ed_key, ev_key),
+            )
+            deleted += cur.rowcount
+
+            if include_release_key_fallback and rel_key:
+                cur = conn.execute(
+                    """
+                    DELETE FROM evaluations
+                    WHERE release_key = ?
+                      AND quality_key = ?
+                      AND edition_key = ?
+                      AND evidence_key = ?
+                    """,
+                    (rel_key, q_key, ed_key, ev_key),
+                )
+                deleted += cur.rowcount
+
+            for imdb in clean_imdbs:
+                if query_year is not None:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM evaluations
+                        WHERE lower(imdb_id) = ?
+                          AND quality_key = ?
+                          AND edition_key = ?
+                          AND evidence_key = ?
+                          AND ABS(year - ?) <= 1
+                        """,
+                        (imdb, q_key, ed_key, ev_key, query_year),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM evaluations
+                        WHERE lower(imdb_id) = ?
+                          AND quality_key = ?
+                          AND edition_key = ?
+                          AND evidence_key = ?
+                        """,
+                        (imdb, q_key, ed_key, ev_key),
+                    )
+                deleted += cur.rowcount
+        self._harden_db_file_permissions()
+        return deleted
+
     def get_cache_entries_count(self, ttl_hours: int = 72) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(
             timespec="seconds"
         )
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS cnt FROM evaluations WHERE created_at >= ?",
-                (cutoff,),
+                "SELECT COUNT(*) AS cnt FROM evaluations WHERE cache_version = ? AND created_at >= ?",
+                (EVALUATION_CACHE_VERSION, cutoff),
             ).fetchone()
             return int(row["cnt"]) if row else 0
 
@@ -872,6 +1329,7 @@ class TriageDB:
         self,
         *,
         imdb_id: Optional[str],
+        tmdb_id: Optional[int] = None,
         title: str,
         decision: str,
         note: Optional[str],
@@ -879,26 +1337,70 @@ class TriageDB:
     ) -> int:
         ts = created_at or utc_now_iso()
         clean_imdb = imdb_id.strip().lower() if imdb_id and imdb_id.strip() else None
+        clean_tmdb = (
+            int(tmdb_id)
+            if isinstance(tmdb_id, int) and not isinstance(tmdb_id, bool) and tmdb_id > 0
+            else None
+        )
         clean_title = title.strip()
         clean_decision = decision.strip().upper()
         clean_note = note.strip() if note and note.strip() else None
         with self._connect() as conn:
-            if clean_imdb:
-                conn.execute(
-                    "DELETE FROM feedback WHERE lower(imdb_id) = ?",
+            # Preserve existing verified ID links across partial updates (TMDb-only or IMDb-only)
+            # so updating via one ID never drops the other verified ID and duplicates feedback rows.
+            if clean_imdb and clean_tmdb is None:
+                linked_tmdb = conn.execute(
+                    """
+                    SELECT DISTINCT tmdb_id FROM feedback
+                    WHERE imdb_id IS NOT NULL AND lower(imdb_id) = ? AND tmdb_id IS NOT NULL
+                    ORDER BY id DESC
+                    """,
                     (clean_imdb,),
+                ).fetchall()
+                if len(linked_tmdb) == 1:
+                    clean_tmdb = int(linked_tmdb[0]["tmdb_id"])
+            elif clean_tmdb is not None and clean_imdb is None:
+                linked_imdb = conn.execute(
+                    """
+                    SELECT DISTINCT lower(imdb_id) AS imdb_id FROM feedback
+                    WHERE tmdb_id = ? AND imdb_id IS NOT NULL AND trim(imdb_id) != ''
+                    ORDER BY id DESC
+                    """,
+                    (clean_tmdb,),
+                ).fetchall()
+                if len(linked_imdb) == 1:
+                    clean_imdb = str(linked_imdb[0]["imdb_id"])
+
+            if clean_imdb and clean_tmdb is not None:
+                conn.execute(
+                    """
+                    DELETE FROM feedback
+                    WHERE (imdb_id IS NOT NULL AND lower(imdb_id) = ?)
+                       OR (tmdb_id = ? AND (imdb_id IS NULL OR lower(imdb_id) = ?))
+                    """,
+                    (clean_imdb, clean_tmdb, clean_imdb),
+                )
+            elif clean_imdb:
+                conn.execute(
+                    "DELETE FROM feedback WHERE imdb_id IS NOT NULL AND lower(imdb_id) = ?",
+                    (clean_imdb,),
+                )
+            elif clean_tmdb is not None:
+                conn.execute(
+                    "DELETE FROM feedback WHERE tmdb_id = ?",
+                    (clean_tmdb,),
                 )
             else:
                 conn.execute(
-                    "DELETE FROM feedback WHERE imdb_id IS NULL AND lower(trim(title)) = ?",
+                    "DELETE FROM feedback WHERE imdb_id IS NULL AND tmdb_id IS NULL AND lower(trim(title)) = ?",
                     (clean_title.lower(),),
                 )
             conn.execute(
                 """
-                INSERT INTO feedback (imdb_id, title, decision, note, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO feedback (imdb_id, tmdb_id, title, decision, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (clean_imdb, clean_title, clean_decision, clean_note, ts),
+                (clean_imdb, clean_tmdb, clean_title, clean_decision, clean_note, ts),
             )
             row = conn.execute("SELECT COUNT(*) AS cnt FROM feedback").fetchone()
             return int(row["cnt"]) if row else 0
@@ -908,7 +1410,7 @@ class TriageDB:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, imdb_id, title, decision, note, created_at
+                SELECT id, imdb_id, tmdb_id, title, decision, note, created_at
                 FROM feedback
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?

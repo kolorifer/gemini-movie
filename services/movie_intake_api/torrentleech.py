@@ -212,19 +212,28 @@ def parse_mediainfo_file_signals(nfo_text: Optional[str]) -> tuple[Optional[int]
     return file_runtime, audio_langs[:6]
 
 
-def parse_retry_after_seconds(header_value: Optional[str], *, failures: int = 0) -> float:
+MAX_TRACKER_RETRY_AFTER_SECONDS = 365 * 24 * 3600  # 365-day overflow ceiling; honors multi-hour and multi-day tracker instructions verbatim
+
+
+def parse_retry_after_seconds(
+    header_value: Optional[str],
+    *,
+    failures: int = 0,
+    now: Optional[datetime] = None,
+) -> float:
     default_backoff = min(1800.0, 30.0 * (2 ** min(failures, 6)))
     if not header_value or not header_value.strip():
         return default_backoff
     text = header_value.strip()
     if text.isdigit():
-        return float(max(5, min(int(text), 3600)))
+        return float(max(5, min(int(text), MAX_TRACKER_RETRY_AFTER_SECONDS)))
     try:
         target = email.utils.parsedate_to_datetime(text)
         if target.tzinfo is None:
             target = target.replace(tzinfo=timezone.utc)
-        delta = (target.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
-        return max(5.0, min(delta, 3600.0))
+        ref_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        delta = (target.astimezone(timezone.utc) - ref_now).total_seconds()
+        return max(5.0, min(delta, float(MAX_TRACKER_RETRY_AFTER_SECONDS)))
     except (TypeError, ValueError):
         return default_backoff
 
