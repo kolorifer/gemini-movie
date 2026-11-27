@@ -4793,6 +4793,336 @@ Language : German
             # Raw archive still preserves exact incoming bytes
             self.assertEqual(len(list(cfg.webhook_archive_dir.rglob("*.json"))), len(cases))
 
+    def test_pr18_r2_blocker_1_pre_upgrade_queued_webdl_suppressed_with_zero_external_calls(self) -> None:
+        """
+        PR #18 Round 2 Blocker 1: Pre-upgrade queued global release.new WEB-DL rows (and
+        pending follow-ups) are suppressed against their archived webhook and configured filters
+        before any tracker, evaluator, or Telegram/Actions call, while retaining the private archive.
+        """
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            webdl_body = {
+                "id": "pre-upgrade-webdl-1",
+                "event": "release.new",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "release": {
+                        "name": "North.Field.2021.1080p.WEB-DL-GROUP",
+                        "type": "movie",
+                        "title": "North Field",
+                        "year": 2021,
+                        "meta_imdb": "tt4440001",
+                        "resolution": "1080p",
+                        "media_processing": "WEB-DL",
+                        "source": "WEB",
+                        "external_id": "445001",
+                        "category": "Movies :: Bluray",
+                    },
+                },
+            }
+            raw_bytes = json.dumps(webdl_body).encode("utf-8")
+            receipt = archive_raw_webhook(cfg.webhook_archive_dir, "occ-legacy-webdl-1", raw_bytes)
+            snap = {
+                "indexer_raw": "TorrentLeech",
+                "indexer_norm": "torrentleech",
+                "external_id_norm": "445001",
+                "exact_release_name": "North.Field.2021.1080p.WEB-DL-GROUP",
+                "hint_title": "North Field",
+                "hint_year": 2021,
+                "category": "Movies :: Bluray",
+                "meta_imdb": "tt4440001",
+                "resolution": "1080p",
+                "source": "WEB",
+                "media_processing": "WEB-DL",
+                "action_rejected": False,
+                "action_is_radarr": False,
+                "rejections": [],
+            }
+            conn = sqlite3.connect(str(cfg.intake_db_path))
+            conn.execute(
+                """
+                INSERT INTO releases (
+                    release_id, indexer_norm, external_id_norm, exact_release_name,
+                    first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                    card_revision, state, pending_reprocess,
+                    incoming_evidence_digest, incoming_snapshot_json,
+                    pending_eval_reply_json, next_attempt_at, created_at, updated_at
+                ) VALUES (?, 'torrentleech', '445001', ?, 'occ-legacy-webdl-1', 'occ-legacy-webdl-1', 'occ-legacy-webdl-1',
+                          0, 'queued', 0, 'legacy-dig-webdl', ?, ?, '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z')
+                """,
+                (
+                    "rel-legacy-webdl-1",
+                    "North.Field.2021.1080p.WEB-DL-GROUP",
+                    json.dumps(snap),
+                    json.dumps({"release_id": "rel-legacy-webdl-1", "text": "stale"}),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO occurrences (
+                    occurrence_id, received_at, archive_relpath, archive_sha256,
+                    payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                ) VALUES ('occ-legacy-webdl-1', '2026-11-26T00:00:00Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-legacy-webdl-1', NULL)
+                """,
+                (receipt.archive_relpath, receipt.archive_sha256, receipt.payload_bytes),
+            )
+            conn.commit()
+            conn.close()
+
+            actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+            triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="invented"))
+            tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+            app = create_app(
+                cfg,
+                db=db,
+                triage_client=triage,
+                actions_client=actions,
+                tl_scraper=tracker,
+                tmdb_client=tmdb,
+                start_worker=False,
+            )
+
+            with TestClient(app):
+                asyncio.run(app.state.worker.process_next_queued())
+
+            self.assertEqual(len(tracker.calls), 0)
+            self.assertEqual(len(triage.calls), 0)
+            self.assertEqual(len(actions.card_calls), 0)
+            self.assertEqual(len(actions.eval_reply_calls), 0)
+            rel = db.get_release("rel-legacy-webdl-1")
+            assert rel is not None
+            self.assertEqual(rel["state"], "suppressed")
+            self.assertEqual(rel["suppression_reason"], "pre_upgrade_ineligible_scope")
+            self.assertIsNone(rel["pending_eval_reply_json"])
+            archived_file = cfg.webhook_archive_dir / receipt.archive_relpath
+            self.assertTrue(archived_file.exists())
+            self.assertEqual(archived_file.read_bytes(), raw_bytes)
+
+    def test_pr18_r2_blocker_4_missing_or_corrupt_legacy_archive_preserves_correction(self) -> None:
+        """
+        PR #18 Round 2 Blocker 4: After upgrading from pre-upgrade schema, if an earlier
+        occurrence's archive is missing or fails SHA-256 verification, a re-wrapped replay of A
+        must preserve correction B and still archive all three deliveries.
+        """
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _payload(imdb: str, event_id: str) -> dict[str, Any]:
+            return {
+                "id": event_id,
+                "event": "action.rejected",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"id": 7, "name": "Movies Remux"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                        "type": "movie",
+                        "title": "North Field",
+                        "year": 2021,
+                        "meta_imdb": imdb,
+                        "resolution": "1080p",
+                        "media_processing": "REMUX",
+                        "source": "BluRay",
+                        "external_id": "445001",
+                        "category": "Movies :: Bluray",
+                    },
+                },
+            }
+
+        for mode in ("missing", "changed"):
+            with self.subTest(archive_mode=mode), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                cfg = _make_config(root)
+                db = IntakeDB(cfg.intake_db_path)
+                db.init_db()
+
+                raw_a = json.dumps(_payload("tt4440001", "alpha")).encode("utf-8")
+                raw_b = json.dumps(_payload("tt4440002", "beta")).encode("utf-8")
+                rec_a = archive_raw_webhook(cfg.webhook_archive_dir, "occ-a", raw_a)
+                rec_b = archive_raw_webhook(cfg.webhook_archive_dir, "occ-b", raw_b)
+
+                snap_b = {
+                    "indexer_raw": "TorrentLeech",
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": "445001",
+                    "exact_release_name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                    "hint_title": "North Field",
+                    "hint_year": 2021,
+                    "category": "Movies :: Bluray",
+                    "meta_imdb": "tt4440002",
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "action_rejected": True,
+                    "action_is_radarr": True,
+                    "rejections": ["Unknown Movie"],
+                }
+                conn = sqlite3.connect(str(cfg.intake_db_path))
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES ('rel-1', 'torrentleech', '445001', 'North.Field.2021.1080p.BluRay.REMUX-GROUP',
+                              'occ-a', 'occ-b', 'occ-b', 0, 'queued', 0, 'old-v0-digest-b', ?,
+                              '2026-11-26T00:00:00Z', '2026-11-26T00:00:00Z', '2026-11-26T00:00:01Z')
+                    """,
+                    (json.dumps(snap_b),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                    ) VALUES ('occ-a', '2026-11-26T00:00:00Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-1', NULL)
+                    """,
+                    (rec_a.archive_relpath, rec_a.archive_sha256, rec_a.payload_bytes),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO occurrences (
+                        occurrence_id, received_at, archive_relpath, archive_sha256,
+                        payload_bytes, classification, diagnostic_note, release_id, incoming_evidence_digest
+                    ) VALUES ('occ-b', '2026-11-26T00:00:01Z', ?, ?, ?, 'movie_candidate', NULL, 'rel-1', NULL)
+                    """,
+                    (rec_b.archive_relpath, rec_b.archive_sha256, rec_b.payload_bytes),
+                )
+                conn.commit()
+                conn.close()
+
+                arch_a = cfg.webhook_archive_dir / rec_a.archive_relpath
+                if mode == "missing":
+                    arch_a.unlink()
+                else:
+                    arch_a.write_bytes(b"{}")
+
+                app = create_app(cfg, db=db, start_worker=False)
+                with TestClient(app) as client:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        json=_payload("tt4440001", "rewrapped-after-upgrade"),
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertEqual(resp.json()["status"], "coalesced_duplicate")
+
+                rows = db.list_all_releases()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(json.loads(rows[0]["incoming_snapshot_json"])["meta_imdb"], "tt4440002")
+                self.assertEqual(len(db.list_all_occurrences()), 3)
+
+    def test_pr18_r2_blocker_5_accepted_hint_title_privacy_end_to_end(self) -> None:
+        """
+        PR #18 Round 2 Blocker 5: Synthetic credential-like markers in an accepted title hint
+        are kept intact in the private raw archive, but scrubbed from SQLite incoming_snapshot_json,
+        the outgoing evaluator request, and the final provider prompt built locally.
+        """
+        from gemini_client import build_user_prompt
+        from schemas import EvaluateRequest
+
+        markers = [
+            "SYNTH_ACC_TOK_101",
+            "SYNTH_QUOTED_PASS_202",
+            "SYNTH_AUTH_BEARER_303",
+            "SYNTH_COOKIE_SESS_404",
+            "SYNTH_COOKIE_TLPASS_505",
+            "SYNTH_SK_KEY_606707808909",
+            "SYNTH_INLINE_PWD_707",
+        ]
+        dirty_title = (
+            "North Field "
+            f"access_token={markers[0]} "
+            f'passkey="{markers[1]}" '
+            f"Authorization: Bearer {markers[2]} "
+            f"Cookie: PHPSESSID={markers[3]}; tlpass={markers[4]} "
+            f"sk-proj-{markers[5]} "
+            f"user:{markers[6]}@tracker.invalid"
+        )
+        body = {
+            "id": "privacy-accepted-1",
+            "event": "action.rejected",
+            "data": {
+                "indexer": "TorrentLeech",
+                "action": {"type": "RADARR"},
+                "filter": {"id": 7, "name": "Movies Remux"},
+                "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                "release": {
+                    "name": "North.Field.2021.1080p.BluRay.REMUX-GROUP",
+                    "type": "movie",
+                    "title": dirty_title,
+                    "year": 2021,
+                    "meta_imdb": "tt4440001",
+                    "resolution": "1080p",
+                    "media_processing": "REMUX",
+                    "source": "BluRay",
+                    "external_id": "445001",
+                    "category": "Movies :: Bluray",
+                },
+            },
+        }
+        raw_bytes = json.dumps(body).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = _make_config(Path(tmpdir))
+            db = IntakeDB(cfg.intake_db_path)
+            actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+            triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+            tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+            tmdb = StubTmdbClient(cfg.tmdb_cache_path, {}, {})
+            app = create_app(
+                cfg,
+                db=db,
+                triage_client=triage,
+                actions_client=actions,
+                tl_scraper=tracker,
+                tmdb_client=tmdb,
+                start_worker=False,
+            )
+
+            with TestClient(app) as client:
+                resp = client.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=raw_bytes,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["status"], "accepted")
+                asyncio.run(app.state.worker.process_next_queued())
+
+            # 1) Authorized private raw archive preserves exact incoming bytes
+            archived_files = list(cfg.webhook_archive_dir.rglob("*.json"))
+            self.assertEqual(len(archived_files), 1)
+            self.assertEqual(archived_files[0].read_bytes(), raw_bytes)
+
+            # 2) Ordinary SQLite snapshot scrubs every synthetic marker
+            rel_rows = db.list_all_releases()
+            self.assertEqual(len(rel_rows), 1)
+            snap_text = str(rel_rows[0]["incoming_snapshot_json"])
+            for m in markers:
+                self.assertNotIn(m, snap_text)
+
+            # 3) Outgoing evaluator request scrubs every synthetic marker
+            self.assertEqual(len(triage.calls), 1)
+            eval_req_dict = triage.calls[0]
+            eval_req_text = json.dumps(eval_req_dict)
+            for m in markers:
+                self.assertNotIn(m, eval_req_text)
+
+            # 4) Final provider prompt built locally scrubs every synthetic marker
+            provider_prompt = build_user_prompt(EvaluateRequest(**eval_req_dict))
+            for m in markers:
+                self.assertNotIn(m, provider_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

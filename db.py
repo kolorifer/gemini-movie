@@ -220,7 +220,7 @@ _EDITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("imax", re.compile(r"(?<![a-z0-9])imax(?:[\s._-]*enhanced)?(?![a-z0-9])", re.IGNORECASE)),
     ("criterion", re.compile(r"(?<![a-z0-9])criterion(?![a-z0-9])", re.IGNORECASE)),
     ("remastered", re.compile(r"(?<![a-z0-9])remastered(?![a-z0-9])", re.IGNORECASE)),
-    ("restored", re.compile(r"(?<![a-z0-9])restored(?![a-z0-9])", re.IGNORECASE)),
+    ("restored", re.compile(r"(?<![a-z0-9])restor(?:ed|ation)(?![a-z0-9])", re.IGNORECASE)),
 )
 _DC_TOKEN_RE = re.compile(r"(?<![a-z0-9])dc(?![a-z0-9])", re.IGNORECASE)
 
@@ -229,16 +229,21 @@ def extract_edition_key(raw_text: str) -> str:
     """
     Extract canonical sorted edition/cut markers from the release string's post-year/tag section
     so theatrical, extended, director's cut, unrated, IMAX, Criterion, etc. never collide in cache.
+    Scans forward for the release year (skipping adjacent title-embedded years like 'Blade Runner 2049 2017')
+    so a later restoration year (e.g. '2004.Extended.2020.Restoration') never erases the cut marker.
     """
     text = _TRAILING_EXT_RE.sub("", (raw_text or "").strip())
     if not text:
         return ""
-    # Focus on post-year text when a release year is present so title words are not misread as editions
+    # Focus on post-release-year text so title words before the release year are not misread as editions
     tokens = [t for t in re.split(r"[\s._\[\]\(\)\{\}/\\,:;]+", text) if t]
     search_text = text
-    for idx in range(len(tokens) - 1, 0, -1):
+    for idx in range(1, len(tokens)):
         if YEAR_RE.match(tokens[idx]):
-            search_text = " ".join(tokens[idx + 1 :])
+            next_idx = idx + 1
+            while next_idx < len(tokens) and YEAR_RE.match(tokens[next_idx]):
+                next_idx += 1
+            search_text = " ".join(tokens[next_idx:])
             break
 
     found: list[str] = []

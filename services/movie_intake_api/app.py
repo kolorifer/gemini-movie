@@ -189,6 +189,12 @@ def create_app(
                 intake_db.backfill_legacy_occurrence_digests,
                 cfg.webhook_archive_dir,
             )
+            await asyncio.to_thread(
+                intake_db.recheck_pre_upgrade_actionable_releases,
+                cfg.webhook_archive_dir,
+                allowed_filter_names=cfg.allowed_filter_names,
+                allowed_filter_ids=cfg.allowed_filter_ids,
+            )
             legacy_digests_backfilled = True
 
     @asynccontextmanager
