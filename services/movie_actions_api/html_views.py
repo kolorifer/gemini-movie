@@ -104,7 +104,7 @@ def render_confirmation_page(
         "watched_good": ("Confirm Watched – Good", "Mark Watched (Unmonitored) & Save Good Rating"),
         "watched_bad": ("Confirm Watched – Bad", "Mark Watched (Unmonitored) & Save Bad Rating"),
         "watched_legacy_unrated": ("Confirm Watched (Unrated)", "Mark Watched (Unmonitored)"),
-        "skip": ("Confirm Skip (Feedback Only)", "Record Skip Decision (No Radarr Changes)"),
+        "skip": ("Confirm Skip (Add Unmonitored)", "Add to Radarr (Unmonitored) & Record Skip"),
     }
     heading, btn_label = labels.get(action_type, ("Confirm Action", "Confirm"))
 
@@ -125,6 +125,8 @@ def render_confirmation_page(
         parts.append(f"<div class=\"warn\">{_e(redact_secrets(warning_note, max_chars=400))}</div>")
 
     form_fields: list[str] = ["<input type=\"hidden\" name=\"confirm\" value=\"1\">"]
+    if action_type == "skip":
+        form_fields.append('<input type="hidden" name="skip_unmonitor" value="1">')
     if needs_add_options:
         if root_folders:
             opts = "".join(

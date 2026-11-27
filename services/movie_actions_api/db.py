@@ -16,7 +16,7 @@ ACTION_TYPES = frozenset(
     {"add_grab", "alternative_grab", "watched_good", "watched_bad", "watched_legacy_unrated", "skip"}
 )
 RADARR_PHASES = frozenset(
-    {"radarr_add_movie", "radarr_release_push", "radarr_watched", "qbit_alt_preflight", "qbit_alternative_grab"}
+    {"radarr_add_movie", "radarr_release_push", "radarr_watched", "radarr_skip", "qbit_alt_preflight", "qbit_alternative_grab"}
 )
 
 
@@ -293,7 +293,7 @@ class ActionsDB:
 
         rows = conn.execute(
             f"""
-            SELECT wa.attempt_id, wa.action_id, wa.phase, a.action_type, a.status AS action_status
+            SELECT wa.attempt_id, wa.action_id, wa.phase, a.status AS action_status
             FROM write_attempts wa
             JOIN actions a ON a.action_id = wa.action_id
             WHERE {' AND '.join(where_parts)}
@@ -307,7 +307,6 @@ class ActionsDB:
             attempt_id = str(row["attempt_id"])
             action_id = str(row["action_id"])
             phase = str(row["phase"])
-            action_type = str(row["action_type"])
             action_status = str(row["action_status"])
             conn.execute(
                 """
@@ -332,30 +331,17 @@ class ActionsDB:
                         (reason, now_iso, action_id),
                     )
             elif phase == "evaluator_feedback":
-                if action_type == "skip" and action_status == "attempting":
-                    conn.execute(
-                        """
-                        UPDATE actions
-                        SET status = 'active',
-                            feedback_status = 'failed',
-                            last_error_redacted = ?,
-                            updated_at = ?
-                        WHERE action_id = ?
-                        """,
-                        (reason, now_iso, action_id),
-                    )
-                else:
-                    # Keep Radarr action permanently sealed at completed_radarr
-                    conn.execute(
-                        """
-                        UPDATE actions
-                        SET feedback_status = 'failed',
-                            last_error_redacted = ?,
-                            updated_at = ?
-                        WHERE action_id = ?
-                        """,
-                        (reason, now_iso, action_id),
-                    )
+                # Isolated feedback recovery preserves the completed Radarr state.
+                conn.execute(
+                    """
+                    UPDATE actions
+                    SET feedback_status = 'failed',
+                        last_error_redacted = ?,
+                        updated_at = ?
+                    WHERE action_id = ?
+                    """,
+                    (reason, now_iso, action_id),
+                )
 
         # Safeguard: any action stuck in 'attempting' with zero live attempting write_attempts
         extra_where = ["status = 'attempting'"]
@@ -368,7 +354,7 @@ class ActionsDB:
             extra_params.append(release_id)
         dangling_rows = conn.execute(
             f"""
-            SELECT a.action_id, a.action_type
+            SELECT a.action_id
             FROM actions a
             WHERE {' AND '.join(extra_where)}
               AND NOT EXISTS (
@@ -383,29 +369,16 @@ class ActionsDB:
         ).fetchall()
         for row in dangling_rows:
             promoted += 1
-            if str(row["action_type"]) == "skip":
-                conn.execute(
-                    """
-                    UPDATE actions
-                    SET status = 'active',
-                        feedback_status = 'failed',
-                        last_error_redacted = ?,
-                        updated_at = ?
-                    WHERE action_id = ?
-                    """,
-                    (reason, now_iso, str(row["action_id"])),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE actions
-                    SET status = 'ambiguous_radarr',
-                        last_error_redacted = ?,
-                        updated_at = ?
-                    WHERE action_id = ?
-                    """,
-                    (reason, now_iso, str(row["action_id"])),
-                )
+            conn.execute(
+                """
+                UPDATE actions
+                SET status = 'ambiguous_radarr',
+                    last_error_redacted = ?,
+                    updated_at = ?
+                WHERE action_id = ?
+                """,
+                (reason, now_iso, str(row["action_id"])),
+            )
         return promoted
 
     def recover_orphaned_state(self, current_process_instance_id: str) -> dict[str, int]:
@@ -677,7 +650,7 @@ class ActionsDB:
                     #   persist card_revision/delivery_kind='retired', and supersede active tokens so any
                     #   in-flight pre-push Phase 1 (radarr_add_movie) immediately sees the retirement.
                     # - `evidence_review`, `verified_proposal`, and `alternative_grab` lock ONLY if an
-                    #   irreversible write (`completed_radarr`, `completed_all`, or a push/watched/qbit
+                    #   irreversible write (`completed_radarr`, `completed_all`, or a push/watched/skip/qbit
                     #   attempt in attempting/ambiguous/succeeded) has already started or completed.
                     #   An in-flight pre-push Phase 1 (`radarr_add_movie`) MUST NOT block a verified
                     #   correction: we persist the new revision immediately so Phase 1 aborts before
@@ -689,13 +662,12 @@ class ActionsDB:
                             SELECT a.action_id, a.status
                             FROM actions a
                             WHERE a.release_id = ?
-                              AND a.action_type != 'skip'
                               AND (
                                   a.status IN ('completed_radarr', 'completed_all')
                                   OR EXISTS (
                                       SELECT 1 FROM write_attempts w
                                       WHERE w.action_id = a.action_id
-                                        AND w.phase IN ('radarr_release_push', 'radarr_watched', 'qbit_alternative_grab')
+                                        AND w.phase IN ('radarr_release_push', 'radarr_watched', 'radarr_skip', 'qbit_alternative_grab')
                                         AND w.status IN ('attempting', 'ambiguous', 'succeeded')
                                   )
                               )
@@ -1531,12 +1503,12 @@ class ActionsDB:
         Serializes concurrent submissions across the entire `completion_group` via BEGIN IMMEDIATE.
         Returns (ok, attempt_id, conflict_code).
         """
-        ts = now_iso or utc_now_iso()
         attempt_id = generate_uuid7()
         clean_fp = redact_secrets(request_fingerprint, max_chars=800)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            ts = now_iso or utc_now_iso()
             action_row = conn.execute(
                 "SELECT * FROM actions WHERE action_id = ?",
                 (action_id,),
@@ -1566,6 +1538,18 @@ class ActionsDB:
                 conn.execute("COMMIT;")
                 return False, None, f"status:{act_status}"
 
+            if phase == "radarr_skip" and (act_status == "active" or radarr_movie_id is None):
+                expires_at = parse_iso_utc(action_row["expires_at"])
+                claim_time = parse_iso_utc(ts)
+                if expires_at is None or claim_time is None or expires_at <= claim_time:
+                    detail = "expired_with_skip_movie_absent" if act_status == "ambiguous_radarr" else "expired"
+                    conn.execute(
+                        "UPDATE actions SET status = 'expired', last_error_redacted = ?, updated_at = ? WHERE action_id = ?",
+                        (detail, ts, action_id),
+                    )
+                    conn.execute("COMMIT;")
+                    return False, None, "expired"
+
             # Issue #13 §2b & PR #18 Blocker 2:
             # 1) For fresh initiation (`active`) OR any pre-push/acquisition claim (including Phase A
             #    timeout recovery), atomically re-verify latest delivery revision/kind so a retired
@@ -1576,7 +1560,8 @@ class ActionsDB:
                 "qbit_alt_preflight",
                 "qbit_alternative_grab",
             )
-            if act_status == "active" or is_pre_push_phase:
+            # Retiring a card also revokes a retry that would issue another Skip write.
+            if act_status == "active" or is_pre_push_phase or phase == "radarr_skip":
                 del_row = conn.execute(
                     "SELECT card_revision, delivery_kind, status FROM deliveries WHERE release_id = ?",
                     (release_id,),
@@ -1599,27 +1584,14 @@ class ActionsDB:
                         conn.execute("COMMIT;")
                         return False, None, f"delivery_{latest_kind}"
 
-            # 2) Bidirectional mutual exclusion between acquisition pushes and Watched choices:
-            #    - Any acquisition phase is blocked once a sibling watched_* started/completed/ambiguous.
-            #    - Any radarr_watched phase is blocked once an irreversible push/grab
-            #      (radarr_release_push / qbit_alternative_grab) has entered attempting/ambiguous/succeeded
-            #      or add_grab/alternative_grab completed.
+            # Serialize acquisition with Watched and Skip across their separate completion groups.
             if is_pre_push_phase:
-                watched_sib = conn.execute(
-                    """
-                    SELECT action_id, status FROM actions
-                    WHERE release_id = ?
-                      AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated')
-                      AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
-                    LIMIT 1
-                    """,
-                    (release_id,),
-                ).fetchone()
-                if watched_sib is not None:
+                sibling_conflict = self._grab_sibling_conflict(conn, release_id)
+                if sibling_conflict is not None:
                     conn.execute("COMMIT;")
-                    return False, None, f"sibling_watched:{watched_sib['status']}"
+                    return False, None, sibling_conflict
 
-            if phase == "radarr_watched":
+            if phase in ("radarr_watched", "radarr_skip"):
                 grab_push_sib = conn.execute(
                     """
                     SELECT a.action_id, a.status
@@ -1738,28 +1710,14 @@ class ActionsDB:
                     ),
                 )
             elif phase == "evaluator_feedback":
-                if str(action_row["action_type"]) == "skip":
-                    conn.execute(
-                        """
-                        UPDATE actions
-                        SET status = 'attempting',
-                            feedback_status = 'pending',
-                            updated_at = ?
-                        WHERE action_id = ?
-                        """,
-                        (ts, action_id),
-                    )
-                else:
-                    # Radarr action stays permanently sealed at completed_radarr
-                    conn.execute(
-                        """
-                        UPDATE actions
-                        SET feedback_status = 'pending',
-                            updated_at = ?
-                        WHERE action_id = ?
-                        """,
-                        (ts, action_id),
-                    )
+                conn.execute(
+                    """
+                    UPDATE actions
+                    SET feedback_status = 'pending', updated_at = ?
+                    WHERE action_id = ?
+                    """,
+                    (ts, action_id),
+                )
 
             conn.execute(
                 """
@@ -1785,6 +1743,19 @@ class ActionsDB:
         except Exception:
             conn.execute("ROLLBACK;")
             raise
+        finally:
+            conn.close()
+
+    def record_skip_race_baseline(self, attempt_id: str, *, request_fingerprint: str) -> bool:
+        """Persist the race winner's observed state before an editor update can lose its acknowledgement."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """UPDATE write_attempts SET request_fingerprint = ?
+                   WHERE attempt_id = ? AND phase = 'radarr_skip' AND status = 'attempting'""",
+                (redact_secrets(request_fingerprint, max_chars=800), attempt_id),
+            )
+            return cur.rowcount == 1
         finally:
             conn.close()
 
@@ -1946,7 +1917,24 @@ class ActionsDB:
             conn.close()
 
     @staticmethod
+    def _grab_sibling_conflict(conn: sqlite3.Connection, release_id: str) -> Optional[str]:
+        sibling = conn.execute(
+            """
+            SELECT action_type, status FROM actions
+            WHERE release_id = ?
+              AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated', 'skip')
+              AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
+            LIMIT 1
+            """,
+            (release_id,),
+        ).fetchone()
+        if sibling is None:
+            return None
+        choice = "skip" if sibling["action_type"] == "skip" else "watched"
+        return f"sibling_{choice}:{sibling['status']}"
+
     def _check_pre_push_db_authorization_locked(
+        self,
         conn: sqlite3.Connection,
         action_row: sqlite3.Row,
         *,
@@ -1955,7 +1943,7 @@ class ActionsDB:
         """
         Atomically verify inside BEGIN IMMEDIATE that a release is still authorized to enter
         its FIRST release push / qBittorrent add (latest revision, not retired/evidence_review,
-        not expired, and no conflicting sibling watched_* action).
+        not expired, and no conflicting Watched or Skip action).
         Returns None when authorized, or a short disqualification reason code.
         """
         release_id = str(action_row["release_id"])
@@ -1976,19 +1964,7 @@ class ActionsDB:
         if isinstance(exp_raw, str) and exp_raw.strip() and exp_raw <= now_iso:
             return "expired"
 
-        watched_sib = conn.execute(
-            """
-            SELECT action_id, status FROM actions
-            WHERE release_id = ?
-              AND action_type IN ('watched_good', 'watched_bad', 'watched_legacy_unrated')
-              AND status IN ('attempting', 'ambiguous_radarr', 'completed_radarr', 'completed_all')
-            LIMIT 1
-            """,
-            (release_id,),
-        ).fetchone()
-        if watched_sib is not None:
-            return f"sibling_watched:{watched_sib['status']}"
-        return None
+        return self._grab_sibling_conflict(conn, release_id)
 
     def mark_phase1_add_movie_reconciled(
         self,
