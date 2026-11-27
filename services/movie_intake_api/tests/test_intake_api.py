@@ -5647,6 +5647,176 @@ Language : German
                 self.assertEqual(r202_c.json()["status"], "coalesced_duplicate")
                 self.assertEqual(_current("202"), "tt4440002")
 
+    def test_pr18_r5_finding_3_unsent_upgrade_recovery_duplicate_filter_and_restored_archive(self) -> None:
+        """
+        PR #18 Round 5 Finding 3 (Intake):
+          - control: intact queued pre-upgrade release runs once and exact redelivery coalesces.
+          - duplicate_filter: queued pre-upgrade release whose latest_occurrence_id became an
+            excluded-filter duplicate of the same movie is suppressed at startup, then wakes once
+            on a fresh qualifying delivery (eval=1, cards=1), and a subsequent repeat coalesces.
+          - restore: queued pre-upgrade release whose archive was temporarily missing during
+            migration is suppressed while missing, then automatically re-queues after restoring
+            the archive byte-for-byte + restart (eval=1, cards=1) while redelivery coalesces.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _make_body(*, filt: str = "Movies Remux") -> bytes:
+            body = {
+                "event": "action.rejected",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": filt},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": "Field.Light.2021.1080p.BluRay.REMUX-GRP",
+                        "title": "Field Light",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "type": "movie",
+                        "category": "Movies :: Bluray",
+                        "external_id": "9312",
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        for mode in ("control", "duplicate_filter", "restore"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                cfg = _make_config(root)
+                db = IntakeDB(cfg.intake_db_path)
+                db.init_db()
+
+                raw_ok = _make_body(filt="Movies Remux")
+                rec1 = archive_raw_webhook(cfg.webhook_archive_dir, "occ-r5-1", raw_ok)
+                p1 = cfg.webhook_archive_dir / rec1.archive_relpath
+                occs: list[tuple[str, str, str, int]] = [
+                    ("occ-r5-1", rec1.archive_relpath, hashlib.sha256(raw_ok).hexdigest(), len(raw_ok))
+                ]
+                latest_id = "occ-r5-1"
+                if mode == "duplicate_filter":
+                    raw_other = _make_body(filt="Other Filter")
+                    rec2 = archive_raw_webhook(cfg.webhook_archive_dir, "occ-r5-2", raw_other)
+                    occs.append(
+                        ("occ-r5-2", rec2.archive_relpath, hashlib.sha256(raw_other).hexdigest(), len(raw_other))
+                    )
+                    latest_id = "occ-r5-2"
+                elif mode == "restore":
+                    p1.rename(root / "temporarily-away")
+
+                snap = {
+                    "indexer_norm": "torrentleech",
+                    "external_id_norm": "9312",
+                    "exact_release_name": "Field.Light.2021.1080p.BluRay.REMUX-GRP",
+                    "action_type": "RADARR",
+                    "action_is_radarr": True,
+                    "action_rejected": True,
+                    "rejection_reasons": ["Unknown Movie"],
+                    "title": "Field Light",
+                    "year": 2021,
+                    "resolution": "1080p",
+                    "source": "BluRay",
+                    "media_processing": "REMUX",
+                    "category": "Movies :: Bluray",
+                }
+                conn = db._connect()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO releases (
+                            release_id, indexer_norm, external_id_norm, exact_release_name,
+                            first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                            card_revision, state, pending_reprocess,
+                            incoming_evidence_digest, incoming_snapshot_json,
+                            next_attempt_at, created_at, updated_at
+                        ) VALUES ('rel-r5', 'torrentleech', '9312', 'Field.Light.2021.1080p.BluRay.REMUX-GRP',
+                                  'occ-r5-1', ?, 'occ-r5-1', 0, 'queued', 0, 'legacy-r5-dig', ?,
+                                  '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:01+00:00')
+                        """,
+                        (latest_id, json.dumps(snap)),
+                    )
+                    for idx, (oid, relp, sha, nbytes) in enumerate(occs):
+                        conn.execute(
+                            """
+                            INSERT INTO occurrences (
+                                occurrence_id, received_at, archive_relpath, archive_sha256,
+                                payload_bytes, classification, diagnostic_note, release_id,
+                                incoming_evidence_digest
+                            ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, 'rel-r5', NULL)
+                            """,
+                            (oid, f"2026-11-26T00:00:0{idx}+00:00", relp, sha, nbytes),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                def _make_runtime():
+                    actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                    triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                    tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                    app = create_app(
+                        cfg,
+                        db=db,
+                        actions_client=actions,
+                        triage_client=triage,
+                        tl_scraper=tracker,
+                        tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                        start_worker=False,
+                    )
+                    return app, actions, triage
+
+                # Phase 1: startup while excluded / missing
+                app1, actions1, triage1 = _make_runtime()
+                with TestClient(app1):
+                    if mode != "control":
+                        self.assertEqual(db.list_all_releases()[0]["state"], "suppressed", mode)
+                        self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()), mode)
+                        self.assertEqual(len(triage1.calls), 0, mode)
+                        self.assertEqual(len(actions1.card_calls), 0, mode)
+                        if mode == "restore":
+                            (root / "temporarily-away").rename(p1)
+
+                # Phase 2: restart after restoration / fresh qualifying redelivery
+                app2, actions2, triage2 = _make_runtime()
+                with TestClient(app2) as client2:
+                    rel_id = db.list_all_releases()[0]["release_id"]
+                    eligible = db.is_release_currently_eligible(rel_id, cfg.webhook_archive_dir)[0]
+                    self.assertEqual(eligible, mode != "duplicate_filter", mode)
+                    worked = asyncio.run(app2.state.worker.process_next_queued())
+                    r_post = client2.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw_ok,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r_post.status_code, 200, mode)
+                    worked_again = asyncio.run(app2.state.worker.process_next_queued())
+                    if mode == "duplicate_filter":
+                        self.assertFalse(worked, mode)
+                        self.assertEqual(r_post.json()["status"], "accepted", mode)
+                        self.assertTrue(worked_again, mode)
+                    else:
+                        self.assertTrue(worked, mode)
+                        self.assertEqual(r_post.json()["status"], "coalesced_duplicate", mode)
+                        self.assertFalse(worked_again, mode)
+                    self.assertEqual(len(triage2.calls), 1, mode)
+                    self.assertEqual(len(actions2.card_calls), 1, mode)
+                    self.assertEqual(db.list_all_releases()[0]["state"], "completed", mode)
+
+                    # One more identical repeat must always coalesce with zero extra calls
+                    r_repeat = client2.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=raw_ok,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(r_repeat.json()["status"], "coalesced_duplicate", mode)
+                    self.assertFalse(asyncio.run(app2.state.worker.process_next_queued()), mode)
+                    self.assertEqual(len(triage2.calls), 1, mode)
+                    self.assertEqual(len(actions2.card_calls), 1, mode)
+
 
 if __name__ == "__main__":
     unittest.main()

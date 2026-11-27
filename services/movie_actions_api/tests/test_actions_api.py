@@ -4157,6 +4157,158 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r_prof["feedback"], ["watch"], prof_mode)
             self.assertEqual(r_prof["update_calls"], 1, prof_mode)
 
+    async def test_pr18_r5_finding_2_watched_partial_editor_and_authoritative_recovery(self) -> None:
+        """
+        PR #18 Round 5 Finding 2:
+          - Watched mutations send ONLY monitoring and additive tag edits (Radarr v3
+            PUT /api/v3/movie/editor) so concurrent external edits to qualityProfileId or
+            unrelated tags at write time are never overwritten.
+          - Watched recovery ALWAYS performs a fresh authoritative GET /api/v3/movie/{id}
+            AFTER all concurrent lookups (TMDb, IMDb, tags) finish before sealing an uncertain
+            attempt, preventing false completion when a concurrent edit re-monitors the movie.
+        """
+        from services.movie_actions_api.clients import RadarrClient
+
+        # 1) Direct wire-level verification that RadarrClient routes applyTags='add' to PUT /api/v3/movie/editor
+        captured: list[tuple[str, str, dict[str, Any]]] = []
+
+        def _mock_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            captured.append((request.method, request.url.path, body))
+            return httpx.Response(
+                202,
+                json=[{"id": 101, "monitored": False, "tags": [36, 7], "qualityProfileId": 9}],
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_handler)) as mock_http:
+            rc = RadarrClient(base_url="http://radarr.invalid", api_key="synth-key", http_client=mock_http)
+            w_res = await rc.update_movie(101, {"monitored": False, "tags": [7], "applyTags": "add"})
+            self.assertEqual(w_res.outcome, "ok")
+            self.assertEqual(len(captured), 1)
+            method, path, wire = captured[0]
+            self.assertEqual(method, "PUT")
+            self.assertEqual(path, "/api/v3/movie/editor")
+            self.assertEqual(wire, {"movieIds": [101], "monitored": False, "tags": [7], "applyTags": "add"})
+            self.assertNotIn("qualityProfileId", wire)
+
+        # 2) End-to-end ASGI scenarios (control, unrelated_edit_at_write, recovery_after_concurrent_remonitor)
+        async def _run_scenario(name: str, *, fail_retry: bool = False) -> dict[str, Any]:
+            with tempfile.TemporaryDirectory() as private:
+                cfg = self._make_config(private)
+                rad = ControllableRadarrStub()
+                tg = ControllableTelegramStub()
+                fb = ControllableFeedbackStub()
+                app = create_actions_app(
+                    cfg,
+                    radarr_client=rad,
+                    telegram_client=tg,
+                    triage_feedback_client=fb,
+                    intake_push_client=ShadowStubIntakePushClient(),
+                )
+                async with (
+                    app.router.lifespan_context(app),
+                    httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+                ):
+                    card = _verified_card_payload(poster_path=None)
+                    resp = await client.post(
+                        "/internal/deliver/card",
+                        json=card,
+                        headers={"X-Internal-Token": cfg.internal_api_secret},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    token = _extract_tokens_from_markup(tg.sent_messages[-1]["reply_markup"])["watched_bad"]
+                    url = "/action/" + token
+                    row_id = 101
+                    rad.movies[row_id] = {
+                        "id": row_id,
+                        "imdbId": card["verified_imdb_id"],
+                        "tmdbId": card["verified_tmdb_id"],
+                        "hasFile": True,
+                        "qualityProfileId": 4,
+                        "monitored": True,
+                        "tags": [],
+                    }
+                    if name == "unrelated_edit_at_write":
+                        real_update = rad.update_movie
+
+                        async def _watched_write(movie_id: int, payload: dict[str, Any]) -> RadarrWriteResult:
+                            rad.movies[movie_id].update(qualityProfileId=9, tags=[36])
+                            return await real_update(movie_id, payload)
+
+                        rad.update_movie = _watched_write  # type: ignore[method-assign]
+                    elif name == "recovery_after_concurrent_remonitor":
+                        rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        self.assertEqual((await client.post(url, data={"confirm": "1"})).status_code, 503)
+                        if fail_retry:
+                            rad.update_outcome_queue.append(RadarrWriteResult(outcome="ambiguous"))
+                        rad.movies[row_id].update(monitored=False, tags=[7])
+                        orig_tmdb, orig_imdb, orig_tags = rad.get_movies_by_tmdb, rad.get_movies_by_imdb, rad.get_tags
+                        tmdb_done, imdb_done = asyncio.Event(), asyncio.Event()
+
+                        async def _obs_tmdb(key: int) -> RadarrReadResult:
+                            val = await orig_tmdb(key)
+                            tmdb_done.set()
+                            return val
+
+                        async def _obs_imdb(key: str) -> RadarrReadResult:
+                            val = await orig_imdb(key)
+                            imdb_done.set()
+                            return val
+
+                        async def _obs_tags() -> RadarrReadResult:
+                            await asyncio.gather(tmdb_done.wait(), imdb_done.wait())
+                            rad.movies[row_id].update(monitored=True)
+                            return await orig_tags()
+
+                        rad.get_movies_by_tmdb = _obs_tmdb  # type: ignore[method-assign]
+                        rad.get_movies_by_imdb = _obs_imdb  # type: ignore[method-assign]
+                        rad.get_tags = _obs_tags  # type: ignore[method-assign]
+
+                    r = await client.post(url, data={"confirm": "1"})
+                    row = rad.movies[row_id]
+                    return {
+                        "http": r.status_code,
+                        "tags": list(row["tags"]),
+                        "profile": row["qualityProfileId"],
+                        "monitored": row["monitored"],
+                        "hasFile": row["hasFile"],
+                        "feedback": [v["decision"] for v in fb.calls],
+                        "get_by_id": rad.readback_calls,
+                        "updates": len(rad.update_calls),
+                    }
+
+        r_ctrl = await _run_scenario("control")
+        self.assertEqual(r_ctrl["http"], 200)
+        self.assertEqual(r_ctrl["feedback"], ["skip"])
+        self.assertEqual(r_ctrl["tags"], [7])
+        self.assertFalse(r_ctrl["monitored"])
+        self.assertTrue(r_ctrl["hasFile"])
+        self.assertEqual(r_ctrl["profile"], 4)
+        self.assertEqual(r_ctrl["get_by_id"], 1)
+        self.assertEqual(r_ctrl["updates"], 1)
+
+        r_edit = await _run_scenario("unrelated_edit_at_write")
+        self.assertEqual(r_edit["http"], 200)
+        self.assertEqual(r_edit["profile"], 9)
+        self.assertIn(36, r_edit["tags"])
+        self.assertIn(7, r_edit["tags"])
+        self.assertFalse(r_edit["monitored"])
+        self.assertTrue(r_edit["hasFile"])
+        self.assertEqual(r_edit["feedback"], ["skip"])
+
+        r_rec = await _run_scenario("recovery_after_concurrent_remonitor")
+        self.assertEqual(r_rec["http"], 200)
+        self.assertFalse(r_rec["monitored"])
+        self.assertIn(7, r_rec["tags"])
+        self.assertEqual(r_rec["feedback"], ["skip"])
+        self.assertGreaterEqual(r_rec["get_by_id"], 2)
+        self.assertEqual(r_rec["updates"], 2)
+
+        r_rec_fail = await _run_scenario("recovery_after_concurrent_remonitor", fail_retry=True)
+        self.assertEqual(r_rec_fail["http"], 503)
+        self.assertTrue(r_rec_fail["monitored"])
+        self.assertEqual(r_rec_fail["feedback"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

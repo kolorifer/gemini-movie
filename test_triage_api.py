@@ -2489,6 +2489,147 @@ class TestTmdbAndEvaluate(unittest.TestCase):
                 test_db.get_cached_evaluation(rel_b, allow_imdb_lookup=False, allow_release_key_fallback=False)
             )
 
+    def test_pr18_r5_findings_1_and_4_search_conflict_and_dated_restoration_year(self) -> None:
+        """
+        PR #18 Round 5 Findings 1 & 4 (Triage):
+          - Finding 1: Title search MUST apply the same release-evidence check before accepting
+            or caching a candidate, so returning the exact catalogue record rejected for a
+            40-minute runtime mismatch stays incompatible and uncached, while a genuinely
+            different matching record resolves the mistaken tracker ID cleanly.
+          - Finding 4: Consecutive film year + labeled restoration/remaster year (e.g.
+            'Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z') preserves 1994 as the
+            release year in both extract_tmdb_query and normalize_release_key, while real
+            numeral-ending titles ('Road.2049.2017') continue to parse cleanly.
+        """
+        import main
+        from db import normalize_release_key
+        from schemas import TorrentInfo
+        from tmdb_client import extract_tmdb_query
+
+        # 1) Finding 1: Search cannot re-approve a record rejected for runtime conflict
+        film_135 = {
+            "id": 59,
+            "title": "North Window",
+            "release_date": "2012-04-09",
+            "runtime": 135,
+            "external_ids": {"imdb_id": "tt5550001"},
+        }
+        film_95 = {
+            "id": 60,
+            "title": "North Window",
+            "release_date": "2012-04-09",
+            "runtime": 95,
+            "external_ids": {"imdb_id": "tt5550002"},
+        }
+        search_cases = (
+            ("consistent", 135, [film_135], (True, True), film_135),
+            ("conflict_without_search_result", 95, [], (False, False), film_135),
+            ("same_rejected_record_in_search", 95, [film_135], (False, False), film_135),
+            ("genuinely_different_matching_search", 95, [film_135, film_95], (True, True), film_95),
+        )
+        for label, measured, search_results, expected, model_film in search_cases:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / f"{label}.db")
+                test_db.init_db()
+                client = TmdbClient(api_key="fixture")
+
+                def _catalogue(path: str, params=None, _sr=search_results):
+                    if path == "/movie/59":
+                        return film_135
+                    if path == "/movie/60":
+                        return film_95
+                    if path == "/search/movie":
+                        return {"results": _sr}
+                    if path == "/find/tt5550001":
+                        return {"movie_results": [{"id": 59}]}
+                    if path == "/find/tt5550002":
+                        return {"movie_results": [{"id": 60}]}
+                    raise AssertionError(path)
+
+                client._get_json = _catalogue  # type: ignore[method-assign]
+                model_res = _sample_payload(
+                    title=model_film["title"],
+                    year=2012,
+                    runtime_minutes=model_film["runtime"],
+                    imdb_id=model_film["external_ids"]["imdb_id"],
+                    tmdb_id=model_film["id"],
+                )
+                req = EvaluateRequest(
+                    raw_text="North.Window.2012.1080p.BluRay.REMUX-GRP",
+                    hint_title="North Window",
+                    hint_year=2012,
+                    torrent_info=TorrentInfo(tmdb_id=59, runtime_minutes=measured),
+                )
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    second = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                self.assertEqual((first.catalogue_identification.compatible, second.cached), expected, label)
+
+        # 2) Finding 4: Labeled restoration years vs title-ending numerals (query + cache key parity)
+        parse_checks = (
+            ("Granite.Bay.1994.1080p.BluRay.REMUX-Z", ("Granite Bay", 1994), "granite bay 1994"),
+            ("Road.2049.2017.1080p.BluRay.REMUX-Z", ("Road 2049", 2017), "road 2049 2017"),
+            ("Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z", ("Granite Bay", 1994), "granite bay 1994"),
+            ("Granite.Bay.1994.2022.4K.Restoration.1080p.BluRay.REMUX-Z", ("Granite Bay", 1994), "granite bay 1994"),
+            ("Road.2049.2017.2024.Restoration.1080p.BluRay.REMUX-Z", ("Road 2049", 2017), "road 2049 2017"),
+            ("Wonder.Woman.1984.2020.Extended.Edition.2160p.UHD.BluRay.REMUX-Z", ("Wonder Woman 1984", 2020), "wonder woman 1984 2020"),
+        )
+        for raw, exp_query, exp_rel_key in parse_checks:
+            self.assertEqual(extract_tmdb_query(raw), exp_query, raw)
+            self.assertEqual(normalize_release_key(raw), exp_rel_key, raw)
+
+        for label, raw, title, year in (
+            ("normal match", "Granite.Bay.1994.1080p.BluRay.REMUX-Z", "Granite Bay", 1994),
+            ("clear numeric title", "Road.2049.2017.1080p.BluRay.REMUX-Z", "Road 2049", 2017),
+            ("dated restoration", "Granite.Bay.1994.2022.Restoration.1080p.BluRay.REMUX-Z", "Granite Bay", 1994),
+        ):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "db.sqlite")
+                test_db.init_db()
+                movie = TmdbMovie(
+                    tmdb_id=33,
+                    imdb_id="tt1111111",
+                    canonical_title=title,
+                    year=year,
+                    director="Jane Cole",
+                    runtime_minutes=103,
+                )
+                client = TmdbClient(api_key="fixture")
+                client._search_results = lambda *a, _t=title, _y=year, **k: [  # type: ignore[method-assign]
+                    {"id": 33, "title": _t, "original_title": _t, "release_date": f"{_y}-09-15", "popularity": 10}
+                ]
+                client._fetch_movie_details = lambda i, _m=movie: _m  # type: ignore[method-assign]
+                client._find_tmdb_id_by_imdb = lambda i: 33  # type: ignore[method-assign]
+                req = EvaluateRequest(
+                    raw_text=raw,
+                    hint_title=title,
+                    hint_year=year,
+                    torrent_info=TorrentInfo(runtime_minutes=103),
+                )
+                model_res = _sample_payload(
+                    title=title,
+                    year=year,
+                    director="Jane Cole",
+                    runtime_minutes=103,
+                    imdb_id="tt1111111",
+                    tmdb_id=33,
+                )
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", new=AsyncMock(return_value=model_res)),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    second = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                self.assertTrue(first.catalogue_identification.compatible, label)
+                self.assertTrue(second.cached, label)
+
 
 if __name__ == "__main__":
     unittest.main()
