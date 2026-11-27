@@ -18,6 +18,7 @@ from .classifier import (
     ClassifiedWebhook,
     _evaluate_remux_quality_eligibility,
     classify_webhook_payload,
+    compute_baseline_legacy_evidence_digest,
     compute_legacy_occurrence_evidence_digest,
 )
 from .security import PrivateFileError, ensure_private_dir
@@ -278,7 +279,7 @@ class IntakeDB:
             pending = conn.execute(
                 """
                 SELECT o.occurrence_id, o.release_id, o.archive_relpath, o.archive_sha256,
-                       o.classification, r.latest_occurrence_id
+                       o.classification, r.latest_occurrence_id, r.ack_incoming_digest
                 FROM occurrences o
                 JOIN releases r ON r.release_id = o.release_id
                 WHERE o.release_id IS NOT NULL
@@ -292,7 +293,7 @@ class IntakeDB:
         if not pending:
             return 0
 
-        updates: list[tuple[str, str, Optional[str], str, str, bool]] = []
+        updates: list[tuple[str, str, Optional[str], str, str, bool, Optional[str]]] = []
         for row in pending:
             occ_id = str(row["occurrence_id"])
             rel_id = str(row["release_id"])
@@ -300,6 +301,7 @@ class IntakeDB:
             expected_sha = str(row["archive_sha256"])
             cur_cls = str(row["classification"] or "movie_candidate")
             is_latest = occ_id == str(row["latest_occurrence_id"])
+            cur_ack_digest = str(row["ack_incoming_digest"] or "")
             try:
                 raw_payload = read_verified_archive_json(archive_dir, relpath, expected_sha)
             except (ArchiveIntegrityError, PrivateFileError, OSError, ValueError):
@@ -307,6 +309,16 @@ class IntakeDB:
             digest = compute_legacy_occurrence_evidence_digest(raw_payload)
             if not digest:
                 continue
+            baseline_digest = (
+                compute_baseline_legacy_evidence_digest(raw_payload)
+                if cur_ack_digest
+                else None
+            )
+            matched_old_ack = (
+                cur_ack_digest
+                if (cur_ack_digest and baseline_digest and cur_ack_digest == baseline_digest)
+                else None
+            )
             new_cls = cur_cls
             new_diag: Optional[str] = None
             if cur_cls == "movie_candidate":
@@ -318,7 +330,7 @@ class IntakeDB:
                 if reclassified.classification != "movie_candidate":
                     new_cls = "pre_upgrade_ineligible_scope"
                     new_diag = reclassified.diagnostic_note or "pre_upgrade_ineligible_scope"
-            updates.append((digest, new_cls, new_diag, occ_id, rel_id, is_latest))
+            updates.append((digest, new_cls, new_diag, occ_id, rel_id, is_latest, matched_old_ack))
 
         if not updates:
             return 0
@@ -326,7 +338,7 @@ class IntakeDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for digest, new_cls, new_diag, occ_id, rel_id, is_latest in updates:
+            for digest, new_cls, new_diag, occ_id, rel_id, is_latest, matched_old_ack in updates:
                 conn.execute(
                     """
                     UPDATE occurrences
@@ -345,6 +357,15 @@ class IntakeDB:
                         WHERE release_id = ? AND latest_occurrence_id = ?
                         """,
                         (digest, rel_id, occ_id),
+                    )
+                if matched_old_ack is not None:
+                    conn.execute(
+                        """
+                        UPDATE releases
+                        SET ack_incoming_digest = ?
+                        WHERE release_id = ? AND ack_incoming_digest = ?
+                        """,
+                        (digest, rel_id, matched_old_ack),
                     )
             conn.execute("COMMIT")
         except Exception:
@@ -675,7 +696,7 @@ class IntakeDB:
                 """
                 SELECT release_id, state, suppression_reason, card_revision,
                        incoming_evidence_digest, latest_occurrence_id, source_occurrence_id,
-                       last_evaluated_digest, ack_message_id
+                       last_evaluated_digest, ack_message_id, ack_incoming_digest
                 FROM releases
                 WHERE indexer_norm = ? AND external_id_norm = ? AND exact_release_name = ?
                 """,
@@ -723,6 +744,11 @@ class IntakeDB:
                 cur_digest = str(existing["incoming_evidence_digest"])
                 latest_occ_id = str(existing["latest_occurrence_id"])
                 cur_source_occ = str(existing["source_occurrence_id"])
+                cur_ack_incoming_digest = (
+                    str(existing["ack_incoming_digest"])
+                    if existing["ack_incoming_digest"] is not None
+                    else None
+                )
                 never_processed = (
                     card_revision == 0
                     and existing["last_evaluated_digest"] is None
@@ -736,29 +762,97 @@ class IntakeDB:
                     latest_occ_row is not None
                     and str(latest_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
                 )
-                if classified.has_download_url:
-                    source_occ = occurrence_id
-                elif latest_is_ineligible_pre_upgrade and cur_source_occ == latest_occ_id:
+                cur_source_is_ineligible = False
+                if cur_source_occ == latest_occ_id:
+                    cur_source_is_ineligible = latest_is_ineligible_pre_upgrade
+                elif cur_source_occ:
+                    src_occ_row = conn.execute(
+                        "SELECT classification FROM occurrences WHERE occurrence_id = ?",
+                        (cur_source_occ,),
+                    ).fetchone()
+                    cur_source_is_ineligible = (
+                        src_occ_row is not None
+                        and str(src_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
+                    )
+                if classified.has_download_url or cur_source_is_ineligible:
                     source_occ = occurrence_id
                 else:
                     source_occ = cur_source_occ
 
-                # PR #18 Round 4 Findings 3 & 4 + Round 5 Finding 3:
+                # PR #18 Round 4 Findings 3 & 4 + Round 5 Finding 3 + Round 6 Finding 1:
                 # 1. Never bypass proven eligible (`movie_candidate`) history for superseded
-                #    identities (`cur_digest != incoming`) or missing-archive ordering guards,
-                #    and never relabel prior `movie_candidate` records.
+                #    identities or missing-archive ordering guards, and never relabel prior
+                #    `movie_candidate` records.
                 # 2. Only treat `latest_occurrence_id` as an exact duplicate when it was NOT an
                 #    intact pre-upgrade excluded delivery (`pre_upgrade_ineligible_scope`).
-                # 3. If a never-evaluated, never-delivered release was suppressed ONLY because an
-                #    excluded filter's duplicate of the SAME current identity (`cur_digest == incoming`)
-                #    became `latest_occurrence_id` before upgrade, allow a fresh qualifying delivery
-                #    to wake and process it once without re-triggering on any subsequent duplicate.
+                # 3. If a release was suppressed ONLY because an excluded-filter occurrence became
+                #    `latest_occurrence_id` before upgrade, inspect the ordered, verified ELIGIBLE
+                #    (`movie_candidate`) history (requiring zero unverified NULL-digest eligible rows)
+                #    and allow ONLY the latest verified eligible identity to wake and process it once
+                #    when either (a) the release was never processed (`never_processed`), or (b) a
+                #    prior card was acknowledged for a DIFFERENT verified eligible identity so the
+                #    latest verified eligible correction was never delivered. Never compare against
+                #    the excluded occurrence's digest, which could belong to an older superseded film.
+                has_any_unverified_eligible = (
+                    conn.execute(
+                        """
+                        SELECT 1 FROM occurrences
+                        WHERE release_id = ?
+                          AND classification = 'movie_candidate'
+                          AND incoming_evidence_digest IS NULL
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    is not None
+                )
+                latest_verified_eligible_occ = (
+                    conn.execute(
+                        """
+                        SELECT occurrence_id, archive_sha256, incoming_evidence_digest
+                        FROM occurrences
+                        WHERE release_id = ?
+                          AND classification = 'movie_candidate'
+                          AND incoming_evidence_digest IS NOT NULL
+                        ORDER BY received_at DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    if (
+                        latest_is_ineligible_pre_upgrade
+                        and cur_state == "suppressed"
+                        and cur_suppression_reason == "pre_upgrade_ineligible_scope"
+                        and not has_any_unverified_eligible
+                    )
+                    else None
+                )
+                has_undelivered_eligible_correction = (
+                    not never_processed
+                    and bool(cur_ack_incoming_digest)
+                    and latest_verified_eligible_occ is not None
+                    and str(latest_verified_eligible_occ["incoming_evidence_digest"])
+                    != cur_ack_incoming_digest
+                    and conn.execute(
+                        """
+                        SELECT 1 FROM occurrences
+                        WHERE release_id = ?
+                          AND classification = 'movie_candidate'
+                          AND incoming_evidence_digest = ?
+                        LIMIT 1
+                        """,
+                        (release_id, cur_ack_incoming_digest),
+                    ).fetchone()
+                    is not None
+                )
                 retrying_unsent_pre_upgrade_duplicate = (
-                    latest_is_ineligible_pre_upgrade
-                    and cur_state == "suppressed"
-                    and cur_suppression_reason == "pre_upgrade_ineligible_scope"
-                    and never_processed
-                    and cur_digest == classified.incoming_evidence_digest
+                    latest_verified_eligible_occ is not None
+                    and (never_processed or has_undelivered_eligible_correction)
+                    and (
+                        str(latest_verified_eligible_occ["incoming_evidence_digest"])
+                        == classified.incoming_evidence_digest
+                        or str(latest_verified_eligible_occ["archive_sha256"]) == receipt.archive_sha256
+                    )
                 )
 
                 is_exact_latest_replay = (
@@ -799,17 +893,7 @@ class IntakeDB:
                 has_unverified_legacy_occurrence = (
                     not is_exact_latest_replay
                     and not seen_prior_occurrence
-                    and conn.execute(
-                        """
-                        SELECT 1 FROM occurrences
-                        WHERE release_id = ?
-                          AND classification = 'movie_candidate'
-                          AND incoming_evidence_digest IS NULL
-                        LIMIT 1
-                        """,
-                        (release_id,),
-                    ).fetchone()
-                    is not None
+                    and has_any_unverified_eligible
                 )
 
                 waking_pre_upgrade_ineligible_new = (
@@ -837,9 +921,13 @@ class IntakeDB:
                     )
                     result_status = "coalesced_duplicate"
                 elif seen_prior_occurrence:
-                    # Issue #13 §4a & PR #18 Blocker 3 / Round 4 Finding 3: Replayed older
-                    # superseded eligible evidence (including across upgrades and suppressed
-                    # transitions). Archive the replay occurrence and preserve current state.
+                    # Issue #13 §4a & PR #18 Blocker 3 / Round 4 Finding 3 / Round 6 Finding 1:
+                    # Replayed older superseded eligible evidence (including across upgrades and
+                    # suppressed transitions). Archive the replay as `movie_superseded_replay` so
+                    # it never masquerades as the latest applied eligible occurrence, and preserve
+                    # current release state intact.
+                    occ_classification = "movie_superseded_replay"
+                    occ_diagnostic_note = "superseded_prior_occurrence"
                     conn.execute(
                         """
                         UPDATE releases

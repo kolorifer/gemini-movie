@@ -1252,3 +1252,107 @@ def compute_legacy_occurrence_evidence_digest(raw_payload: dict[str, Any]) -> Op
     return hashlib.sha256(
         json.dumps(digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     ).hexdigest()
+
+
+def compute_baseline_legacy_evidence_digest(raw_payload: dict[str, Any]) -> Optional[str]:
+    """
+    Compute the pre-upgrade (baseline v0) `incoming_evidence_digest` for a historical archived
+    webhook so migration backfill can match and upgrade `releases.ack_incoming_digest`.
+    """
+    if not isinstance(raw_payload, dict):
+        return None
+    data = raw_payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    release = data.get("release")
+    if not isinstance(release, dict):
+        return None
+    exact_name = _clean_str(release.get("name")) or _clean_str(release.get("torrent_name"))
+    if not exact_name:
+        return None
+
+    top_event = (_clean_str(raw_payload.get("event")) or _clean_str(raw_payload.get("type")) or "").lower()
+    (
+        action_rejected,
+        action_is_radarr,
+        rejections,
+        _action_type_raw,
+        _result_status,
+        _has_malformed_rejections,
+    ) = _extract_action_info(raw_payload, data, top_event=top_event)
+
+    indexer_raw = _extract_indexer_name(raw_payload, data, release)
+    indexer_norm = indexer_raw.lower()
+    external_id_raw = release.get("external_id")
+    if external_id_raw is None:
+        external_id_raw = release.get("torrent_id")
+    external_id_norm = str(external_id_raw).strip() if external_id_raw is not None else ""
+
+    category = _clean_str(release.get("category")) or _clean_str(data.get("category"))
+    resolution = _clean_str(release.get("resolution"))
+    source = _clean_str(release.get("source"))
+    media_processing = _clean_str(release.get("media_processing") or release.get("container"))
+    hint_title = _clean_str(release.get("title"))
+    hint_year = _clean_int(release.get("year"), min_val=1888, max_val=2100)
+
+    raw_season = release.get("season")
+    raw_episode = release.get("episode")
+    has_season_or_episode = bool(
+        (isinstance(raw_season, int) and not isinstance(raw_season, bool) and raw_season > 0)
+        or (isinstance(raw_episode, int) and not isinstance(raw_episode, bool) and raw_episode > 0)
+        or (isinstance(raw_season, str) and raw_season.strip() not in ("", "0"))
+        or (isinstance(raw_episode, str) and raw_episode.strip() not in ("", "0"))
+        or _EPISODIC_RELEASE_RE.search(exact_name)
+    )
+
+    meta_imdb = _clean_imdb(release.get("meta_imdb") or release.get("imdb_id"))
+    meta_tmdb = _clean_int(release.get("meta_tmdb") or release.get("tmdb_id"), min_val=1)
+    dynamic_range = _clean_str_list(release.get("hdr") or release.get("dynamic_range"))
+    group = _clean_str(release.get("group"))
+    size_gb = _parse_size_gb(release)
+
+    freeleech: Optional[bool] = None
+    if "freeleech" in release:
+        freeleech = _clean_bool(release.get("freeleech"))
+    elif "is_freeleech" in release:
+        freeleech = _clean_bool(release.get("is_freeleech"))
+
+    first_download_url: Optional[str] = None
+    for container in (release, data, raw_payload):
+        for k in ("download_url", "downloadUrl", "torrent_url", "torrentUrl"):
+            val = container.get(k)
+            if isinstance(val, str) and val.strip():
+                first_download_url = val.strip()
+                break
+        if first_download_url:
+            break
+
+    has_canonical_tl_download_ref = bool(
+        first_download_url and is_canonical_tl_download_url(first_download_url, external_id_norm)
+    )
+
+    baseline_digest_input = {
+        "indexer": indexer_norm,
+        "external_id": external_id_norm,
+        "exact_release_name": exact_name,
+        "hint_title": hint_title.lower() if hint_title else None,
+        "hint_year": hint_year,
+        "category": category.lower() if category else None,
+        "meta_imdb": meta_imdb,
+        "meta_tmdb": meta_tmdb,
+        "resolution": resolution.lower() if resolution else None,
+        "source": source.lower() if source else None,
+        "dynamic_range": sorted({d.lower() for d in dynamic_range}),
+        "media_processing": media_processing.lower() if media_processing else None,
+        "group": group.lower() if group else None,
+        "size_gb": size_gb,
+        "freeleech": freeleech,
+        "action_rejected": action_rejected,
+        "action_is_radarr": action_is_radarr,
+        "rejections": rejections,
+        "has_canonical_tl_download_ref": has_canonical_tl_download_ref,
+        "has_season_or_episode": has_season_or_episode,
+    }
+    return hashlib.sha256(
+        json.dumps(baseline_digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
