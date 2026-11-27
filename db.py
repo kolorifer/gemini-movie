@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import stat
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -582,15 +583,30 @@ _DATED_EDITION_YEAR_PREFIXES = frozenset(
 )
 
 
-def _is_dated_edition_year(tokens: list[str], idx: int) -> bool:
+def _is_dated_edition_year(
+    tokens: list[str],
+    idx: int,
+    *,
+    film_year: Optional[int] = None,
+    max_release_year: Optional[int] = None,
+) -> bool:
     """
-    Return True when a 4-digit year token at `tokens[idx]` labels a restoration/remaster/reissue
-    edition (e.g. '2022.Restoration', '2022.4K.Restoration', '2022.Remastered') rather than the
-    film's own release year.
+    Return True when a 4-digit year token at `tokens[idx]` plausibly labels a
+    restoration/remaster/reissue edition (e.g. '2022.Restoration', '2022.4K.Restoration',
+    '2022.Remastered') rather than the film's own release year.
+    When `film_year` is supplied, requires chronological order (`edition_year > film_year`)
+    so a release year predating or matching a title numeral (e.g. 'Crew.Of.1999.1990.Remastered')
+    is never misclassified as a restoration year.
     """
     if idx < 0 or idx >= len(tokens):
         return False
-    if not YEAR_RE.match(tokens[idx].lower()):
+    low = tokens[idx].lower()
+    if not YEAR_RE.match(low):
+        return False
+    edition_year = int(low)
+    if film_year is not None and edition_year <= film_year:
+        return False
+    if max_release_year is not None and edition_year > max_release_year:
         return False
     if idx + 1 < len(tokens):
         nxt = tokens[idx + 1].lower().strip("'’")
@@ -606,24 +622,141 @@ def _is_dated_edition_year(tokens: list[str], idx: int) -> bool:
 def is_title_numeral_token(tokens: list[str], idx: int, *, max_release_year: int) -> bool:
     """
     Return True when a 4-digit year-like token at `tokens[idx]` is part of the movie title
-    (e.g. '2049' in 'Road.2049.2017.1080p.BluRay.REMUX' or '1984' in 'Wonder.Woman.1984.2020')
-    rather than the release year itself. Does NOT treat a release year followed by a labeled
-    restoration/remaster year (e.g. 'Granite.Bay.1994.2022.Restoration') as a title numeral.
+    (e.g. '2049' in 'Road.2049.2017.1080p.BluRay.REMUX', '1999' in 'Crew.Of.1999.1990.Remastered',
+    or '1984' in 'Wonder.Woman.1984.2020') rather than the release year itself. Does NOT treat a
+    release year followed by a chronologically later labeled restoration/remaster year
+    (e.g. 'Granite.Bay.1994.2022.Restoration') as a title numeral.
     """
     low = tokens[idx].lower()
     if not YEAR_RE.match(low):
         return False
     if idx == 0:
         return True
-    if int(low) > max_release_year:
+    year_val = int(low)
+    if year_val > max_release_year:
         return True
     if (
         idx + 1 < len(tokens)
         and YEAR_RE.match(tokens[idx + 1].lower())
-        and not _is_dated_edition_year(tokens, idx + 1)
+        and not _is_dated_edition_year(
+            tokens,
+            idx + 1,
+            film_year=year_val,
+            max_release_year=max_release_year,
+        )
     ):
         return True
     return False
+
+
+def _normalize_title_compare(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z]+", " ", stripped).strip().lower())
+
+
+def extract_tokens_title_year_candidates(
+    tokens: list[str],
+    *,
+    max_release_year: int,
+    skip_imdb_tokens: bool = False,
+) -> list[tuple[list[str], Optional[int]]]:
+    """
+    Extract ordered `(title_tokens, detected_year)` candidates from tokenized release text.
+    Returns one candidate unless a chronologically plausible consecutive-year + dated-edition
+    marker pair (`Y1 < Y2 <= max_release_year`, e.g. `1984.2020.Remastered` or
+    `1994.2022.Restoration`) supports both:
+      1. Primary (dated restoration/remaster): `(title_tokens, Y1)`
+      2. Alternate (title-ending numeral on remastered disc): `(title_tokens + [Y1], Y2)`
+    """
+    title_tokens: list[str] = []
+    detected_year: Optional[int] = None
+    alternate: Optional[tuple[list[str], int]] = None
+
+    for idx, token in enumerate(tokens):
+        low = token.lower()
+        if YEAR_RE.match(low):
+            if is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
+                title_tokens.append(token)
+                continue
+            year_val = int(low)
+            detected_year = year_val
+            if (
+                idx > 0
+                and year_val <= max_release_year
+                and idx + 1 < len(tokens)
+                and _is_dated_edition_year(
+                    tokens,
+                    idx + 1,
+                    film_year=year_val,
+                    max_release_year=max_release_year,
+                )
+            ):
+                alternate = (title_tokens + [token], int(tokens[idx + 1]))
+            break
+        if low in RELEASE_STOP_TOKENS and title_tokens:
+            break
+        if skip_imdb_tokens and low.startswith("tt") and re.fullmatch(r"tt\d{7,10}", low):
+            continue
+        title_tokens.append(token)
+
+    candidates: list[tuple[list[str], Optional[int]]] = [(title_tokens, detected_year)]
+    if alternate is not None:
+        candidates.append(alternate)
+    return candidates
+
+
+def select_release_title_year_candidate(
+    candidates: list[tuple[list[str], Optional[int]]],
+    *,
+    hint_title: Optional[str] = None,
+    hint_year: Optional[int] = None,
+) -> tuple[list[str], Optional[int]]:
+    """
+    Resolve between chronologically valid consecutive-year interpretations using corroborating
+    title/year hints when available. Never overrides an unambiguous single-interpretation filename
+    and never lets a non-numeral title + contradictory year hint mask a release-year conflict.
+    """
+    if not candidates:
+        return ([], None)
+    if len(candidates) == 1 or (not hint_title and hint_year is None):
+        return candidates[0]
+
+    primary_tokens, primary_year = candidates[0]
+    alt_tokens, alt_year = candidates[1]
+    norm_primary = _normalize_title_compare(" ".join(primary_tokens))
+    norm_alt = _normalize_title_compare(" ".join(alt_tokens))
+    norm_hint = _normalize_title_compare(hint_title) if hint_title else ""
+
+    hint_title_matches_primary = bool(norm_hint and norm_primary and norm_hint == norm_primary)
+    hint_title_matches_alt = bool(norm_hint and norm_alt and norm_hint == norm_alt)
+    if (
+        norm_hint
+        and not hint_title_matches_primary
+        and not hint_title_matches_alt
+        and primary_year is not None
+        and norm_primary
+    ):
+        hint_words = norm_hint.split()
+        if str(primary_year) in hint_words and all(w in hint_words for w in norm_primary.split()):
+            hint_title_matches_alt = True
+
+    hint_year_matches_primary = (
+        hint_year is not None and primary_year is not None and abs(hint_year - primary_year) <= 1
+    )
+    hint_year_matches_alt = (
+        hint_year is not None and alt_year is not None and abs(hint_year - alt_year) <= 1
+    )
+
+    if hint_title_matches_alt and (hint_year is None or hint_year_matches_alt):
+        return candidates[1]
+    if (
+        not hint_title_matches_primary
+        and hint_year_matches_alt
+        and not hint_year_matches_primary
+    ):
+        return candidates[1]
+    return candidates[0]
 
 
 def normalize_release_key(
@@ -641,21 +774,14 @@ def normalize_release_key(
     cleaned = re.sub(r"-[A-Za-z0-9]{2,20}$", "", cleaned)
     tokens = [t for t in re.split(r"[\s._\-\[\]\(\)\{\}/\\,:;]+", cleaned) if t]
 
-    title_tokens: list[str] = []
-    detected_year: Optional[int] = None
     max_release_year = datetime.now(timezone.utc).year + 5
-
-    for idx, token in enumerate(tokens):
-        low = token.lower()
-        if YEAR_RE.match(low):
-            if is_title_numeral_token(tokens, idx, max_release_year=max_release_year):
-                title_tokens.append(low)
-                continue
-            detected_year = int(low)
-            break
-        if low in RELEASE_STOP_TOKENS and title_tokens:
-            break
-        title_tokens.append(low)
+    candidates = extract_tokens_title_year_candidates(tokens, max_release_year=max_release_year)
+    chosen_tokens, detected_year = select_release_title_year_candidate(
+        candidates,
+        hint_title=hint_title,
+        hint_year=hint_year,
+    )
+    title_tokens = [t.lower() for t in chosen_tokens]
 
     year = detected_year or hint_year
     if not title_tokens and hint_title:

@@ -743,22 +743,60 @@ class IntakeDB:
                 else:
                     source_occ = cur_source_occ
 
-                # PR #18 Round 4 Findings 3 & 4 + Round 5 Finding 3:
+                # PR #18 Round 4 Findings 3 & 4 + Round 5 Finding 3 + Round 6 Finding 1:
                 # 1. Never bypass proven eligible (`movie_candidate`) history for superseded
-                #    identities (`cur_digest != incoming`) or missing-archive ordering guards,
-                #    and never relabel prior `movie_candidate` records.
+                #    identities or missing-archive ordering guards, and never relabel prior
+                #    `movie_candidate` records.
                 # 2. Only treat `latest_occurrence_id` as an exact duplicate when it was NOT an
                 #    intact pre-upgrade excluded delivery (`pre_upgrade_ineligible_scope`).
                 # 3. If a never-evaluated, never-delivered release was suppressed ONLY because an
-                #    excluded filter's duplicate of the SAME current identity (`cur_digest == incoming`)
-                #    became `latest_occurrence_id` before upgrade, allow a fresh qualifying delivery
-                #    to wake and process it once without re-triggering on any subsequent duplicate.
+                #    excluded-filter occurrence became `latest_occurrence_id` before upgrade, inspect
+                #    the ordered, verified ELIGIBLE (`movie_candidate`) history (requiring zero
+                #    unverified NULL-digest eligible rows) and allow ONLY the latest verified
+                #    eligible identity to wake and process it once. Never compare against the
+                #    excluded occurrence's digest, which could belong to an older superseded film.
+                has_any_unverified_eligible = (
+                    conn.execute(
+                        """
+                        SELECT 1 FROM occurrences
+                        WHERE release_id = ?
+                          AND classification = 'movie_candidate'
+                          AND incoming_evidence_digest IS NULL
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    is not None
+                )
+                latest_verified_eligible_occ = (
+                    conn.execute(
+                        """
+                        SELECT occurrence_id, archive_sha256, incoming_evidence_digest
+                        FROM occurrences
+                        WHERE release_id = ?
+                          AND classification = 'movie_candidate'
+                          AND incoming_evidence_digest IS NOT NULL
+                        ORDER BY received_at DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (release_id,),
+                    ).fetchone()
+                    if (
+                        latest_is_ineligible_pre_upgrade
+                        and cur_state == "suppressed"
+                        and cur_suppression_reason == "pre_upgrade_ineligible_scope"
+                        and never_processed
+                        and not has_any_unverified_eligible
+                    )
+                    else None
+                )
                 retrying_unsent_pre_upgrade_duplicate = (
-                    latest_is_ineligible_pre_upgrade
-                    and cur_state == "suppressed"
-                    and cur_suppression_reason == "pre_upgrade_ineligible_scope"
-                    and never_processed
-                    and cur_digest == classified.incoming_evidence_digest
+                    latest_verified_eligible_occ is not None
+                    and (
+                        str(latest_verified_eligible_occ["incoming_evidence_digest"])
+                        == classified.incoming_evidence_digest
+                        or str(latest_verified_eligible_occ["archive_sha256"]) == receipt.archive_sha256
+                    )
                 )
 
                 is_exact_latest_replay = (
@@ -799,17 +837,7 @@ class IntakeDB:
                 has_unverified_legacy_occurrence = (
                     not is_exact_latest_replay
                     and not seen_prior_occurrence
-                    and conn.execute(
-                        """
-                        SELECT 1 FROM occurrences
-                        WHERE release_id = ?
-                          AND classification = 'movie_candidate'
-                          AND incoming_evidence_digest IS NULL
-                        LIMIT 1
-                        """,
-                        (release_id,),
-                    ).fetchone()
-                    is not None
+                    and has_any_unverified_eligible
                 )
 
                 waking_pre_upgrade_ineligible_new = (
@@ -837,9 +865,13 @@ class IntakeDB:
                     )
                     result_status = "coalesced_duplicate"
                 elif seen_prior_occurrence:
-                    # Issue #13 §4a & PR #18 Blocker 3 / Round 4 Finding 3: Replayed older
-                    # superseded eligible evidence (including across upgrades and suppressed
-                    # transitions). Archive the replay occurrence and preserve current state.
+                    # Issue #13 §4a & PR #18 Blocker 3 / Round 4 Finding 3 / Round 6 Finding 1:
+                    # Replayed older superseded eligible evidence (including across upgrades and
+                    # suppressed transitions). Archive the replay as `movie_superseded_replay` so
+                    # it never masquerades as the latest applied eligible occurrence, and preserve
+                    # current release state intact.
+                    occ_classification = "movie_superseded_replay"
+                    occ_diagnostic_note = "superseded_prior_occurrence"
                     conn.execute(
                         """
                         UPDATE releases

@@ -5817,6 +5817,288 @@ Language : German
                     self.assertEqual(len(triage2.calls), 1, mode)
                     self.assertEqual(len(actions2.card_calls), 1, mode)
 
+    def test_pr18_r6_finding_1_ordered_eligible_history_after_excluded_duplicate(self) -> None:
+        """
+        PR #18 Round 6 Finding 1 (Intake):
+          - 401 (control): unsent allowed A followed by excluded A -> suppressed on upgrade ->
+            replaying allowed A wakes once (eval=A, cards=1); repeats coalesce.
+          - 402 (superseded A -> corrected B -> excluded A): suppressed on upgrade ->
+            delayed replay of superseded allowed A MUST coalesce (0 evals, 0 cards, recorded
+            as `movie_superseded_replay` so it never masks B) -> redelivering allowed B MUST
+            wake once (eval=B, cards=1) -> further repeats of B and A coalesce.
+          - 403 (allowed A -> allowed B -> excluded C): replay of A coalesces; redelivery of
+            latest verified eligible B wakes once.
+          - 404 (allowed A intact -> allowed B missing archive -> excluded A intact): missing
+            eligible archive blocks waking A or B until B's archive is restored and restarted,
+            after which A still coalesces and B wakes once.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+
+        def _payload(case: str, version: str, *, approved_filter: bool = True, envelope: str = "") -> bytes:
+            obs_id = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[version]
+            body = {
+                "event": "action.rejected",
+                "id": f"{case}{version}{envelope}",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": "Movies Remux" if approved_filter else "Other Filter"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": {
+                        "name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                        "title": "North Field",
+                        "type": "movie",
+                        "year": 2021,
+                        "resolution": "1080p",
+                        "source": "BluRay",
+                        "media_processing": "REMUX",
+                        "category": "Movies :: Bluray",
+                        "meta_imdb": obs_id,
+                        "external_id": case,
+                    },
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_pre_upgrade(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            specs: list[tuple[str, str, bool, bool]],
+            missing_backup: Optional[Path] = None,
+        ) -> Optional[Path]:
+            rel_id = f"rel-r6-{case}"
+            occs: list[tuple[str, str, str, int, str]] = []
+            missing_target: Optional[Path] = None
+            last_version = "a"
+            for idx, (oid, ver, approved, keep_archive) in enumerate(specs):
+                raw = _payload(case, ver, approved_filter=approved)
+                rec = archive_raw_webhook(archive_dir, oid, raw)
+                if not keep_archive:
+                    src = archive_dir / rec.archive_relpath
+                    if missing_backup is not None:
+                        src.rename(missing_backup)
+                        missing_target = src
+                    else:
+                        src.unlink()
+                occs.append(
+                    (
+                        oid,
+                        rec.archive_relpath,
+                        hashlib.sha256(raw).hexdigest(),
+                        len(raw),
+                        f"2026-11-26T00:00:0{idx}+00:00",
+                    )
+                )
+                last_version = ver
+
+            obs_id = {"a": "tt4440001", "b": "tt4440002", "c": "tt4440003"}[last_version]
+            snap = {
+                "indexer_norm": "torrentleech",
+                "external_id_norm": case,
+                "exact_release_name": f"North.Field.{case}.2021.1080p.BluRay.REMUX-GROUP",
+                "action_type": "RADARR",
+                "action_is_radarr": True,
+                "action_rejected": True,
+                "rejection_reasons": ["Unknown Movie"],
+                "title": "North Field",
+                "year": 2021,
+                "resolution": "1080p",
+                "source": "BluRay",
+                "media_processing": "REMUX",
+                "category": "Movies :: Bluray",
+                "meta_imdb": obs_id,
+            }
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'torrentleech', ?, ?, ?, ?, ?, 0, 'queued', 0, ?, ?,
+                              '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:05+00:00')
+                    """,
+                    (
+                        rel_id,
+                        case,
+                        snap["exact_release_name"],
+                        occs[0][0],
+                        occs[-1][0],
+                        occs[0][0],
+                        f"legacy-r6-{case}-{last_version}",
+                        json.dumps(snap),
+                    ),
+                )
+                for oid, relp, sha, nbytes, ts in occs:
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (oid, ts, relp, sha, nbytes, rel_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return missing_target
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "401",
+                [("occ-401-a1", "a", True, True), ("occ-401-a2", "a", False, True)],
+            )
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "402",
+                [
+                    ("occ-402-a1", "a", True, True),
+                    ("occ-402-b1", "b", True, True),
+                    ("occ-402-a2", "a", False, True),
+                ],
+            )
+            _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "403",
+                [
+                    ("occ-403-a1", "a", True, True),
+                    ("occ-403-b1", "b", True, True),
+                    ("occ-403-c1", "c", False, True),
+                ],
+            )
+            backup_404 = root / "occ-404-b1.backup"
+            missing_target_404 = _seed_pre_upgrade(
+                db,
+                cfg.webhook_archive_dir,
+                "404",
+                [
+                    ("occ-404-a1", "a", True, True),
+                    ("occ-404-b1", "b", True, False),
+                    ("occ-404-a2", "a", False, True),
+                ],
+                missing_backup=backup_404,
+            )
+            assert missing_target_404 is not None
+
+            def _make_runtime():
+                actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                app = create_app(
+                    cfg,
+                    db=db,
+                    actions_client=actions,
+                    triage_client=triage,
+                    tl_scraper=tracker,
+                    tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                    start_worker=False,
+                )
+                return app, actions, triage
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            app1, actions1, triage1 = _make_runtime()
+            with TestClient(app1) as client:
+                for c in ("401", "402", "403", "404"):
+                    self.assertEqual(_row(c)["state"], "suppressed", c)
+
+                def _post(case: str, ver: str, env: str = "") -> str:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=_payload(case, ver, approved_filter=True, envelope=env),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    return str(resp.json()["status"])
+
+                def _assessed(case: str) -> list[str]:
+                    return [v["torrent_info"]["imdb_id"] for v in triage1.calls if f".{case}." in v["raw_text"]]
+
+                def _cards(case: str) -> list[dict[str, Any]]:
+                    return [v for v in actions1.card_calls if v.get("external_id") == case]
+
+                # 401 control: allowed A wakes once, repeat coalesces
+                self.assertEqual(_post("401", "a"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("401"), ["tt4440001"])
+                self.assertEqual(len(_cards("401")), 1)
+                self.assertEqual(_post("401", "a", "dup"), "coalesced_duplicate")
+
+                # 402: delayed replay of superseded A coalesces (even twice!), then B wakes once
+                self.assertEqual(_post("402", "a"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), [])
+                self.assertEqual(len(_cards("402")), 0)
+                self.assertEqual(_row("402")["state"], "suppressed")
+                self.assertEqual(_post("402", "a", "dup2"), "coalesced_duplicate")
+                self.assertEqual(_post("402", "b"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), ["tt4440002"])
+                self.assertEqual(len(_cards("402")), 1)
+                self.assertEqual(_post("402", "b", "dup"), "coalesced_duplicate")
+                self.assertEqual(_post("402", "a", "late"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("402"), ["tt4440002"])
+                self.assertEqual(len(_cards("402")), 1)
+
+                # 403: excluded C does not hide eligible B either
+                self.assertEqual(_post("403", "a"), "coalesced_duplicate")
+                self.assertEqual(_post("403", "b"), "accepted")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("403"), ["tt4440002"])
+                self.assertEqual(len(_cards("403")), 1)
+
+                # 404: missing B archive blocks waking both A and B until restored
+                self.assertEqual(_post("404", "a"), "coalesced_duplicate")
+                self.assertEqual(_post("404", "b"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("404"), [])
+                self.assertEqual(len(_cards("404")), 0)
+
+            # Restore 404 B archive + restart: A still coalesces, B wakes once
+            backup_404.rename(missing_target_404)
+            app2, actions2, triage2 = _make_runtime()
+            with TestClient(app2) as client2:
+                self.assertEqual(_row("404")["state"], "suppressed")
+                r404_a = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("404", "a", approved_filter=True, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r404_a.json()["status"], "coalesced_duplicate")
+                r404_b = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("404", "b", approved_filter=True, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r404_b.json()["status"], "accepted")
+                self.assertTrue(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage2.calls if ".404." in v["raw_text"]],
+                    ["tt4440002"],
+                )
+                self.assertEqual(
+                    len([v for v in actions2.card_calls if v.get("external_id") == "404"]),
+                    1,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
