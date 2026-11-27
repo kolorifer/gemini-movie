@@ -6193,6 +6193,255 @@ Language : German
                 )
                 self.assertEqual(len([v for v in actions3.card_calls if v.get("external_id") == "406"]), 0)
 
+    def test_pr18_r7_finding_1_historical_ack_lacking_current_scope_does_not_drop_eligible_correction(self) -> None:
+        """
+        PR #18 Round 7 Finding 1 (Intake):
+          - 801 (control): baseline delivered A with complete REMUX metadata, B corrected, excluded A,
+            upgrade -> redelivering eligible B wakes once via `updated_correction` (1 eval for B, 1 card).
+          - 802 (Finding 1): baseline delivered A lacking structured `media_processing` (container='MKV'),
+            B corrected with full `media_processing='REMUX'`, excluded A, upgrade -> verified historical
+            ack of A still proves A was sent while current eligibility applies to B -> redelivering B
+            wakes once via `updated_correction` (1 eval for B, 1 card) and repeats coalesce.
+          - 803 (superseded replay guard): baseline delivered A under excluded filter (complete REMUX),
+            B queued under allowed filter, excluded A arrived -> after upgrade, replaying A under
+            allowed filter MUST coalesce (`movie_superseded_replay`) while B still wakes once.
+          - 804 (missing archive fail-closed + restore recovery): Case 802 with A's archive missing
+            blocks waking B; restoring A's archive + restart upgrades `ack_incoming_digest` and lets
+            B wake once via `updated_correction`.
+        """
+        import hashlib
+        from services.movie_intake_api.archive import archive_raw_webhook
+        from services.movie_intake_api.classifier import compute_baseline_legacy_evidence_digest
+
+        def _payload(
+            case: str,
+            identity: str,
+            *,
+            allowed: bool = True,
+            omit_media_processing: bool = False,
+            envelope: str = "",
+        ) -> bytes:
+            rel: dict[str, Any] = {
+                "name": f"Granite.Bay.{case}.1994.1080p.BluRay.REMUX-GROUP",
+                "title": "Granite Bay",
+                "year": 1994,
+                "type": "movie",
+                "category": "Movies :: Bluray",
+                "source": "BluRay",
+                "resolution": "1080p",
+                "media_processing": "REMUX",
+                "container": "MKV",
+                "meta_imdb": "tt1111111" if identity == "A" else "tt2222222",
+                "external_id": case,
+            }
+            if omit_media_processing:
+                del rel["media_processing"]
+            body = {
+                "event": "action.rejected",
+                "id": f"{case}-{identity}-{envelope}",
+                "data": {
+                    "indexer": "TorrentLeech",
+                    "action": {"type": "RADARR"},
+                    "filter": {"name": "Movies Remux" if allowed else "Other Filter"},
+                    "result": {"status": "PUSH_REJECTED", "rejections": ["Unknown Movie"]},
+                    "release": rel,
+                },
+            }
+            return json.dumps(body).encode("utf-8")
+
+        def _seed_acked_pre_upgrade(
+            db: IntakeDB,
+            archive_dir: Path,
+            case: str,
+            *,
+            a_allowed: bool = True,
+            a_omit_mp: bool = False,
+            missing_a_backup: Optional[Path] = None,
+        ) -> Optional[Path]:
+            rel_id = f"rel-r7-{case}"
+            raw_a1 = _payload(case, "A", allowed=a_allowed, omit_media_processing=a_omit_mp, envelope="a1")
+            raw_b1 = _payload(case, "B", allowed=True, omit_media_processing=False, envelope="b1")
+            raw_a2 = _payload(case, "A", allowed=False, omit_media_processing=a_omit_mp, envelope="a2")
+            ack_base_digest = compute_baseline_legacy_evidence_digest(json.loads(raw_a1.decode("utf-8")))
+            assert ack_base_digest is not None
+            latest_base_digest = compute_baseline_legacy_evidence_digest(json.loads(raw_a2.decode("utf-8")))
+            assert latest_base_digest is not None
+
+            missing_target: Optional[Path] = None
+            occs: list[tuple[str, str, str, int, str]] = []
+            for idx, (oid, raw) in enumerate(
+                ((f"occ-{case}-a1", raw_a1), (f"occ-{case}-b1", raw_b1), (f"occ-{case}-a2", raw_a2))
+            ):
+                rec = archive_raw_webhook(archive_dir, oid, raw)
+                if idx == 0 and missing_a_backup is not None:
+                    src = archive_dir / rec.archive_relpath
+                    src.rename(missing_a_backup)
+                    missing_target = src
+                occs.append(
+                    (
+                        oid,
+                        rec.archive_relpath,
+                        hashlib.sha256(raw).hexdigest(),
+                        len(raw),
+                        f"2026-11-26T00:00:0{idx}+00:00",
+                    )
+                )
+
+            snap = {
+                "indexer_norm": "torrentleech",
+                "external_id_norm": case,
+                "exact_release_name": f"Granite.Bay.{case}.1994.1080p.BluRay.REMUX-GROUP",
+                "action_type": "RADARR",
+                "action_is_radarr": True,
+                "action_rejected": True,
+                "rejection_reasons": ["Unknown Movie"],
+                "title": "Granite Bay",
+                "year": 1994,
+                "resolution": "1080p",
+                "source": "BluRay",
+                "media_processing": "MKV" if a_omit_mp else "REMUX",
+                "category": "Movies :: Bluray",
+                "meta_imdb": "tt1111111",
+            }
+            conn = db._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO releases (
+                        release_id, indexer_norm, external_id_norm, exact_release_name,
+                        first_occurrence_id, latest_occurrence_id, source_occurrence_id,
+                        card_revision, state, pending_reprocess,
+                        incoming_evidence_digest, incoming_snapshot_json,
+                        ack_chat_id, ack_message_id, ack_incoming_digest, last_evaluated_digest,
+                        next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'torrentleech', ?, ?, ?, ?, ?, 1, 'queued', 0, ?, ?,
+                              '-100123456', 777, ?, 'legacy-eval-digest',
+                              '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:00+00:00', '2026-11-26T00:00:05+00:00')
+                    """,
+                    (
+                        rel_id,
+                        case,
+                        snap["exact_release_name"],
+                        occs[0][0],
+                        occs[-1][0],
+                        occs[-1][0],
+                        latest_base_digest,
+                        json.dumps(snap),
+                        ack_base_digest,
+                    ),
+                )
+                for oid, relp, sha, nbytes, ts in occs:
+                    conn.execute(
+                        """
+                        INSERT INTO occurrences (
+                            occurrence_id, received_at, archive_relpath, archive_sha256,
+                            payload_bytes, classification, diagnostic_note, release_id,
+                            incoming_evidence_digest
+                        ) VALUES (?, ?, ?, ?, ?, 'movie_candidate', NULL, ?, NULL)
+                        """,
+                        (oid, ts, relp, sha, nbytes, rel_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return missing_target
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = _make_config(root)
+            db = IntakeDB(cfg.intake_db_path)
+            db.init_db()
+
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "801", a_allowed=True, a_omit_mp=False)
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "802", a_allowed=True, a_omit_mp=True)
+            _seed_acked_pre_upgrade(db, cfg.webhook_archive_dir, "803", a_allowed=False, a_omit_mp=False)
+            backup_804 = root / "occ-804-a1.backup"
+            missing_target_804 = _seed_acked_pre_upgrade(
+                db, cfg.webhook_archive_dir, "804", a_allowed=True, a_omit_mp=True, missing_a_backup=backup_804
+            )
+            assert missing_target_804 is not None
+
+            def _make_runtime():
+                actions = StubActionsClient(radarr_handler=lambda *_, **__: RadarrStatusResponse(status="absent"))
+                triage = StubTriageClient(lambda *_: TriageEvalResult(ok=False, error_redacted="stubbed"))
+                tracker = StubTlScraper(db, cfg.tl_cookie_file, lambda *_: TorrentLeechResult(outcome="listing_id_missing"))
+                app = create_app(
+                    cfg,
+                    db=db,
+                    actions_client=actions,
+                    triage_client=triage,
+                    tl_scraper=tracker,
+                    tmdb_client=StubTmdbClient(cfg.tmdb_cache_path, {}, {}),
+                    start_worker=False,
+                )
+                return app, actions, triage
+
+            def _row(case: str) -> dict[str, Any]:
+                return next(r for r in db.list_all_releases() if r["external_id_norm"] == case)
+
+            app1, actions1, triage1 = _make_runtime()
+            with TestClient(app1) as client:
+                for c in ("801", "802", "803", "804"):
+                    self.assertEqual(_row(c)["state"], "suppressed", c)
+
+                def _post(case: str, identity: str, env: str = "") -> str:
+                    resp = client.post(
+                        f"/webhook/{cfg.webhook_secret}",
+                        content=_payload(case, identity, allowed=True, omit_media_processing=False, envelope=env),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    return str(resp.json()["status"])
+
+                def _assessed(case: str) -> list[str]:
+                    return [v["torrent_info"]["imdb_id"] for v in triage1.calls if f".{case}." in v["raw_text"]]
+
+                def _cards(case: str) -> list[dict[str, Any]]:
+                    return [v for v in actions1.card_calls if v.get("external_id") == case]
+
+                # 801 (control) & 802 (A lacked structured REMUX metadata): B wakes once via updated_correction
+                for case in ("801", "802"):
+                    self.assertEqual(_post(case, "B", "redeliver"), "updated_correction", case)
+                    self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()), case)
+                    self.assertEqual(_assessed(case), ["tt2222222"], case)
+                    self.assertEqual(len(_cards(case)), 1, case)
+                    self.assertEqual(_post(case, "B", "dup"), "coalesced_duplicate", case)
+                    self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()), case)
+
+                # 803: replaying previously acked A (reclassified to pre_upgrade_ineligible_scope) MUST coalesce,
+                # then B wakes once via updated_correction
+                self.assertEqual(_post("803", "A", "replay"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("803"), [])
+                self.assertEqual(len(_cards("803")), 0)
+                self.assertEqual(_post("803", "B", "redeliver"), "updated_correction")
+                self.assertTrue(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("803"), ["tt2222222"])
+                self.assertEqual(len(_cards("803")), 1)
+
+                # 804: missing historical A archive refuses to wake B
+                self.assertEqual(_post("804", "B", "while-missing"), "coalesced_duplicate")
+                self.assertFalse(asyncio.run(app1.state.worker.process_next_queued()))
+                self.assertEqual(_assessed("804"), [])
+                self.assertEqual(len(_cards("804")), 0)
+
+            # Restore 804 A archive + restart -> backfill upgrades ack_incoming_digest -> B wakes once
+            backup_804.rename(missing_target_804)
+            app2, actions2, triage2 = _make_runtime()
+            with TestClient(app2) as client2:
+                r804 = client2.post(
+                    f"/webhook/{cfg.webhook_secret}",
+                    content=_payload("804", "B", allowed=True, omit_media_processing=False, envelope="after-restore"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(r804.json()["status"], "updated_correction")
+                self.assertTrue(asyncio.run(app2.state.worker.process_next_queued()))
+                self.assertEqual(
+                    [v["torrent_info"]["imdb_id"] for v in triage2.calls if ".804." in v["raw_text"]],
+                    ["tt2222222"],
+                )
+                self.assertEqual(len([v for v in actions2.card_calls if v.get("external_id") == "804"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

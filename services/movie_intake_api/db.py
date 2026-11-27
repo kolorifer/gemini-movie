@@ -279,11 +279,22 @@ class IntakeDB:
             pending = conn.execute(
                 """
                 SELECT o.occurrence_id, o.release_id, o.archive_relpath, o.archive_sha256,
-                       o.classification, r.latest_occurrence_id, r.ack_incoming_digest
+                       o.classification, o.incoming_evidence_digest AS occ_digest,
+                       r.latest_occurrence_id, r.ack_incoming_digest
                 FROM occurrences o
                 JOIN releases r ON r.release_id = o.release_id
                 WHERE o.release_id IS NOT NULL
-                  AND o.incoming_evidence_digest IS NULL
+                  AND (
+                      o.incoming_evidence_digest IS NULL
+                      OR (
+                          r.ack_incoming_digest IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM occurrences o2
+                              WHERE o2.release_id = r.release_id
+                                AND o2.incoming_evidence_digest = r.ack_incoming_digest
+                          )
+                      )
+                  )
                 ORDER BY o.received_at ASC, o.occurrence_id ASC
                 """
             ).fetchall()
@@ -293,13 +304,14 @@ class IntakeDB:
         if not pending:
             return 0
 
-        updates: list[tuple[str, str, Optional[str], str, str, bool, Optional[str]]] = []
+        updates: list[tuple[str, str, Optional[str], str, str, bool, bool, Optional[str]]] = []
         for row in pending:
             occ_id = str(row["occurrence_id"])
             rel_id = str(row["release_id"])
             relpath = str(row["archive_relpath"])
             expected_sha = str(row["archive_sha256"])
             cur_cls = str(row["classification"] or "movie_candidate")
+            needs_occ_backfill = row["occ_digest"] is None
             is_latest = occ_id == str(row["latest_occurrence_id"])
             cur_ack_digest = str(row["ack_incoming_digest"] or "")
             try:
@@ -319,9 +331,11 @@ class IntakeDB:
                 if (cur_ack_digest and baseline_digest and cur_ack_digest == baseline_digest)
                 else None
             )
+            if not needs_occ_backfill and matched_old_ack is None:
+                continue
             new_cls = cur_cls
             new_diag: Optional[str] = None
-            if cur_cls == "movie_candidate":
+            if needs_occ_backfill and cur_cls == "movie_candidate":
                 reclassified = classify_webhook_payload(
                     raw_payload,
                     allowed_filter_names=allowed_filter_names,
@@ -330,7 +344,9 @@ class IntakeDB:
                 if reclassified.classification != "movie_candidate":
                     new_cls = "pre_upgrade_ineligible_scope"
                     new_diag = reclassified.diagnostic_note or "pre_upgrade_ineligible_scope"
-            updates.append((digest, new_cls, new_diag, occ_id, rel_id, is_latest, matched_old_ack))
+            updates.append(
+                (digest, new_cls, new_diag, occ_id, rel_id, needs_occ_backfill, is_latest, matched_old_ack)
+            )
 
         if not updates:
             return 0
@@ -338,26 +354,27 @@ class IntakeDB:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for digest, new_cls, new_diag, occ_id, rel_id, is_latest, matched_old_ack in updates:
-                conn.execute(
-                    """
-                    UPDATE occurrences
-                    SET incoming_evidence_digest = ?,
-                        classification = ?,
-                        diagnostic_note = COALESCE(diagnostic_note, ?)
-                    WHERE occurrence_id = ? AND incoming_evidence_digest IS NULL
-                    """,
-                    (digest, new_cls, new_diag, occ_id),
-                )
-                if is_latest:
+            for digest, new_cls, new_diag, occ_id, rel_id, needs_occ_backfill, is_latest, matched_old_ack in updates:
+                if needs_occ_backfill:
                     conn.execute(
                         """
-                        UPDATE releases
-                        SET incoming_evidence_digest = ?
-                        WHERE release_id = ? AND latest_occurrence_id = ?
+                        UPDATE occurrences
+                        SET incoming_evidence_digest = ?,
+                            classification = ?,
+                            diagnostic_note = COALESCE(diagnostic_note, ?)
+                        WHERE occurrence_id = ? AND incoming_evidence_digest IS NULL
                         """,
-                        (digest, rel_id, occ_id),
+                        (digest, new_cls, new_diag, occ_id),
                     )
+                    if is_latest:
+                        conn.execute(
+                            """
+                            UPDATE releases
+                            SET incoming_evidence_digest = ?
+                            WHERE release_id = ? AND latest_occurrence_id = ?
+                            """,
+                            (digest, rel_id, occ_id),
+                        )
                 if matched_old_ack is not None:
                     conn.execute(
                         """
@@ -827,23 +844,32 @@ class IntakeDB:
                     )
                     else None
                 )
-                has_undelivered_eligible_correction = (
-                    not never_processed
-                    and bool(cur_ack_incoming_digest)
-                    and latest_verified_eligible_occ is not None
-                    and str(latest_verified_eligible_occ["incoming_evidence_digest"])
-                    != cur_ack_incoming_digest
+                # PR #18 Round 7 Finding 1: A pre-upgrade acknowledged occurrence (e.g. A lacking
+                # today's structured REMUX processing metadata) may have been reclassified to
+                # `pre_upgrade_ineligible_scope` during migration while still proving which
+                # identity was actually sent. Verify the historical ack across both applied
+                # historical classifications while continuing to enforce current `movie_candidate`
+                # eligibility strictly on `latest_verified_eligible_occ` (the correction B).
+                verified_ack_exists = (
+                    bool(cur_ack_incoming_digest)
                     and conn.execute(
                         """
                         SELECT 1 FROM occurrences
                         WHERE release_id = ?
-                          AND classification = 'movie_candidate'
+                          AND classification IN ('movie_candidate', 'pre_upgrade_ineligible_scope')
                           AND incoming_evidence_digest = ?
                         LIMIT 1
                         """,
                         (release_id, cur_ack_incoming_digest),
                     ).fetchone()
                     is not None
+                )
+                has_undelivered_eligible_correction = (
+                    not never_processed
+                    and verified_ack_exists
+                    and latest_verified_eligible_occ is not None
+                    and str(latest_verified_eligible_occ["incoming_evidence_digest"])
+                    != cur_ack_incoming_digest
                 )
                 retrying_unsent_pre_upgrade_duplicate = (
                     latest_verified_eligible_occ is not None
@@ -869,20 +895,26 @@ class IntakeDB:
                 seen_prior_occurrence = (
                     not is_exact_latest_replay
                     and not retrying_unsent_pre_upgrade_duplicate
-                    and conn.execute(
-                        """
-                        SELECT 1 FROM occurrences
-                        WHERE release_id = ?
-                          AND classification = 'movie_candidate'
-                          AND (
-                              incoming_evidence_digest = ?
-                              OR archive_sha256 = ?
-                          )
-                        LIMIT 1
-                        """,
-                        (release_id, classified.incoming_evidence_digest, receipt.archive_sha256),
-                    ).fetchone()
-                    is not None
+                    and (
+                        (
+                            verified_ack_exists
+                            and cur_ack_incoming_digest == classified.incoming_evidence_digest
+                        )
+                        or conn.execute(
+                            """
+                            SELECT 1 FROM occurrences
+                            WHERE release_id = ?
+                              AND classification = 'movie_candidate'
+                              AND (
+                                  incoming_evidence_digest = ?
+                                  OR archive_sha256 = ?
+                              )
+                            LIMIT 1
+                            """,
+                            (release_id, classified.incoming_evidence_digest, receipt.archive_sha256),
+                        ).fetchone()
+                        is not None
+                    )
                 )
 
                 # PR #18 Round 2 Blocker 4 & Round 4 Finding 3: If any historical applied

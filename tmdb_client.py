@@ -1531,10 +1531,13 @@ class TmdbClient:
         primary_search_title = raw_title or query_title
         if primary_search_title:
             search_queries.append((primary_search_title, query_year))
-        for cand_title, cand_year in raw_candidates[1:]:
-            if cand_title and (cand_title, cand_year) not in search_queries:
-                search_queries.append((cand_title, cand_year))
+        if len(raw_candidates) > 1:
+            for cand_title, cand_year in raw_candidates:
+                if cand_title and (cand_title, cand_year) not in search_queries:
+                    search_queries.append((cand_title, cand_year))
 
+        consistent_matches: list[TmdbMovie] = []
+        seen_consistent_ids: set[int] = set()
         search_conflicts: list[str] = []
         for search_title, search_year in search_queries:
             if not search_title:
@@ -1558,17 +1561,40 @@ class TmdbClient:
                     audio_languages=audio_languages,
                 )
                 if search_conflict is None:
-                    # Genuinely consistent search result (can resolve a mistaken tracker ID
-                    # when a different film matches all release evidence). Still run Gemini
-                    # when tracker_conflict was present instead of serving from alias cache.
-                    return TmdbLookupResult(
-                        movie=searched,
-                        tracker_conflict=tracker_conflict,
-                        trusted_for_cache=tracker_conflict is None,
-                    )
-                search_conflicts.append(search_conflict)
+                    if searched.tmdb_id not in seen_consistent_ids:
+                        seen_consistent_ids.add(searched.tmdb_id)
+                        consistent_matches.append(searched)
+                else:
+                    search_conflicts.append(search_conflict)
 
-        if search_conflicts:
+        if len(consistent_matches) == 1:
+            # Single unambiguous consistent search result (can resolve a mistaken tracker ID
+            # when a different film matches all release evidence). Still run Gemini when
+            # tracker_conflict was present instead of serving from alias cache.
+            return TmdbLookupResult(
+                movie=consistent_matches[0],
+                tracker_conflict=tracker_conflict,
+                trusted_for_cache=tracker_conflict is None,
+            )
+
+        if len(consistent_matches) > 1:
+            # PR #18 Round 7 Finding 2: Multiple distinct catalogue films independently fit
+            # plausible readings of an ambiguous release filename with no deciding evidence.
+            # Refuse to pick one silently and withhold caching.
+            descs = ", ".join(
+                f"'{m.canonical_title}' ({m.year}, tmdb={m.tmdb_id})"
+                for m in consistent_matches
+            )
+            ambiguity_msg = (
+                f"Ambiguous release title/year matches multiple distinct catalogue films: {descs}"
+            )
+            logger.warning("Rejecting ambiguous TMDB search candidates: %s", ambiguity_msg)
+            tracker_conflict = (
+                f"{tracker_conflict}; {ambiguity_msg}"
+                if tracker_conflict and ambiguity_msg not in tracker_conflict
+                else (tracker_conflict or ambiguity_msg)
+            )
+        elif search_conflicts:
             first_conflict = search_conflicts[0]
             logger.warning("Rejecting inconsistent TMDB search candidate: %s", first_conflict)
             tracker_conflict = (

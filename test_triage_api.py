@@ -2873,6 +2873,115 @@ class TestTmdbAndEvaluate(unittest.TestCase):
             self.assertTrue(first.catalogue_identification.compatible)
             self.assertTrue(second.cached)
 
+    def test_pr18_r7_finding_2_ambiguous_dual_catalogue_films_withhold_trust(self) -> None:
+        """
+        PR #18 Round 7 Finding 2 (Triage):
+          When an ambiguous consecutive-year remastered filename (`Granite.Bay.1994.2022.Remastered`)
+          matches TWO distinct catalogue films across its plausible readings (`Granite Bay` (1994)
+          and `Granite Bay 1994` (2022)) with no deciding hint, runtime, or explicit ID, Triage MUST
+          check all plausible readings, report an ambiguity conflict, and withhold caching, while
+          continuing to accept single-film catalogues and evidence-resolved disambiguations.
+        """
+        import main
+        from schemas import TorrentInfo
+
+        def _film(
+            identifier: int,
+            title: str,
+            year: int,
+            *,
+            runtime: int = 103,
+            japanese: bool = False,
+        ) -> TmdbMovie:
+            return TmdbMovie(
+                tmdb_id=identifier,
+                imdb_id=f"tt{identifier:07d}",
+                canonical_title=title,
+                year=year,
+                director="Jane Cole",
+                runtime_minutes=runtime,
+                original_title="花崗岩湾" if japanese else title,
+                original_language="ja" if japanese else "en",
+            )
+
+        original = _film(31, "Granite Bay", 1994)
+        numbered = _film(32, "Granite Bay 1994", 2022)
+        numbered_long = _film(34, "Granite Bay 1994", 2022, runtime=145)
+        remake = _film(33, "Granite Bay", 2022, japanese=True)
+        release = "Granite.Bay.1994.2022.Remastered.1080p.BluRay.REMUX-Z"
+
+        def _assess(
+            label: str,
+            catalogue: list[TmdbMovie],
+            model_pick: TmdbMovie,
+            expected: bool,
+            *,
+            hint: Optional[str] = None,
+            year: Optional[int] = None,
+            tracker: Optional[int] = None,
+        ) -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                test_db = TriageDB(Path(tmpdir) / "triage.db")
+                test_db.init_db()
+                client = TmdbClient(api_key="fixture")
+                by_id = {m.tmdb_id: m for m in catalogue}
+
+                def _search(q_title: str, q_year: Optional[int] = None):
+                    return [
+                        {
+                            "id": m.tmdb_id,
+                            "title": m.canonical_title,
+                            "original_title": m.original_title,
+                            "release_date": f"{m.year}-05-05",
+                            "popularity": 10,
+                        }
+                        for m in catalogue
+                        if m.canonical_title.lower() == q_title.lower() and m.year == q_year
+                    ]
+
+                client._search_results = _search  # type: ignore[method-assign]
+                client._fetch_movie_details = by_id.__getitem__  # type: ignore[method-assign]
+                client._find_tmdb_id_by_imdb = lambda imdb: next(  # type: ignore[method-assign]
+                    (m.tmdb_id for m in catalogue if m.imdb_id == imdb),
+                    None,
+                )
+                req = EvaluateRequest(
+                    raw_text=release,
+                    hint_title=hint,
+                    hint_year=year,
+                    torrent_info=TorrentInfo(runtime_minutes=103, tmdb_id=tracker),
+                )
+                model = AsyncMock(
+                    return_value=_sample_payload(
+                        title=model_pick.canonical_title,
+                        year=model_pick.year,
+                        director=model_pick.director or "Jane Cole",
+                        runtime_minutes=103,
+                        imdb_id=model_pick.imdb_id or "tt0000031",
+                        tmdb_id=model_pick.tmdb_id,
+                    )
+                )
+                with (
+                    patch.object(main, "db", test_db),
+                    patch.object(main, "tmdb_client", client),
+                    patch.object(main.gemini_client, "evaluate", model),
+                ):
+                    first = asyncio.run(main.evaluate(req))
+                    repeat = asyncio.run(main.evaluate(req))
+                assert first.catalogue_identification is not None
+                self.assertEqual(first.catalogue_identification.compatible, expected, label)
+                self.assertEqual(repeat.cached, expected, label)
+
+        _assess("only original", [original], original, True)
+        _assess("only numeral title", [numbered], numbered, True)
+        _assess("two distinct matching films; no deciding evidence", [original, numbered], original, False)
+        _assess("two films, explicit ID selects numeral title", [original, numbered], numbered, True, tracker=numbered.tmdb_id)
+        _assess("two films, explicit hint selects original", [original, numbered], original, True, hint="Granite Bay", year=1994)
+        _assess("two films, explicit hint selects numeral title", [original, numbered], numbered, True, hint="Granite Bay 1994", year=2022)
+        _assess("two films, distinguishing runtime selects original", [original, numbered_long], original, True)
+        _assess("remake without numeral, year only", [remake], remake, False, year=2022, tracker=remake.tmdb_id)
+        _assess("same remake, parsed title hint contains original year", [remake], remake, False, hint="Granite Bay 1994", year=2022, tracker=remake.tmdb_id)
+
 
 if __name__ == "__main__":
     unittest.main()
