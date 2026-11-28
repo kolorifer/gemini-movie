@@ -38,7 +38,7 @@ class RadarrStatusResponse:
 
 @dataclass(frozen=True)
 class DeliveryCardResponse:
-    status: str  # delivered | ambiguous_delivery | failed
+    status: str  # delivered | locked_completed_radarr | ambiguous_delivery | failed
     ack_chat_id: Optional[str] = None
     ack_message_id: Optional[int] = None
     ack_thread_id: Optional[int] = None
@@ -308,7 +308,7 @@ class ActionsApiClient:
                 detail = redact_secrets(str(data.get("detail") or ""), max_chars=200) or None
                 if st == "failed":
                     return DeliveryCardResponse(status="failed", detail=detail)
-                if st == "delivered":
+                if st in ("delivered", "locked_completed_radarr"):
                     msg_id = self._parse_optional_int(data.get("ack_message_id"))
                     if msg_id is None or msg_id <= 0:
                         return DeliveryCardResponse(
@@ -319,6 +319,11 @@ class ActionsApiClient:
                     chat_id = str(raw_chat).strip() if raw_chat is not None else ""
                     thread_id = self._parse_optional_int(data.get("ack_thread_id"))
                     expected = card_payload.get("expected_ack")
+                    if st == "locked_completed_radarr" and (
+                        not isinstance(expected, dict) or type(data.get("ack_card_revision")) is not int
+                        or data["ack_card_revision"] != expected.get("revision")
+                    ):
+                        return DeliveryCardResponse(status="ambiguous_delivery", detail="original_card_ack_mismatch")
                     if expected is not None and (
                         not isinstance(expected, dict) or chat_id != expected.get("chat_id")
                         or msg_id != expected.get("message_id") or thread_id != expected.get("thread_id")
@@ -326,7 +331,7 @@ class ActionsApiClient:
                     ):
                         return DeliveryCardResponse(status="ambiguous_delivery", detail="original_card_ack_mismatch")
                     return DeliveryCardResponse(
-                        status="delivered",
+                        status=st,
                         ack_chat_id=chat_id,
                         ack_message_id=msg_id,
                         ack_thread_id=thread_id,

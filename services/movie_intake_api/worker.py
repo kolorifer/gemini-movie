@@ -591,7 +591,9 @@ class IntakeWorker:
             lease_seconds=self.config.worker_lease_seconds,
             new_state="delivering",
         )
-        ret_resp = await self.actions_client.deliver_card(retired_card)
+        ret_resp = await self._deliver_card_unless_locked(row, retired_card)
+        if ret_resp is None:
+            return
         if _is_ambiguous_card_ack(ret_resp):
             await asyncio.to_thread(
                 self.db.finalize_release,
@@ -662,17 +664,32 @@ class IntakeWorker:
             evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
         )
 
+    async def _deliver_card_unless_locked(
+        self, row: dict[str, Any], card: dict[str, Any],
+    ) -> Optional[DeliveryCardResponse]:
+        response = await self.actions_client.deliver_card(card)
+        if response.status != "locked_completed_radarr":
+            return response
+        # Actions verified the original receipt and kept that revision. Discard work
+        # for the proposed edit without recording a new card digest or posting its reply.
+        await asyncio.to_thread(
+            self.db.finalize_release, row["release_id"], worker_id=self.worker_id,
+            expected_incoming_digest=row["incoming_evidence_digest"], state="completed",
+            pending_card_supersede=None, pending_eval_reply=None, skip_pending_eval_reply=True,
+        )
+        return None
+
     async def _deliver_card_and_eval_reply(
         self,
         *,
-        release_id: str,
+        row: dict[str, Any],
         card_revision: int,
-        incoming_digest: str,
         card_payload: dict[str, Any],
         eval_payload: Optional[dict[str, Any]],
         eval_error: Optional[str],
         ack_metadata: Optional[dict[str, Any]] = None,
-    ) -> tuple[DeliveryCardResponse, Optional[DeliveryEvalResponse], Optional[dict[str, Any]]]:
+    ) -> tuple[Optional[DeliveryCardResponse], Optional[DeliveryEvalResponse], Optional[dict[str, Any]]]:
+        release_id = row["release_id"]
         await asyncio.to_thread(
             self.db.renew_lease,
             release_id,
@@ -680,8 +697,9 @@ class IntakeWorker:
             lease_seconds=self.config.worker_lease_seconds,
             new_state="delivering",
         )
-        card_resp = await self.actions_client.deliver_card(card_payload)
-        if card_resp.status != "delivered" or card_resp.ack_message_id is None or card_resp.ack_message_id <= 0:
+        card_resp = await self._deliver_card_unless_locked(row, card_payload)
+        if (card_resp is None or card_resp.status != "delivered" or card_resp.ack_message_id is None
+                or card_resp.ack_message_id <= 0):
             # Never post an unanchored reply when ack_message_id is missing / invalid / ambiguous_delivery
             return card_resp, None, None
 
@@ -704,7 +722,7 @@ class IntakeWorker:
             ack_chat_id=card_resp.ack_chat_id,
             ack_message_id=card_resp.ack_message_id,
             ack_thread_id=card_resp.ack_thread_id,
-            ack_incoming_digest=incoming_digest,
+            ack_incoming_digest=row["incoming_evidence_digest"],
             last_card_digest=compute_card_content_digest(card_payload),
             pending_eval_reply=reply_body,
             **(ack_metadata or {}),
@@ -798,10 +816,14 @@ class IntakeWorker:
         # Path A: Retry conflict-card supersession before allowing completion
         if raw_sup:
             supersede_card = json.loads(str(raw_sup))
+            # Supersessions saved by older workers also target an acknowledged card.
+            supersede_card.setdefault("expected_ack", _expected_card_ack(row))
             sup_card_digest = compute_card_content_digest(supersede_card)
             effective_rev = int(supersede_card.get("card_revision") or (int(row.get("card_revision") or 0) + 1))
             conflict_reason = supersede_card.get("conflict_reason")
-            sup_resp = await self.actions_client.deliver_card(supersede_card)
+            sup_resp = await self._deliver_card_unless_locked(row, supersede_card)
+            if sup_resp is None:
+                return True
             if _is_ambiguous_card_ack(sup_resp):
                 await asyncio.to_thread(
                     self.db.finalize_release,
@@ -1334,7 +1356,9 @@ class IntakeWorker:
                     lease_seconds=self.config.worker_lease_seconds,
                     new_state="delivering",
                 )
-                card_resp = await self.actions_client.deliver_card(card_payload)
+                card_resp = await self._deliver_card_unless_locked(row, card_payload)
+                if card_resp is None:
+                    return
                 if _is_ambiguous_card_ack(card_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
@@ -1441,7 +1465,9 @@ class IntakeWorker:
                         lease_seconds=self.config.worker_lease_seconds,
                         new_state="delivering",
                     )
-                    card_resp = await self.actions_client.deliver_card(card_payload)
+                    card_resp = await self._deliver_card_unless_locked(row, card_payload)
+                    if card_resp is None:
+                        return
                     if _is_ambiguous_card_ack(card_resp):
                         await asyncio.to_thread(
                             self.db.finalize_release,
@@ -1557,7 +1583,9 @@ class IntakeWorker:
                     "evaluation": eval_res.payload if eval_res.ok else None,
                     "error_redacted": None if eval_res.ok else eval_res.error_redacted,
                 }
-                sup_resp = await self.actions_client.deliver_card(supersede_card)
+                sup_resp = await self._deliver_card_unless_locked(row, supersede_card)
+                if sup_resp is None:
+                    return
                 if _is_ambiguous_card_ack(sup_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
@@ -1965,7 +1993,9 @@ class IntakeWorker:
                 lease_seconds=self.config.worker_lease_seconds,
                 new_state="delivering",
             )
-            card_resp = await self.actions_client.deliver_card(card_payload)
+            card_resp = await self._deliver_card_unless_locked(row, card_payload)
+            if card_resp is None:
+                return
             if _is_ambiguous_card_ack(card_resp):
                 await asyncio.to_thread(
                     self.db.finalize_release,
@@ -2118,9 +2148,8 @@ class IntakeWorker:
             reply_resp = await self.actions_client.deliver_evaluation(reply_body)
         else:
             card_resp, reply_resp, reply_body = await self._deliver_card_and_eval_reply(
-                release_id=release_id,
+                row=row,
                 card_revision=next_card_rev,
-                incoming_digest=expected_digest,
                 card_payload=card_payload,
                 eval_payload=eval_res.payload if eval_res.ok else None,
                 eval_error=None if eval_res.ok else eval_res.error_redacted,
@@ -2138,6 +2167,8 @@ class IntakeWorker:
                     "evaluation_json": eval_res.payload if eval_res.ok else None,
                 },
             )
+        if card_resp is None:
+            return
         if _is_ambiguous_card_ack(card_resp):
             await asyncio.to_thread(
                 self.db.finalize_release,

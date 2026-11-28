@@ -357,6 +357,8 @@ Once a movie identity is independently verified (either pre-evaluation on the fa
 
 Upgrade Actions before Intake for edit-only delivery support. On the first Intake upgrade, completed releases from the previous 24 hours can resume a timed-out lookup if the database retains the verified identity, matching source evidence, original Telegram receipt, and a sent evaluation reply. Recovery edits the acknowledged card in place and preserves its reply. A missing or mismatched receipt stops the edit.
 
+Intake saves the recovered Radarr result before requesting an edit. If Telegram definitively refuses an edit, Actions can retry the exact request against its original receipt. An uncertain Telegram outcome stops delivery. When an irreversible Radarr action already locks the card, Actions returns its existing receipt and Intake closes the correction at the original revision.
+
 1. **Prompt Card Delivery + Bound Evaluation Reply:**
    - **Fast path (pre-evaluation verified):** Deliver the actionable Telegram card immediately (< 2s after webhook), persist Telegram's exact `(ack_chat_id, ack_message_id, ack_thread_id)`, then call `movie-triage-api POST /evaluate` and deliver the evaluation summary (or redacted error) as a reply to that exact `(ack_chat_id, ack_message_id, ack_thread_id)`.
    - **Unresolved / conflicted path:** Evaluate first (so `movie-triage-api` can attempt resolution and so newly verified watched/owned movies are still suppressed before delivery), run the independent verification gate + Radarr check, then deliver either the verified actionable card or the `evidence_review` card and immediately post the evaluation (or redacted error) as a reply to its persisted `(ack_chat_id, ack_message_id, ack_thread_id)`.

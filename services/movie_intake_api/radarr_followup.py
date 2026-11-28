@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from .classifier import ClassifiedWebhook, classify_rejection_reasons
+from .clients import RadarrStatusResponse
 from .radarr_retry import MAX_RADARR_ATTEMPTS, is_lookup_timeout
 from .tmdb_verifier import IdentityGateResult, TmdbMovieRecord
 from .torrentleech import TorrentLeechResult
@@ -22,11 +23,12 @@ async def resume_legacy(worker: IntakeWorker, row: dict[str, Any], checkpoint: d
     source = checkpoint["source_occurrence_id"]
     attempts = checkpoint["attempts"]
 
-    async def lease(state: str) -> bool:
+    async def lease(state: str, completed_lookup: dict[str, Any] | None = None) -> bool:
         return await asyncio.to_thread(
             worker.db.renew_lease, release_id, worker_id=worker.worker_id,
             lease_seconds=worker.config.worker_lease_seconds, new_state=state,
             expected_incoming_digest=digest, expected_source_occurrence_id=source,
+            completed_radarr_checkpoint=completed_lookup,
         )
 
     async def finish(state: str, **fields: Any) -> None:
@@ -39,22 +41,28 @@ async def resume_legacy(worker: IntakeWorker, row: dict[str, Any], checkpoint: d
             or int(row.get("ack_message_id") or 0) <= 0 or row["card_revision"] < 1
             or row.get("identity_gate_status") != "verified" or row.get("identity_conflict_reason")
             or not row.get("verified_title") or not row.get("verified_tmdb_id")
-            or row.get("eval_reply_status") != "sent" or attempts >= MAX_RADARR_ATTEMPTS):
+            or row.get("eval_reply_status") != "sent"
+            or ("lookup_result" not in checkpoint and attempts >= MAX_RADARR_ATTEMPTS)):
         await finish("completed")
         return
 
     movie = TmdbMovieRecord(tmdb_id=row["verified_tmdb_id"], imdb_id=row.get("verified_imdb_id"),
                             title=row["verified_title"], year=row.get("verified_year"))
     classified = ClassifiedWebhook.from_sanitized_snapshot(json.loads(row["incoming_snapshot_json"]), digest)
-    radarr = await worker.actions_client.get_radarr_status(
-        tmdb_id=movie.tmdb_id, imdb_id=movie.imdb_id, release_title=movie.title,
-    )
-    attempts += 1
-    if is_lookup_timeout(radarr) and attempts < MAX_RADARR_ATTEMPTS:
-        await asyncio.to_thread(worker.db.defer_radarr_retry, release_id, worker_id=worker.worker_id,
-                                expected_incoming_digest=digest, checkpoint={**checkpoint, "attempts": attempts},
-                                next_attempt_at=worker._radarr_retry_at(attempts))
-        return
+    completed_lookup = None
+    if "lookup_result" in checkpoint:
+        radarr = RadarrStatusResponse(**checkpoint["lookup_result"])
+    else:
+        radarr = await worker.actions_client.get_radarr_status(
+            tmdb_id=movie.tmdb_id, imdb_id=movie.imdb_id, release_title=movie.title,
+        )
+        attempts += 1
+        if is_lookup_timeout(radarr) and attempts < MAX_RADARR_ATTEMPTS:
+            await asyncio.to_thread(worker.db.defer_radarr_retry, release_id, worker_id=worker.worker_id,
+                                    expected_incoming_digest=digest, checkpoint={**checkpoint, "attempts": attempts},
+                                    next_attempt_at=worker._radarr_retry_at(attempts))
+            return
+        completed_lookup = {**checkpoint, "attempts": attempts, "lookup_result": radarr.to_dict()}
     if radarr.status in ("lookup_failed", "ambiguous"):
         # The existing review already withholds every action. Do not send another warning/reply.
         await finish("completed", radarr_status_snapshot=radarr.to_dict())
@@ -81,10 +89,16 @@ async def resume_legacy(worker: IntakeWorker, row: dict[str, Any], checkpoint: d
     card["preserve_eval_reply"] = True
     card["expected_ack"] = {"chat_id": row["ack_chat_id"], "message_id": row["ack_message_id"],
                             "revision": row["card_revision"], "thread_id": row.get("ack_thread_id")}
-    if not await lease("delivering"):
+    if not await lease("delivering", completed_lookup):
         return
-    receipt = await worker.actions_client.deliver_card(card)
+    receipt = await worker._deliver_card_unless_locked(row, card)
+    if receipt is None:
+        return
     if receipt.status == "failed":
+        if receipt.detail in ("actions_connect_error", "telegram_connect_error") and row["retry_count"] < 4:
+            await finish("queued", next_attempt_at=worker._retry_next_attempt_iso(), increment_retry=True,
+                         radarr_status_snapshot=radarr.to_dict())
+            return
         await finish("failed_terminal", radarr_status_snapshot=radarr.to_dict())
     elif (receipt.status != "delivered" or receipt.ack_message_id != row["ack_message_id"]
           or receipt.ack_chat_id != row["ack_chat_id"] or receipt.ack_thread_id != row.get("ack_thread_id")):

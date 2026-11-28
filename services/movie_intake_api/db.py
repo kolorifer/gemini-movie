@@ -1563,6 +1563,7 @@ class IntakeDB:
         next_attempt_at: Optional[str] = None,
         increment_retry: bool = False,
         reset_retry: bool = False,
+        skip_pending_eval_reply: bool = False,
         allow_downgrade_on_conflict: bool = False,
     ) -> str:
         """
@@ -1648,6 +1649,8 @@ class IntakeDB:
                 card_revision if card_revision is not None else int(cur_row["card_revision"])
             )
             final_eval_reply_status = eval_reply_status or str(cur_row["eval_reply_status"])
+            if skip_pending_eval_reply and final_eval_reply_status == "pending":
+                final_eval_reply_status = "skipped"
             final_last_card_digest = (
                 last_card_digest if last_card_digest is not None else cur_row["last_card_digest"]
             )

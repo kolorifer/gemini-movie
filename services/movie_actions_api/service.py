@@ -721,8 +721,17 @@ class ActionsService:
             edit_digest=edit_digest,
         )
 
-        if plan.mode == "receipt_mismatch" or (expected_ack and plan.mode == "locked_completed_radarr"):
+        if plan.mode == "receipt_mismatch":
             return {"status": "failed", "detail": "original_card_edit_refused"}
+        if plan.mode == "locked_completed_radarr" and expected_ack:
+            # An irreversible action won the race. Acknowledge only the original card.
+            return {
+                "status": "locked_completed_radarr",
+                "ack_chat_id": plan.ack_chat_id,
+                "ack_message_id": plan.ack_message_id,
+                "ack_thread_id": plan.ack_thread_id,
+                "ack_card_revision": plan.previous_card_revision,
+            }
         if plan.mode in ("already_delivered", "locked_completed_radarr"):
             return {
                 "status": "delivered",
