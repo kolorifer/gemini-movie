@@ -172,6 +172,7 @@ class ActionsDB:
                     ack_message_id                  INTEGER,
                     ack_thread_id                   INTEGER,
                     used_poster                     INTEGER NOT NULL DEFAULT 0,
+                    confirmed_edit_digest           TEXT,
                     eval_reply_status               TEXT NOT NULL DEFAULT 'pending',
                     eval_reply_card_revision        INTEGER NOT NULL DEFAULT 0,
                     eval_reply_attempt_id           TEXT,
@@ -191,6 +192,8 @@ class ActionsDB:
             }
             if "eval_reply_attempt_id" not in existing_del_cols:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN eval_reply_attempt_id TEXT;")
+            if "confirmed_edit_digest" not in existing_del_cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN confirmed_edit_digest TEXT;")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS actions (
@@ -548,6 +551,8 @@ class ActionsDB:
         process_instance_id: str,
         lease_expires_at: str,
         new_actions: list[NewActionRecord],
+        expected_ack: Optional[dict[str, Any]] = None,
+        edit_digest: Optional[str] = None,
     ) -> CardDeliveryPlan:
         now_iso = utc_now_iso()
         conn = self._connect()
@@ -563,6 +568,21 @@ class ActionsDB:
                 "SELECT * FROM deliveries WHERE release_id = ?",
                 (release_id,),
             ).fetchone()
+
+            # An edit-only request must never fall through to the fresh-card send path.
+            if expected_ack is not None:
+                exact_replay = (
+                    row is not None and row["status"] == "delivered"
+                    and row["card_revision"] == card_revision and row["delivery_kind"] == delivery_kind
+                    and edit_digest is not None and edit_digest == row["confirmed_edit_digest"]
+                )
+                if (row is None or row["status"] not in ("delivered", "edit_failed")
+                        or row["ack_chat_id"] != expected_ack["chat_id"]
+                        or row["ack_thread_id"] != expected_ack["thread_id"]
+                        or row["ack_message_id"] != expected_ack["message_id"]
+                        or (row["card_revision"] != expected_ack["revision"] and not exact_replay)):
+                    conn.execute("COMMIT;")
+                    return CardDeliveryPlan(mode="receipt_mismatch")
 
             if row is not None:
                 status = str(row["status"])
@@ -837,6 +857,7 @@ class ActionsDB:
         used_poster: bool,
         is_edit: bool,
         preserve_eval_reply: bool = False,
+        confirmed_edit_digest: Optional[str] = None,
     ) -> bool:
         now_iso = utc_now_iso()
         conn = self._connect()
@@ -865,6 +886,7 @@ class ActionsDB:
                             ack_thread_id = ?,
                             used_poster = ?,
                             eval_reply_card_revision = ?,
+                            confirmed_edit_digest = ?,
                             last_error_redacted = NULL,
                             updated_at = ?
                         WHERE release_id = ?
@@ -877,6 +899,7 @@ class ActionsDB:
                             ack_thread_id,
                             1 if used_poster else 0,
                             card_revision,
+                            confirmed_edit_digest,
                             now_iso,
                             release_id,
                         ),
@@ -901,6 +924,7 @@ class ActionsDB:
                             eval_reply_lease_expires_at = NULL,
                             eval_reply_message_id = NULL,
                             eval_doc_message_id = NULL,
+                            confirmed_edit_digest = ?,
                             last_error_redacted = NULL,
                             updated_at = ?
                         WHERE release_id = ?
@@ -913,6 +937,7 @@ class ActionsDB:
                             ack_thread_id,
                             1 if used_poster else 0,
                             card_revision,
+                            confirmed_edit_digest,
                             now_iso,
                             release_id,
                         ),

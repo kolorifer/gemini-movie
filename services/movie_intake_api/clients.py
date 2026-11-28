@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -251,6 +252,9 @@ class ActionsApiClient:
                 alternative_grab_configured=alt_cfg,
                 detail=redact_secrets(str(data.get("detail") or ""), max_chars=200) or None,
             )
+        except httpx.TimeoutException as exc:
+            # Persist the failure class even when the transport supplies free-form error text.
+            return RadarrStatusResponse(status="lookup_failed", detail=type(exc).__name__)
         except Exception as exc:
             return RadarrStatusResponse(
                 status="lookup_failed",
@@ -283,7 +287,9 @@ class ActionsApiClient:
             else httpx.AsyncClient(follow_redirects=False, timeout=self.timeout_seconds)
         )
         try:
-            resp = await client.post(
+            # Older Actions deployments reject PUT; they cannot accidentally send a new card.
+            request = client.put if "expected_ack" in card_payload else client.post
+            resp = await request(
                 f"{self.base_url}/internal/deliver/card",
                 json=card_payload,
                 headers=self._headers(),
@@ -312,6 +318,13 @@ class ActionsApiClient:
                     raw_chat = data.get("ack_chat_id")
                     chat_id = str(raw_chat).strip() if raw_chat is not None else ""
                     thread_id = self._parse_optional_int(data.get("ack_thread_id"))
+                    expected = card_payload.get("expected_ack")
+                    if expected is not None and (
+                        not isinstance(expected, dict) or chat_id != expected.get("chat_id")
+                        or msg_id != expected.get("message_id") or thread_id != expected.get("thread_id")
+                        or "ack_thread_id" not in data or (data["ack_thread_id"] is not None and thread_id is None)
+                    ):
+                        return DeliveryCardResponse(status="ambiguous_delivery", detail="original_card_ack_mismatch")
                     return DeliveryCardResponse(
                         status="delivered",
                         ack_chat_id=chat_id,
@@ -422,6 +435,8 @@ class ShadowStubActionsClient(ActionsApiClient):
         self.eval_reply_calls: list[dict[str, Any]] = []
         self._next_msg_id = 1000
         self._delivered_by_release: dict[str, DeliveryCardResponse] = {}
+        self._card_revisions: dict[str, int] = {}
+        self._confirmed_edits: dict[str, dict[str, Any]] = {}
         self._eval_sent_releases: set[str] = set()
 
     async def get_capabilities(self) -> Optional[bool]:
@@ -445,8 +460,23 @@ class ShadowStubActionsClient(ActionsApiClient):
     async def deliver_card(self, card_payload: dict[str, Any]) -> DeliveryCardResponse:
         self.card_calls.append(dict(card_payload))
         rel_id = str(card_payload["release_id"])
-        if rel_id in self._delivered_by_release:
-            prev = self._delivered_by_release[rel_id]
+        previous = self._delivered_by_release.get(rel_id)
+        if "expected_ack" in card_payload:
+            revision = self._card_revisions.get(rel_id)
+            exact_replay = self._confirmed_edits.get(rel_id) == card_payload
+            if not exact_replay and (
+                    previous is None or revision is None or card_payload.get("card_revision") != revision + 1
+                    or card_payload["expected_ack"] != {
+                        "chat_id": previous.ack_chat_id, "message_id": previous.ack_message_id,
+                        "thread_id": previous.ack_thread_id, "revision": revision,
+                    }):
+                return DeliveryCardResponse(status="failed", detail="original_card_edit_refused")
+            self._confirmed_edits[rel_id] = copy.deepcopy(card_payload)
+        else:
+            self._confirmed_edits.pop(rel_id, None)
+        self._card_revisions[rel_id] = int(card_payload["card_revision"])
+        if previous is not None:
+            prev = previous
             preserved = bool(
                 card_payload.get("preserve_eval_reply") is True and rel_id in self._eval_sent_releases
             )
