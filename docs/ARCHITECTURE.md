@@ -125,6 +125,7 @@ CREATE TABLE releases (
     verified_imdb_id           TEXT,
     verified_title             TEXT,
     verified_year              INTEGER,
+    pending_radarr_retry_json  TEXT,             -- verified identity and retry progress for this source occurrence
     radarr_status_snapshot     TEXT,             -- JSON: sanitized read-only Radarr check outcome (no keys/URLs)
     evaluation_json            TEXT,             -- JSON: sanitized movie-triage-api response (no secrets)
     created_at                 TEXT NOT NULL,
@@ -348,10 +349,15 @@ Once a movie identity is independently verified (either pre-evaluation on the fa
 | `unmonitored_no_file` (unmonitored, no file, no `watched` tag) | Exact verified match | Suppress before delivery and record `unmonitored_no_file`. A pre-evaluation match also skips Gemini. |
 | `monitored_no_file` (`monitored == true`, `hasFile == false`, no `watched` tag) | Verified release | **Do NOT suppress** (monitoring alone proves neither ownership nor viewing). Deliver actionable card explicitly labeled `"Monitored in Radarr (no file yet)"` + evaluation reply. |
 | `absent` (confirmed live Radarr check returned zero matching movies) | Verified release | Deliver actionable card to `TELEGRAM_ADD_GRAB_TOPIC_ID` (fallback `TELEGRAM_TOPIC_ID`) with `Add & Grab`, `Watched – Good`, `Watched – Bad` (and optional `Skip`) + evaluation reply. |
-| `lookup_failed` or `ambiguous` (Radarr unreachable, timeout, or ambiguous match) | Any | **Do NOT treat as absent.** Do NOT silently suppress or mint unchecked grab assumptions. Deliver `evidence_review` card (or deferred/warning notice clearly stating Radarr status could not be verified) + evaluation reply. |
+| Timed-out lookup, including HTTP 408 or 504 | Verified movie | Retry the read twice, by default after 30 and 60 seconds. Intake saves the verified identity, source occurrence, and any completed evaluation in SQLite before waiting. An unchanged release resumes at the Radarr lookup after restart. If all three reads time out, deliver one `evidence_review` card with no action buttons. |
+| Other `lookup_failed` or `ambiguous` result | Any | Deliver an `evidence_review` card explaining that the Radarr status could not be verified, plus its evaluation reply. |
 | *Unresolved / Identity Conflict* (`identity_gate_status == "evidence_review"`) | Any | Never suppress via guessed Radarr lookup; never mint Alternative Grab buttons. Deliver `evidence_review` card (0 buttons; shows observed evidence & conflict summary) to `TELEGRAM_TOPIC_ID` (or `TELEGRAM_GRAB_ANYWAY_TOPIC_ID` when an eligible rejected release fails verification) + evaluation/redacted error reply. |
 
 ### 5.4 Two-Phase Prompt Delivery, Formatting & Replies (`movie-actions-api`)
+
+Upgrade Actions before Intake for edit-only delivery support. On the first Intake upgrade, completed releases from the previous 24 hours can resume a timed-out lookup if the database retains the verified identity, matching source evidence, original Telegram receipt, and a sent evaluation reply. Recovery edits the acknowledged card in place and preserves its reply. A missing or mismatched receipt stops the edit.
+
+Intake saves the recovered Radarr result before requesting an edit. If Telegram definitively refuses an edit, Actions can retry or replace it using the original receipt and the same target revision. This allows a newer correction or a watched-movie retirement to reach the existing message. Once Telegram confirms an edit, only identical content can reuse its receipt. An uncertain Telegram outcome stops delivery. When an irreversible Radarr action already locks the card, Actions returns its existing receipt and Intake closes the correction at the original revision.
 
 1. **Prompt Card Delivery + Bound Evaluation Reply:**
    - **Fast path (pre-evaluation verified):** Deliver the actionable Telegram card immediately (< 2s after webhook), persist Telegram's exact `(ack_chat_id, ack_message_id, ack_thread_id)`, then call `movie-triage-api POST /evaluate` and deliver the evaluation summary (or redacted error) as a reply to that exact `(ack_chat_id, ack_message_id, ack_thread_id)`.

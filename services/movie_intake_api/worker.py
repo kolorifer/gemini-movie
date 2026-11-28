@@ -20,6 +20,8 @@ from .clients import (
 )
 from .config import IntakeConfig
 from .db import IntakeDB, utc_now, utc_now_iso
+from .radarr_retry import MAX_RADARR_ATTEMPTS, identification_checkpoint, is_lookup_timeout, restore_gate
+from .radarr_followup import resume_legacy
 from .security import redact_secrets
 from .tmdb_verifier import (
     IdentityGateResult,
@@ -38,8 +40,15 @@ from .torrentleech import (
 logger = logging.getLogger(__name__)
 
 _CARD_DIGEST_EXCLUDED_KEYS = frozenset(
-    {"card_revision", "source_occurrence_id", "preferred_topic_kind", "preserve_eval_reply"}
+    {"card_revision", "source_occurrence_id", "preferred_topic_kind", "preserve_eval_reply", "expected_ack"}
 )
+
+
+def _expected_card_ack(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "chat_id": row["ack_chat_id"], "message_id": row["ack_message_id"],
+        "thread_id": row.get("ack_thread_id"), "revision": row["card_revision"],
+    }
 
 
 def compute_card_content_digest(card_payload: dict[str, Any]) -> str:
@@ -546,6 +555,7 @@ class IntakeWorker:
         if isinstance(eff_year, int) and not isinstance(eff_year, bool):
             retired_card["verified_year"] = eff_year
 
+        retired_card["expected_ack"] = _expected_card_ack(row)
         retired_digest = compute_card_content_digest(retired_card)
         prev_card_digest = str(row.get("last_card_digest") or "") or None
         if prev_card_digest == retired_digest and str(row.get("suppression_reason") or "") == suppression_reason:
@@ -581,7 +591,9 @@ class IntakeWorker:
             lease_seconds=self.config.worker_lease_seconds,
             new_state="delivering",
         )
-        ret_resp = await self.actions_client.deliver_card(retired_card)
+        ret_resp = await self._deliver_card_unless_locked(row, retired_card)
+        if ret_resp is None:
+            return
         if _is_ambiguous_card_ack(ret_resp):
             await asyncio.to_thread(
                 self.db.finalize_release,
@@ -652,17 +664,32 @@ class IntakeWorker:
             evaluation_json=eval_res.payload if (eval_res is not None and eval_res.ok) else None,
         )
 
+    async def _deliver_card_unless_locked(
+        self, row: dict[str, Any], card: dict[str, Any],
+    ) -> Optional[DeliveryCardResponse]:
+        response = await self.actions_client.deliver_card(card)
+        if response.status != "locked_completed_radarr":
+            return response
+        # Actions verified the original receipt and kept that revision. Discard work
+        # for the proposed edit without recording a new card digest or posting its reply.
+        await asyncio.to_thread(
+            self.db.finalize_release, row["release_id"], worker_id=self.worker_id,
+            expected_incoming_digest=row["incoming_evidence_digest"], state="completed",
+            pending_card_supersede=None, pending_eval_reply=None, skip_pending_eval_reply=True,
+        )
+        return None
+
     async def _deliver_card_and_eval_reply(
         self,
         *,
-        release_id: str,
+        row: dict[str, Any],
         card_revision: int,
-        incoming_digest: str,
         card_payload: dict[str, Any],
         eval_payload: Optional[dict[str, Any]],
         eval_error: Optional[str],
         ack_metadata: Optional[dict[str, Any]] = None,
-    ) -> tuple[DeliveryCardResponse, Optional[DeliveryEvalResponse], Optional[dict[str, Any]]]:
+    ) -> tuple[Optional[DeliveryCardResponse], Optional[DeliveryEvalResponse], Optional[dict[str, Any]]]:
+        release_id = row["release_id"]
         await asyncio.to_thread(
             self.db.renew_lease,
             release_id,
@@ -670,8 +697,9 @@ class IntakeWorker:
             lease_seconds=self.config.worker_lease_seconds,
             new_state="delivering",
         )
-        card_resp = await self.actions_client.deliver_card(card_payload)
-        if card_resp.status != "delivered" or card_resp.ack_message_id is None or card_resp.ack_message_id <= 0:
+        card_resp = await self._deliver_card_unless_locked(row, card_payload)
+        if (card_resp is None or card_resp.status != "delivered" or card_resp.ack_message_id is None
+                or card_resp.ack_message_id <= 0):
             # Never post an unanchored reply when ack_message_id is missing / invalid / ambiguous_delivery
             return card_resp, None, None
 
@@ -694,7 +722,7 @@ class IntakeWorker:
             ack_chat_id=card_resp.ack_chat_id,
             ack_message_id=card_resp.ack_message_id,
             ack_thread_id=card_resp.ack_thread_id,
-            ack_incoming_digest=incoming_digest,
+            ack_incoming_digest=row["incoming_evidence_digest"],
             last_card_digest=compute_card_content_digest(card_payload),
             pending_eval_reply=reply_body,
             **(ack_metadata or {}),
@@ -704,6 +732,48 @@ class IntakeWorker:
 
     def _retry_next_attempt_iso(self) -> str:
         return utc_now_iso(utc_now() + timedelta(seconds=self.config.retry_backoff_seconds))
+
+    def _radarr_retry_at(self, attempts: int) -> str:
+        delay = self.config.retry_backoff_seconds * attempts
+        return utc_now_iso(utc_now() + timedelta(seconds=delay))
+
+    async def _lookup_verified_status(
+        self, row: dict[str, Any], tl: TorrentLeechResult, pre_gate: IdentityGateResult,
+        gate: IdentityGateResult, evaluation: Optional[TriageEvalResult], checkpoint: Optional[dict[str, Any]],
+    ) -> Optional[RadarrStatusResponse]:
+        """Return None when the claim has been deferred or superseded."""
+        movie = gate.verified_movie
+        if movie is None or gate.status != "verified":
+            raise ValueError("Radarr lookup requires a verified movie")
+        completed_checkpoint = None
+        if checkpoint and "lookup_result" in checkpoint:
+            # Definite card failures and orphan recovery resume delivery of this result.
+            radarr = RadarrStatusResponse(**checkpoint["lookup_result"])
+        else:
+            radarr = await self.actions_client.get_radarr_status(
+                tmdb_id=movie.tmdb_id, imdb_id=movie.imdb_id, release_title=movie.title,
+            )
+            attempts = int(checkpoint["attempts"]) + 1 if checkpoint else 1
+            if is_lookup_timeout(radarr) and attempts < MAX_RADARR_ATTEMPTS:
+                data = identification_checkpoint(tl, pre_gate, gate, evaluation)
+                await asyncio.to_thread(
+                    self.db.defer_radarr_retry, row["release_id"], worker_id=self.worker_id,
+                    expected_incoming_digest=row["incoming_evidence_digest"],
+                    checkpoint={"mode": "identified", "source_occurrence_id": row["source_occurrence_id"],
+                                "incoming_digest": row["incoming_evidence_digest"], "attempts": attempts,
+                                **data}, next_attempt_at=self._radarr_retry_at(attempts),
+                )
+                return None
+            if checkpoint:
+                completed_checkpoint = {**checkpoint, "attempts": attempts, "lookup_result": radarr.to_dict()}
+        current = await asyncio.to_thread(
+            self.db.renew_lease, row["release_id"], worker_id=self.worker_id,
+            lease_seconds=self.config.worker_lease_seconds,
+            expected_incoming_digest=row["incoming_evidence_digest"],
+            expected_source_occurrence_id=row["source_occurrence_id"],
+            completed_radarr_checkpoint=completed_checkpoint,
+        )
+        return radarr if current else None
 
     async def _process_pending_followups(self, row: dict[str, Any]) -> bool:
         """
@@ -746,10 +816,14 @@ class IntakeWorker:
         # Path A: Retry conflict-card supersession before allowing completion
         if raw_sup:
             supersede_card = json.loads(str(raw_sup))
+            # Supersessions saved by older workers also target an acknowledged card.
+            supersede_card.setdefault("expected_ack", _expected_card_ack(row))
             sup_card_digest = compute_card_content_digest(supersede_card)
             effective_rev = int(supersede_card.get("card_revision") or (int(row.get("card_revision") or 0) + 1))
             conflict_reason = supersede_card.get("conflict_reason")
-            sup_resp = await self.actions_client.deliver_card(supersede_card)
+            sup_resp = await self._deliver_card_unless_locked(row, supersede_card)
+            if sup_resp is None:
+                return True
             if _is_ambiguous_card_ack(sup_resp):
                 await asyncio.to_thread(
                     self.db.finalize_release,
@@ -950,6 +1024,15 @@ class IntakeWorker:
         snap = json.loads(str(row["incoming_snapshot_json"]))
         classified = ClassifiedWebhook.from_sanitized_snapshot(snap, expected_digest)
 
+        checkpoint = json.loads(row["pending_radarr_retry_json"]) if row.get("pending_radarr_retry_json") else None
+        if checkpoint and (checkpoint["source_occurrence_id"] != source_occurrence_id
+                           or checkpoint["incoming_digest"] != expected_digest):
+            # A materially changed occurrence must pass the normal admission and identity checks.
+            checkpoint = None
+        if checkpoint and checkpoint["mode"] == "acknowledged":
+            await resume_legacy(self, row, checkpoint)
+            return
+
         # Step 1: Routine quality rejection early check (§5.1 Step 3 + legacy Grab Anyway capability check)
         rej_mode, rej_class = classify_rejection_reasons(classified)
         if rej_mode == "quality_rejected_suppress":
@@ -1054,29 +1137,33 @@ class IntakeWorker:
             self.config.tl_metadata_enabled
             and classified.indexer_norm == "torrentleech"
         )
-        tl_result = await self.tl_scraper.fetch_listing(
-            indexer_norm=classified.indexer_norm,
-            external_id=classified.external_id_norm,
-            exact_release_name=classified.exact_release_name,
-        )
+        if checkpoint:
+            tl_result = TorrentLeechResult(**checkpoint["listing"])
+            pre_gate = restore_gate(checkpoint["pre_gate"])
+        else:
+            tl_result = await self.tl_scraper.fetch_listing(
+                indexer_norm=classified.indexer_norm,
+                external_id=classified.external_id_norm,
+                exact_release_name=classified.exact_release_name,
+            )
 
-        # Step 3: Check whether pre-evaluation source IDs independently pass all 6 gate checks
-        pre_imdb = tl_result.imdb_id or classified.meta_imdb
-        pre_tmdb = classified.meta_tmdb
-        pre_gate = await run_independent_identity_gate(
-            tmdb_client=self.tmdb_client,
-            exact_release_name=classified.exact_release_name,
-            proposed_imdb_id=pre_imdb,
-            proposed_tmdb_id=pre_tmdb,
-            proposal_confidence=None,
-            from_evaluator=False,
-            tl_applicable=tl_applicable,
-            tl_outcome=tl_result.outcome,
-            observed_meta_imdb=classified.meta_imdb,
-            observed_meta_tmdb=classified.meta_tmdb,
-            observed_tl_imdb=tl_result.imdb_id,
-            file_runtime_minutes=tl_result.file_runtime_minutes,
-        )
+            # Step 3: Check whether pre-evaluation source IDs independently pass all 6 gate checks
+            pre_imdb = tl_result.imdb_id or classified.meta_imdb
+            pre_tmdb = classified.meta_tmdb
+            pre_gate = await run_independent_identity_gate(
+                tmdb_client=self.tmdb_client,
+                exact_release_name=classified.exact_release_name,
+                proposed_imdb_id=pre_imdb,
+                proposed_tmdb_id=pre_tmdb,
+                proposal_confidence=None,
+                from_evaluator=False,
+                tl_applicable=tl_applicable,
+                tl_outcome=tl_result.outcome,
+                observed_meta_imdb=classified.meta_imdb,
+                observed_meta_tmdb=classified.meta_tmdb,
+                observed_tl_imdb=tl_result.imdb_id,
+                file_runtime_minutes=tl_result.file_runtime_minutes,
+            )
 
         prev_verified_conflict_reasons: list[str] = []
         if has_acknowledged_verified_card:
@@ -1142,11 +1229,9 @@ class IntakeWorker:
         # =====================================================================
         if pre_gate.status == "verified" and pre_gate.verified_movie is not None:
             movie = pre_gate.verified_movie
-            radarr = await self.actions_client.get_radarr_status(
-                tmdb_id=movie.tmdb_id,
-                imdb_id=movie.imdb_id,
-                release_title=movie.title,
-            )
+            radarr = await self._lookup_verified_status(row, tl_result, pre_gate, pre_gate, None, checkpoint)
+            if radarr is None:
+                return
             delivery_mode, suppression_reason, radarr_note = self._decide_radarr_outcome(
                 radarr=radarr,
                 alt_grab_eligible=alt_grab_eligible,
@@ -1205,6 +1290,8 @@ class IntakeWorker:
                 alt_rejection_class=rej_class,
                 preferred_topic_kind=preferred_topic_kind,
             )
+            if has_acknowledged_card:
+                card_payload["expected_ack"] = _expected_card_ack(row)
             candidate_card_digest = compute_card_content_digest(card_payload)
             card_unchanged = (
                 has_acknowledged_card
@@ -1269,7 +1356,9 @@ class IntakeWorker:
                     lease_seconds=self.config.worker_lease_seconds,
                     new_state="delivering",
                 )
-                card_resp = await self.actions_client.deliver_card(card_payload)
+                card_resp = await self._deliver_card_unless_locked(row, card_payload)
+                if card_resp is None:
+                    return
                 if _is_ambiguous_card_ack(card_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
@@ -1376,7 +1465,9 @@ class IntakeWorker:
                         lease_seconds=self.config.worker_lease_seconds,
                         new_state="delivering",
                     )
-                    card_resp = await self.actions_client.deliver_card(card_payload)
+                    card_resp = await self._deliver_card_unless_locked(row, card_payload)
+                    if card_resp is None:
+                        return
                     if _is_ambiguous_card_ack(card_resp):
                         await asyncio.to_thread(
                             self.db.finalize_release,
@@ -1478,6 +1569,10 @@ class IntakeWorker:
                     alt_rejection_class=None,
                     preferred_topic_kind=preferred_topic_kind,
                 )
+                supersede_card["expected_ack"] = {
+                    "chat_id": card_resp.ack_chat_id, "message_id": card_resp.ack_message_id,
+                    "thread_id": card_resp.ack_thread_id, "revision": next_card_rev,
+                }
                 supersede_card_digest = compute_card_content_digest(supersede_card)
                 pending_reply_for_sup: dict[str, Any] = {
                     "release_id": release_id,
@@ -1488,7 +1583,9 @@ class IntakeWorker:
                     "evaluation": eval_res.payload if eval_res.ok else None,
                     "error_redacted": None if eval_res.ok else eval_res.error_redacted,
                 }
-                sup_resp = await self.actions_client.deliver_card(supersede_card)
+                sup_resp = await self._deliver_card_unless_locked(row, supersede_card)
+                if sup_resp is None:
+                    return
                 if _is_ambiguous_card_ack(sup_resp):
                     await asyncio.to_thread(
                         self.db.finalize_release,
@@ -1661,7 +1758,9 @@ class IntakeWorker:
             and isinstance(prev_eval_payload, dict)
         )
 
-        if can_reuse_prev_eval:
+        if checkpoint:
+            eval_res = TriageEvalResult(**checkpoint["evaluation"])
+        elif can_reuse_prev_eval:
             eval_res = TriageEvalResult(ok=True, payload=prev_eval_payload)
         else:
             await asyncio.to_thread(
@@ -1681,7 +1780,9 @@ class IntakeWorker:
             eval_res = await self.triage_client.evaluate(eval_body)
 
         final_gate = pre_gate
-        if eval_res.ok and isinstance(eval_res.payload, dict):
+        if checkpoint:
+            final_gate = restore_gate(checkpoint["evaluated_gate"])
+        elif eval_res.ok and isinstance(eval_res.payload, dict):
             ident = eval_res.payload.get("identification")
             ident_dict = ident if isinstance(ident, dict) else {}
             # Run independent verification gate on evaluator's proposal
@@ -1783,11 +1884,9 @@ class IntakeWorker:
 
         if final_gate.status == "verified" and final_gate.verified_movie is not None:
             movie = final_gate.verified_movie
-            radarr = await self.actions_client.get_radarr_status(
-                tmdb_id=movie.tmdb_id,
-                imdb_id=movie.imdb_id,
-                release_title=movie.title,
-            )
+            radarr = await self._lookup_verified_status(row, tl_result, pre_gate, final_gate, eval_res, checkpoint)
+            if radarr is None:
+                return
             delivery_mode, suppression_reason, radarr_note = self._decide_radarr_outcome(
                 radarr=radarr,
                 alt_grab_eligible=alt_grab_eligible,
@@ -1850,6 +1949,8 @@ class IntakeWorker:
             alt_rejection_class=rej_class if delivery_kind == "alternative_grab" else None,
             preferred_topic_kind=preferred_topic_kind,
         )
+        if has_acknowledged_card:
+            card_payload["expected_ack"] = _expected_card_ack(row)
         candidate_card_digest = compute_card_content_digest(card_payload)
         verified_movie: Optional[TmdbMovieRecord] = (
             final_gate.verified_movie if final_gate.status == "verified" else None
@@ -1892,7 +1993,9 @@ class IntakeWorker:
                 lease_seconds=self.config.worker_lease_seconds,
                 new_state="delivering",
             )
-            card_resp = await self.actions_client.deliver_card(card_payload)
+            card_resp = await self._deliver_card_unless_locked(row, card_payload)
+            if card_resp is None:
+                return
             if _is_ambiguous_card_ack(card_resp):
                 await asyncio.to_thread(
                     self.db.finalize_release,
@@ -2045,9 +2148,8 @@ class IntakeWorker:
             reply_resp = await self.actions_client.deliver_evaluation(reply_body)
         else:
             card_resp, reply_resp, reply_body = await self._deliver_card_and_eval_reply(
-                release_id=release_id,
+                row=row,
                 card_revision=next_card_rev,
-                incoming_digest=expected_digest,
                 card_payload=card_payload,
                 eval_payload=eval_res.payload if eval_res.ok else None,
                 eval_error=None if eval_res.ok else eval_res.error_redacted,
@@ -2065,6 +2167,8 @@ class IntakeWorker:
                     "evaluation_json": eval_res.payload if eval_res.ok else None,
                 },
             )
+        if card_resp is None:
+            return
         if _is_ambiguous_card_ack(card_resp):
             await asyncio.to_thread(
                 self.db.finalize_release,

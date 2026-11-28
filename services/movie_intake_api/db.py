@@ -178,6 +178,7 @@ class IntakeDB:
                     eval_reply_status          TEXT NOT NULL DEFAULT 'pending',
                     pending_card_supersede_json TEXT,
                     pending_eval_reply_json    TEXT,
+                    pending_radarr_retry_json  TEXT,
                     radarr_status_snapshot     TEXT,
                     evaluation_json            TEXT,
                     created_at                 TEXT NOT NULL,
@@ -251,6 +252,15 @@ class IntakeDB:
                         ON occurrences(release_id, archive_sha256);
                     """
                 )
+                if "pending_radarr_retry_json" not in existing_cols:
+                    conn.execute("ALTER TABLE releases ADD COLUMN pending_radarr_retry_json TEXT")
+                    # Older schemas did not retain the canonical Radarr status/identity or card
+                    # proof. Add the column for future use without enrolling historical rows.
+                    proof_columns = {"radarr_status_snapshot", "identity_gate_status", "identity_conflict_reason",
+                                     "last_card_digest", "ack_incoming_digest", "pending_card_supersede_json",
+                                     "pending_eval_reply_json", "eval_reply_status"}
+                    if proof_columns.issubset(existing_cols):
+                        self._queue_recent_acknowledged_radarr_timeouts(conn)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -258,6 +268,56 @@ class IntakeDB:
         finally:
             conn.close()
         self._harden_db_files()
+
+    @staticmethod
+    def _queue_recent_acknowledged_radarr_timeouts(conn: sqlite3.Connection) -> None:
+        """One-time upgrade of recent verified cards with a confirmed current delivery."""
+        from .radarr_retry import is_timeout_status
+
+        now = utc_now()
+        now_iso = utc_now_iso(now)
+        rows = conn.execute(
+            """
+            SELECT r.release_id, r.source_occurrence_id, r.incoming_evidence_digest,
+                   r.radarr_status_snapshot
+            FROM releases r
+            JOIN occurrences src ON src.release_id = r.release_id AND src.occurrence_id = r.source_occurrence_id
+            JOIN occurrences latest ON latest.release_id = r.release_id AND latest.occurrence_id = r.latest_occurrence_id
+            WHERE r.state = 'completed' AND r.created_at BETWEEN ? AND ?
+              AND r.identity_gate_status = 'verified' AND r.identity_conflict_reason IS NULL
+              AND r.verified_tmdb_id > 0 AND r.verified_title != '' AND r.verified_year > 0
+              AND r.card_revision >= 1 AND r.ack_chat_id != '' AND r.ack_message_id > 0
+              AND r.ack_incoming_digest = r.incoming_evidence_digest AND r.last_card_digest IS NOT NULL
+              AND r.eval_reply_status = 'sent' AND r.pending_reprocess = 0
+              AND r.pending_eval_reply_json IS NULL AND r.pending_card_supersede_json IS NULL
+              AND r.lease_owner IS NULL AND r.next_attempt_at IS NULL AND r.radarr_status_snapshot IS NOT NULL
+              AND src.classification = 'movie_candidate' AND latest.classification = 'movie_candidate'
+              AND src.incoming_evidence_digest = r.incoming_evidence_digest
+              AND latest.incoming_evidence_digest = r.incoming_evidence_digest
+            """,
+            (utc_now_iso(now - timedelta(days=1)), now_iso),
+        ).fetchall()
+        for row in rows:
+            try:
+                status = json.loads(row["radarr_status_snapshot"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(status, dict) or not is_timeout_status(status.get("status"), status.get("detail")):
+                continue
+            checkpoint = {
+                "mode": "acknowledged",
+                "source_occurrence_id": row["source_occurrence_id"],
+                "incoming_digest": row["incoming_evidence_digest"],
+                "attempts": 1,
+            }
+            conn.execute(
+                """
+                UPDATE releases SET state = 'queued', pending_radarr_retry_json = ?,
+                    next_attempt_at = ?, updated_at = ?
+                WHERE release_id = ?
+                """,
+                (json.dumps(checkpoint), now_iso, now_iso, row["release_id"]),
+            )
 
     def backfill_legacy_occurrence_digests(
         self,
@@ -599,6 +659,7 @@ class IntakeDB:
                         """
                         UPDATE releases
                         SET pending_eval_reply_json = NULL,
+                            pending_radarr_retry_json = NULL,
                             updated_at = ?
                         WHERE release_id = ?
                         """,
@@ -612,6 +673,7 @@ class IntakeDB:
                             suppression_reason = 'pre_upgrade_ineligible_scope',
                             pending_reprocess = 0,
                             pending_card_supersede_json = NULL,
+                            pending_radarr_retry_json = NULL,
                             pending_eval_reply_json = NULL,
                             lease_owner = NULL,
                             lease_expires_at = NULL,
@@ -780,11 +842,13 @@ class IntakeDB:
                     and str(latest_occ_row["classification"] or "") == "pre_upgrade_ineligible_scope"
                 )
                 cur_source_is_ineligible = False
+                src_occ_row = None
                 if cur_source_occ == latest_occ_id:
                     cur_source_is_ineligible = latest_is_ineligible_pre_upgrade
+                    src_occ_row = latest_occ_row
                 elif cur_source_occ:
                     src_occ_row = conn.execute(
-                        "SELECT classification FROM occurrences WHERE occurrence_id = ?",
+                        "SELECT classification, archive_sha256 FROM occurrences WHERE occurrence_id = ?",
                         (cur_source_occ,),
                     ).fetchone()
                     cur_source_is_ineligible = (
@@ -938,6 +1002,11 @@ class IntakeDB:
                 )
 
                 if is_exact_latest_replay:
+                    # A byte-identical archive retains the same acquisition evidence. Keep
+                    # its source stable for any in-flight worker or scheduled lookup.
+                    if (src_occ_row is not None and src_occ_row["classification"] == "movie_candidate"
+                            and src_occ_row["archive_sha256"] == receipt.archive_sha256):
+                        source_occ = cur_source_occ
                     # Exact duplicate (concurrent burst or late duplicate): attach occurrence
                     # without re-queuing, while preserving/upgrading source_occurrence_id if
                     # this delivery supplies a usable download URL.
@@ -998,6 +1067,7 @@ class IntakeDB:
                             pending_reprocess = 0,
                             retry_count = 0,
                             pending_card_supersede_json = NULL,
+                            pending_radarr_retry_json = NULL,
                             pending_eval_reply_json = NULL,
                             eval_reply_status = 'pending',
                             suppression_reason = NULL,
@@ -1043,6 +1113,7 @@ class IntakeDB:
                             incoming_snapshot_json = ?,
                             retry_count = 0,
                             pending_card_supersede_json = NULL,
+                            pending_radarr_retry_json = NULL,
                             pending_eval_reply_json = NULL,
                             eval_reply_status = CASE WHEN card_revision >= 1 THEN eval_reply_status ELSE 'pending' END,
                             next_attempt_at = ?,
@@ -1070,6 +1141,7 @@ class IntakeDB:
                             incoming_evidence_digest = ?,
                             incoming_snapshot_json = ?,
                             pending_reprocess = 1,
+                            pending_radarr_retry_json = NULL,
                             updated_at = ?
                         WHERE release_id = ?
                         """,
@@ -1096,6 +1168,7 @@ class IntakeDB:
                             pending_reprocess = 0,
                             retry_count = 0,
                             pending_card_supersede_json = NULL,
+                            pending_radarr_retry_json = NULL,
                             pending_eval_reply_json = NULL,
                             eval_reply_status = CASE WHEN card_revision >= 1 THEN eval_reply_status ELSE 'pending' END,
                             suppression_reason = NULL,
@@ -1243,33 +1316,92 @@ class IntakeDB:
         finally:
             conn.close()
 
-    def renew_lease(self, release_id: str, *, worker_id: str, lease_seconds: int, new_state: Optional[str] = None) -> bool:
+    @staticmethod
+    def _requeue_superseded_claim(
+        conn: sqlite3.Connection, release_id: str, worker_id: str, digest: str, source_id: str, now_iso: str
+    ) -> bool:
+        """Yield our stale claim to the corrected event; never touch its source or another owner's lease."""
+        cur = conn.execute(
+            """
+            UPDATE releases SET state = 'queued', pending_reprocess = 0,
+                pending_radarr_retry_json = NULL, pending_card_supersede_json = NULL,
+                pending_eval_reply_json = NULL,
+                eval_reply_status = CASE WHEN card_revision < 1 THEN 'pending' ELSE eval_reply_status END,
+                retry_count = 0, next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE release_id = ? AND lease_owner = ?
+              AND (pending_reprocess != 0 OR incoming_evidence_digest != ? OR source_occurrence_id != ?)
+            """,
+            (now_iso, now_iso, release_id, worker_id, digest, source_id),
+        )
+        return cur.rowcount == 1
+
+    def defer_radarr_retry(
+        self, release_id: str, *, worker_id: str, expected_incoming_digest: str,
+        checkpoint: dict[str, Any], next_attempt_at: str,
+    ) -> str:
+        """Durably schedule only the timed-out lookup, bound to the claimed evidence."""
+        source_id = checkpoint["source_occurrence_id"]
+        now_iso = utc_now_iso()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE releases SET state = 'queued', pending_radarr_retry_json = ?, next_attempt_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE release_id = ? AND lease_owner = ? AND lease_expires_at > ?
+                  AND pending_reprocess = 0 AND incoming_evidence_digest = ? AND source_occurrence_id = ?
+                """,
+                (json.dumps(checkpoint, ensure_ascii=False), next_attempt_at, now_iso, release_id,
+                 worker_id, now_iso, expected_incoming_digest, source_id),
+            )
+            if cur.rowcount == 1:
+                result = "queued"
+            elif self._requeue_superseded_claim(conn, release_id, worker_id, expected_incoming_digest, source_id, now_iso):
+                result = "superseded"
+            else:
+                result = "lease_lost"
+            conn.execute("COMMIT")
+            return result
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def renew_lease(
+        self, release_id: str, *, worker_id: str, lease_seconds: int, new_state: Optional[str] = None,
+        expected_incoming_digest: Optional[str] = None, expected_source_occurrence_id: Optional[str] = None,
+        completed_radarr_checkpoint: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        if (expected_incoming_digest is None) != (expected_source_occurrence_id is None):
+            raise ValueError("An evidence-bound lease needs both the digest and the source occurrence")
+        if completed_radarr_checkpoint is not None and expected_incoming_digest is None:
+            raise ValueError("Recording a lookup result requires an evidence-bound lease")
         now = utc_now()
         now_iso = utc_now_iso(now)
         lease_until_iso = utc_now_iso(now + timedelta(seconds=lease_seconds))
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if new_state is not None:
-                cur = conn.execute(
-                    """
-                    UPDATE releases
-                    SET state = ?, lease_expires_at = ?, updated_at = ?
-                    WHERE release_id = ? AND lease_owner = ?
-                    """,
-                    (new_state, lease_until_iso, now_iso, release_id, worker_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE releases
-                    SET lease_expires_at = ?, updated_at = ?
-                    WHERE release_id = ? AND lease_owner = ?
-                    """,
-                    (lease_until_iso, now_iso, release_id, worker_id),
+            sql = """UPDATE releases SET state = COALESCE(?, state), lease_expires_at = ?, updated_at = ?"""
+            params = (new_state, lease_until_iso, now_iso)
+            if completed_radarr_checkpoint is not None:
+                sql += ", pending_radarr_retry_json = ?"
+                params += (json.dumps(completed_radarr_checkpoint, ensure_ascii=False),)
+            sql += " WHERE release_id = ? AND lease_owner = ?"
+            params += (release_id, worker_id)
+            if expected_incoming_digest is not None:
+                sql += """ AND pending_reprocess = 0 AND incoming_evidence_digest = ?
+                           AND source_occurrence_id = ? AND lease_expires_at > ?"""
+                params += (expected_incoming_digest, expected_source_occurrence_id, now_iso)
+            renewed = conn.execute(sql, params).rowcount == 1
+            if not renewed and expected_incoming_digest is not None:
+                self._requeue_superseded_claim(
+                    conn, release_id, worker_id, expected_incoming_digest, expected_source_occurrence_id, now_iso
                 )
             conn.execute("COMMIT")
-            return cur.rowcount == 1
+            return renewed
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -1431,6 +1563,7 @@ class IntakeDB:
         next_attempt_at: Optional[str] = None,
         increment_retry: bool = False,
         reset_retry: bool = False,
+        skip_pending_eval_reply: bool = False,
         allow_downgrade_on_conflict: bool = False,
     ) -> str:
         """
@@ -1516,6 +1649,8 @@ class IntakeDB:
                 card_revision if card_revision is not None else int(cur_row["card_revision"])
             )
             final_eval_reply_status = eval_reply_status or str(cur_row["eval_reply_status"])
+            if skip_pending_eval_reply and final_eval_reply_status == "pending":
+                final_eval_reply_status = "skipped"
             final_last_card_digest = (
                 last_card_digest if last_card_digest is not None else cur_row["last_card_digest"]
             )
@@ -1571,6 +1706,7 @@ class IntakeDB:
                     eval_reply_status = ?,
                     pending_card_supersede_json = ?,
                     pending_eval_reply_json = ?,
+                    pending_radarr_retry_json = CASE WHEN ? THEN pending_radarr_retry_json ELSE NULL END,
                     radarr_status_snapshot = COALESCE(?, radarr_status_snapshot),
                     evaluation_json = COALESCE(?, evaluation_json),
                     updated_at = ?
@@ -1600,6 +1736,7 @@ class IntakeDB:
                     final_eval_reply_status,
                     final_pending_supersede,
                     final_pending_reply,
+                    final_state == "queued" and not has_newer,
                     json.dumps(radarr_status_snapshot, ensure_ascii=False)
                     if radarr_status_snapshot is not None
                     else None,

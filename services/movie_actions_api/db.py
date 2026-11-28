@@ -172,6 +172,8 @@ class ActionsDB:
                     ack_message_id                  INTEGER,
                     ack_thread_id                   INTEGER,
                     used_poster                     INTEGER NOT NULL DEFAULT 0,
+                    confirmed_edit_digest           TEXT,
+                    pending_edit_digest             TEXT,
                     eval_reply_status               TEXT NOT NULL DEFAULT 'pending',
                     eval_reply_card_revision        INTEGER NOT NULL DEFAULT 0,
                     eval_reply_attempt_id           TEXT,
@@ -191,6 +193,10 @@ class ActionsDB:
             }
             if "eval_reply_attempt_id" not in existing_del_cols:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN eval_reply_attempt_id TEXT;")
+            if "confirmed_edit_digest" not in existing_del_cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN confirmed_edit_digest TEXT;")
+            if "pending_edit_digest" not in existing_del_cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN pending_edit_digest TEXT;")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS actions (
@@ -548,6 +554,8 @@ class ActionsDB:
         process_instance_id: str,
         lease_expires_at: str,
         new_actions: list[NewActionRecord],
+        expected_ack: Optional[dict[str, Any]] = None,
+        edit_digest: Optional[str] = None,
     ) -> CardDeliveryPlan:
         now_iso = utc_now_iso()
         conn = self._connect()
@@ -563,6 +571,16 @@ class ActionsDB:
                 "SELECT * FROM deliveries WHERE release_id = ?",
                 (release_id,),
             ).fetchone()
+
+            # An edit-only request must never fall through to the fresh-card send path.
+            if expected_ack is not None:
+                if (row is None or not edit_digest or card_revision != expected_ack["revision"] + 1
+                        or row["ack_chat_id"] != expected_ack["chat_id"]
+                        or row["ack_thread_id"] != expected_ack["thread_id"]
+                        or row["ack_message_id"] != expected_ack["message_id"]
+                        or row["status"] not in ("sending", "ambiguous_delivery", "delivered", "edit_failed")):
+                    conn.execute("COMMIT;")
+                    return CardDeliveryPlan(mode="receipt_mismatch")
 
             if row is not None:
                 status = str(row["status"])
@@ -600,6 +618,22 @@ class ActionsDB:
                 if status in ("delivered", "edit_failed"):
                     prev_rev = int(row["card_revision"])
                     prev_kind = str(row["delivery_kind"])
+                    if expected_ack is not None:
+                        if status == "edit_failed":
+                            # Telegram refused the prior edit. Its reserved revision can carry
+                            # corrected content, while its buttons remain superseded.
+                            allowed = row["pending_edit_digest"] is not None and prev_rev == card_revision
+                        else:
+                            confirmed_replay = (prev_rev == card_revision and prev_kind == delivery_kind
+                                                and row["confirmed_edit_digest"] == edit_digest)
+                            allowed = prev_rev == expected_ack["revision"] or confirmed_replay
+                        if not allowed:
+                            conn.execute("COMMIT;")
+                            return CardDeliveryPlan(mode="receipt_mismatch")
+                    elif status == "edit_failed" and row["pending_edit_digest"]:
+                        # Omitting the receipt on the ordinary card endpoint must not bypass the retry fence.
+                        conn.execute("COMMIT;")
+                        return CardDeliveryPlan(mode="receipt_mismatch")
                     ack_chat = str(row["ack_chat_id"] or "")
                     ack_msg = row["ack_message_id"]
                     ack_thread = row["ack_thread_id"]
@@ -695,7 +729,8 @@ class ActionsDB:
                             ack_message_id=int(ack_msg),
                             ack_thread_id=int(ack_thread) if ack_thread is not None else None,
                             used_poster=used_poster,
-                            previous_card_revision=prev_rev,
+                            # A failed edit reserved prev_rev but never made it visible.
+                            previous_card_revision=expected_ack["revision"] if expected_ack else prev_rev,
                             previous_delivery_kind=prev_kind,
                             eval_reply_status=str(row["eval_reply_status"] or "pending"),
                             detail=f"radarr_action_{locked_row['status']}",
@@ -726,13 +761,15 @@ class ActionsDB:
                         UPDATE deliveries
                         SET card_revision = ?,
                             delivery_kind = ?,
+                            pending_edit_digest = ?,
                             status = 'sending',
                             process_instance_id = ?,
                             lease_expires_at = ?,
                             updated_at = ?
                         WHERE release_id = ?
                         """,
-                        (card_revision, delivery_kind, process_instance_id, lease_expires_at, now_iso, release_id),
+                        (card_revision, delivery_kind, edit_digest, process_instance_id, lease_expires_at,
+                         now_iso, release_id),
                     )
                     conn.execute("COMMIT;")
                     return CardDeliveryPlan(
@@ -837,6 +874,7 @@ class ActionsDB:
         used_poster: bool,
         is_edit: bool,
         preserve_eval_reply: bool = False,
+        confirmed_edit_digest: Optional[str] = None,
     ) -> bool:
         now_iso = utc_now_iso()
         conn = self._connect()
@@ -865,6 +903,8 @@ class ActionsDB:
                             ack_thread_id = ?,
                             used_poster = ?,
                             eval_reply_card_revision = ?,
+                            confirmed_edit_digest = ?,
+                            pending_edit_digest = NULL,
                             last_error_redacted = NULL,
                             updated_at = ?
                         WHERE release_id = ?
@@ -877,6 +917,7 @@ class ActionsDB:
                             ack_thread_id,
                             1 if used_poster else 0,
                             card_revision,
+                            confirmed_edit_digest,
                             now_iso,
                             release_id,
                         ),
@@ -901,6 +942,8 @@ class ActionsDB:
                             eval_reply_lease_expires_at = NULL,
                             eval_reply_message_id = NULL,
                             eval_doc_message_id = NULL,
+                            confirmed_edit_digest = ?,
+                            pending_edit_digest = NULL,
                             last_error_redacted = NULL,
                             updated_at = ?
                         WHERE release_id = ?
@@ -913,6 +956,7 @@ class ActionsDB:
                             ack_thread_id,
                             1 if used_poster else 0,
                             card_revision,
+                            confirmed_edit_digest,
                             now_iso,
                             release_id,
                         ),
@@ -977,7 +1021,12 @@ class ActionsDB:
                     [now_iso, *newly_minted_action_ids],
                 )
             if is_edit:
-                if keep_prior_superseded:
+                # A receipt-bound edit reserves its target revision and supersedes the old
+                # buttons even on a definite Telegram refusal. Preserve both on any failure path.
+                if keep_prior_superseded or conn.execute(
+                    "SELECT 1 FROM deliveries WHERE release_id = ? AND pending_edit_digest IS NOT NULL",
+                    (release_id,),
+                ).fetchone():
                     conn.execute(
                         """
                         UPDATE deliveries

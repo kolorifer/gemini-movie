@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -22,6 +23,7 @@ from .clients import (
     IntakePushClient,
     RadarrClient,
     TelegramClient,
+    TelegramSendResult,
     TriageFeedbackClient,
 )
 from .config import ActionsConfig, AlternativeGrabConfig
@@ -674,6 +676,24 @@ class ActionsService:
         release_id = str(card_payload["release_id"]).strip()
         card_revision = int(card_payload["card_revision"])
         delivery_kind = str(card_payload["delivery_kind"]).strip()
+        expected_ack = card_payload.get("expected_ack")
+        if "expected_ack" in card_payload and (
+            not isinstance(expected_ack, dict)
+            or not isinstance(expected_ack.get("chat_id"), str)
+            or not expected_ack["chat_id"].strip()
+            or type(expected_ack.get("message_id")) is not int
+            or expected_ack["message_id"] <= 0
+            or "thread_id" not in expected_ack
+            or (expected_ack["thread_id"] is not None and type(expected_ack["thread_id"]) is not int)
+            or type(expected_ack.get("revision")) is not int
+            or expected_ack["revision"] < 1
+            or expected_ack["revision"] + 1 != card_revision
+        ):
+            raise DeliveryValidationError("Invalid card edit receipt or revision")
+        edit_digest = None
+        if expected_ack:
+            encoded = json.dumps(card_payload, sort_keys=True, separators=(",", ":")).encode()
+            edit_digest = hashlib.sha256(encoded).hexdigest()
         preserve_eval_reply = card_payload.get("preserve_eval_reply") is True
         target_chat_id = self.config.telegram_chat_id
         if not target_chat_id:
@@ -697,8 +717,21 @@ class ActionsService:
             process_instance_id=self.process_instance_id,
             lease_expires_at=self._lease_iso(self.config.telegram_timeout_seconds),
             new_actions=new_actions,
+            expected_ack=expected_ack,
+            edit_digest=edit_digest,
         )
 
+        if plan.mode == "receipt_mismatch":
+            return {"status": "failed", "detail": "original_card_edit_refused"}
+        if plan.mode == "locked_completed_radarr" and expected_ack:
+            # An irreversible action won the race. Acknowledge only the original card.
+            return {
+                "status": "locked_completed_radarr",
+                "ack_chat_id": plan.ack_chat_id,
+                "ack_message_id": plan.ack_message_id,
+                "ack_thread_id": plan.ack_thread_id,
+                "ack_card_revision": plan.previous_card_revision,
+            }
         if plan.mode in ("already_delivered", "locked_completed_radarr"):
             return {
                 "status": "delivered",
@@ -742,6 +775,12 @@ class ActionsService:
                     reply_markup=reply_markup,
                 )
 
+            # Telegram addresses edits by chat/message. A supplied topic must agree with their receipt.
+            if expected_ack and res.outcome == "ok" and (
+                res.ack_chat_id != plan.ack_chat_id or res.ack_message_id != plan.ack_message_id
+                or (res.ack_thread_id is not None and res.ack_thread_id != plan.ack_thread_id)
+            ):
+                res = TelegramSendResult(outcome="ambiguous", error_redacted="telegram_edit_ack_mismatch")
             if res.outcome in ("ok", "not_modified"):
                 eval_reply_preserved = await asyncio.to_thread(
                     self.db.finish_card_delivery_success,
@@ -754,6 +793,7 @@ class ActionsService:
                     used_poster=plan.used_poster,
                     is_edit=True,
                     preserve_eval_reply=preserve_eval_reply,
+                    confirmed_edit_digest=edit_digest,
                 )
                 return {
                     "status": "delivered",

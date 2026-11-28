@@ -286,11 +286,13 @@ def create_app(
             release_title=release_title,
         )
 
-    @app.post(
-        "/internal/deliver/card",
+    @app.api_route(
+        "/internal/deliver/card", methods=["POST", "PUT"],
         dependencies=[Depends(require_internal_token)],
     )
-    async def deliver_card(payload: dict[str, Any]) -> dict[str, Any]:
+    async def deliver_card(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+        if request.method == "PUT" and "expected_ack" not in payload:
+            raise HTTPException(status_code=400, detail="Missing required card edit receipt")
         try:
             return await service.deliver_card(payload)
         except DeliveryValidationError as exc:

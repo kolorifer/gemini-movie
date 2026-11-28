@@ -285,6 +285,74 @@ class TestMovieActionsApi(unittest.IsolatedAsyncioTestCase):
             shadow_replay_enabled=shadow_replay,
         )
 
+    async def test_radarr_followup_edit_requires_the_original_receipt(self) -> None:
+        from services.movie_intake_api.clients import ActionsApiClient
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._make_config(tmpdir)
+            tg = ControllableTelegramStub()
+            app = create_actions_app(
+                cfg, telegram_client=tg, radarr_client=ControllableRadarrStub(),
+                intake_push_client=ShadowStubIntakePushClient(), triage_feedback_client=ControllableFeedbackStub(),
+            )
+            methods = []
+            async def observe_method(request):
+                methods.append(request.method)
+            async with app.router.lifespan_context(app), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test",
+                event_hooks={"request": [observe_method]},
+            ) as transport:
+                client = ActionsApiClient(base_url="http://test", internal_token=cfg.internal_api_secret,
+                                          http_client=transport)
+                card = _verified_card_payload(card_revision=2)
+                receipt = {"chat_id": cfg.telegram_chat_id, "message_id": 1234, "revision": 1, "thread_id": None}
+                card["expected_ack"] = receipt
+                self.assertEqual((await client.deliver_card(card)).status, "failed")
+                self.assertFalse(tg.sent_photos or tg.sent_messages or tg.edited_captions or tg.edited_texts)
+                self.assertEqual(methods, ["PUT"])
+
+                first = await client.deliver_card(_verified_card_payload(delivery_kind="evidence_review"))
+                self.assertEqual(first.status, "delivered")
+                self.assertEqual((await client.deliver_card(card)).status, "failed")
+                self.assertFalse(tg.edited_captions or tg.edited_texts)
+                receipt["message_id"] = first.ack_message_id
+                receipt["thread_id"] = -99
+                self.assertEqual((await client.deliver_card(card)).status, "failed")
+                receipt["thread_id"] = first.ack_thread_id
+                # Drop the intake response after the real Actions endpoint persisted the confirmed edit.
+                await client.deliver_card(card)
+                restarted = ActionsApiClient(base_url="http://test", internal_token=cfg.internal_api_secret,
+                                             http_client=transport)
+                recovered = await restarted.deliver_card(card)
+                self.assertEqual((recovered.status, recovered.ack_message_id), ("delivered", first.ack_message_id))
+                for change in ({"source_occurrence_id": "different-occurrence"}, {"radarr_note": "changed"}):
+                    self.assertEqual((await restarted.deliver_card({**card, **change})).status, "failed")
+                self.assertEqual(len(tg.sent_photos) + len(tg.sent_messages), 1)
+                self.assertEqual(len(tg.edited_captions) + len(tg.edited_texts), 1)
+
+                # A later edit returning the wrong Telegram receipt remains unconfirmed on replay.
+                revision_three = {**card, "card_revision": 3, "expected_ack": {**receipt, "revision": 2}}
+                wrong_target = TelegramSendResult(outcome="ok", ack_chat_id=first.ack_chat_id,
+                                                  ack_message_id=first.ack_message_id + 10)
+                with patch.object(tg, "edit_message_text", return_value=wrong_target) as edit:
+                    self.assertEqual((await restarted.deliver_card(revision_three)).status, "ambiguous_delivery")
+                    self.assertNotEqual((await restarted.deliver_card(revision_three)).status, "delivered")
+                    edit.assert_awaited_once()
+
+    async def test_edit_response_must_match_chat_message_and_topic(self) -> None:
+        from services.movie_intake_api.clients import ActionsApiClient
+
+        expected = {"chat_id": "-100", "message_id": 50, "thread_id": 42, "revision": 1}
+        ack = {"status": "delivered", "ack_chat_id": "-100", "ack_message_id": 50, "ack_thread_id": 42}
+        for override in ({"ack_chat_id": "-200"}, {"ack_message_id": 99}, {"ack_thread_id": None}):
+            def respond(request):
+                self.assertEqual(request.method, "PUT")
+                return httpx.Response(200, json={**ack, **override})
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+                client = ActionsApiClient(base_url="http://test", internal_token="fixture", http_client=transport)
+                result = await client.deliver_card({"expected_ack": expected})
+                self.assertEqual(result.status, "ambiguous_delivery")
+
     def _write_alt_grab_config(
         self,
         tmpdir: str,
