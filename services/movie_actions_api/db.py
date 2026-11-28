@@ -574,7 +574,7 @@ class ActionsDB:
 
             # An edit-only request must never fall through to the fresh-card send path.
             if expected_ack is not None:
-                if (row is None or not edit_digest
+                if (row is None or not edit_digest or card_revision != expected_ack["revision"] + 1
                         or row["ack_chat_id"] != expected_ack["chat_id"]
                         or row["ack_thread_id"] != expected_ack["thread_id"]
                         or row["ack_message_id"] != expected_ack["message_id"]
@@ -619,13 +619,15 @@ class ActionsDB:
                     prev_rev = int(row["card_revision"])
                     prev_kind = str(row["delivery_kind"])
                     if expected_ack is not None:
-                        # The target revision is stored before Telegram I/O to fence old buttons.
-                        # A replay at that revision must match the exact input (including receipt).
-                        digest_field = "pending_edit_digest" if status == "edit_failed" else "confirmed_edit_digest"
-                        same_edit = (prev_rev == card_revision and prev_kind == delivery_kind
-                                     and row[digest_field] == edit_digest)
-                        next_edit = status == "delivered" and prev_rev == expected_ack["revision"]
-                        if not (same_edit or next_edit):
+                        if status == "edit_failed":
+                            # Telegram refused the prior edit. Its reserved revision can carry
+                            # corrected content, while its buttons remain superseded.
+                            allowed = row["pending_edit_digest"] is not None and prev_rev == card_revision
+                        else:
+                            confirmed_replay = (prev_rev == card_revision and prev_kind == delivery_kind
+                                                and row["confirmed_edit_digest"] == edit_digest)
+                            allowed = prev_rev == expected_ack["revision"] or confirmed_replay
+                        if not allowed:
                             conn.execute("COMMIT;")
                             return CardDeliveryPlan(mode="receipt_mismatch")
                     elif status == "edit_failed" and row["pending_edit_digest"]:
@@ -727,7 +729,8 @@ class ActionsDB:
                             ack_message_id=int(ack_msg),
                             ack_thread_id=int(ack_thread) if ack_thread is not None else None,
                             used_poster=used_poster,
-                            previous_card_revision=prev_rev,
+                            # A failed edit reserved prev_rev but never made it visible.
+                            previous_card_revision=expected_ack["revision"] if expected_ack else prev_rev,
                             previous_delivery_kind=prev_kind,
                             eval_reply_status=str(row["eval_reply_status"] or "pending"),
                             detail=f"radarr_action_{locked_row['status']}",

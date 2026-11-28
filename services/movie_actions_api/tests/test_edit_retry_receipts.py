@@ -49,15 +49,16 @@ class EditRetryReceiptTests(unittest.IsolatedAsyncioTestCase):
         response.raise_for_status()
         return response.json()
 
-    async def assert_receipt_required(self):
+    async def assert_receipt_required(self, payload=None):
+        payload = self.edit if payload is None else payload
         for change in ({"chat_id": "other"}, {"thread_id": -1}, {"message_id": 99999}):
-            wrong = {**self.edit, "expected_ack": {**self.receipt, **change}}
+            wrong = {**payload, "expected_ack": {**self.receipt, **change}}
             self.assertEqual((await self.put(wrong))["detail"], "original_card_edit_refused")
-        missing = {k: v for k, v in self.edit.items() if k != "expected_ack"}
+        missing = {k: v for k, v in payload.items() if k != "expected_ack"}
         response = await self.client.put("/internal/deliver/card", json=missing)
         self.assertEqual(response.status_code, 400)
 
-    async def exercise_definite_failure(self, restore):
+    async def exercise_definite_failure(self, restore, correction=None):
         failure = TelegramSendResult(outcome="failed_definitive", error_redacted="fixture_rejected")
         finish = self.db.finish_card_delivery_failed
         def finalize(release_id, **kwargs):
@@ -71,18 +72,21 @@ class EditRetryReceiptTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.put())["detail"], "fixture_rejected")
             first_edit.assert_awaited_once()
         self.client = await self.start_service()
-        await self.assert_receipt_required()
-        for edit in ({**self.edit, "radarr_note": "changed"}, {**self.edit, "source_occurrence_id": "different"}):
-            self.assertEqual((await self.put(edit))["detail"], "original_card_edit_refused")
-        unbound = {k: v for k, v in self.edit.items() if k != "expected_ack"}
+        accepted = self.edit if correction is None else correction
+        await self.assert_receipt_required(accepted)
+        wrong_revision = {**accepted, "card_revision": 3, "expected_ack": {**self.receipt, "revision": 2}}
+        self.assertEqual((await self.put(wrong_revision))["detail"], "original_card_edit_refused")
+        unbound = {k: v for k, v in accepted.items() if k != "expected_ack"}
         for revision in (2, 3):
             post = await self.client.post("/internal/deliver/card", json={**unbound, "card_revision": revision})
             self.assertEqual(post.json()["status"], "failed")
         actions = self.db.list_actions_for_release(self.original["release_id"])
         self.assertTrue(actions)
         self.assertEqual({a["status"] for a in actions}, {"superseded"})
-        self.assertEqual((await self.put())["status"], "delivered")
-        self.assertEqual((await self.put())["status"], "delivered")
+        self.assertEqual((await self.put(accepted))["status"], "delivered")
+        self.assertEqual((await self.put(accepted))["status"], "delivered")
+        if correction is not None:
+            self.assertEqual((await self.put(self.edit))["detail"], "original_card_edit_refused")
         self.assertEqual(len(self.telegram.sent_messages), 1)
         self.assertEqual(len(self.telegram.edited_texts), 1)
         rendered = self.telegram.edited_texts[0]
@@ -91,14 +95,37 @@ class EditRetryReceiptTests(unittest.IsolatedAsyncioTestCase):
         old_actions = {a["action_id"] for a in actions}
         actions = self.db.list_actions_for_release(self.original["release_id"])
         self.assertTrue(all(a["status"] == "superseded" for a in actions if a["action_id"] in old_actions))
-        if self.edit["delivery_kind"] == "actionable_grab":
-            self.assertTrue(any(a["status"] == "active" for a in actions if a["action_id"] not in old_actions))
+        if accepted["delivery_kind"] == "actionable_grab":
+            active = [a for a in actions if a["status"] == "active"]
+            self.assertTrue(active)
+            for a in active:
+                self.assertNotIn(a["action_id"], old_actions)
+                self.assertEqual(a["source_occurrence_id"], accepted["source_occurrence_id"])
+                self.assertEqual(a["bound_tmdb_id"], accepted["verified_tmdb_id"])
+                self.assertEqual(a["bound_imdb_id"], accepted["verified_imdb_id"])
+                self.assertEqual(a["bound_release_name"], accepted["exact_release_name"])
         else:
             self.assertEqual({a["action_id"] for a in actions}, old_actions)
-            self.assertTrue(all(a["card_revision"] == 1 for a in actions))
+            self.assertTrue(all(a["status"] == "superseded" for a in actions))
+            self.assertFalse((rendered["reply_markup"] or {}).get("inline_keyboard"))
+
+        if self.edit["delivery_kind"] == "actionable_grab":
+            self.assertEqual({a["card_revision"] for a in actions if a["action_id"] in old_actions}, {1, 2})
 
     async def test_definite_edit_replays_exact_receipt_and_content(self):
         await self.exercise_definite_failure(restore=False)
+
+    async def test_new_occurrence_corrects_failed_proposal_on_original_card(self):
+        correction = fixtures._verified_card_payload(
+            card_revision=2, source_occurrence_id="occ-new", release_name="New.Identity.2024.1080p.BluRay.REMUX",
+            title="New Identity", tmdb_id=30999, imdb_id="tt0339999", year=2024, poster_path=None,
+            extra={"expected_ack": self.receipt},
+        )
+        await self.exercise_definite_failure(restore=False, correction=correction)
+
+    async def test_same_occurrence_can_retire_failed_proposal_when_fresh_status_is_watched(self):
+        retirement = {**self.edit, "delivery_kind": "retired", "radarr_status": "watched_unmonitored"}
+        await self.exercise_definite_failure(restore=False, correction=retirement)
 
     async def test_failure_restoration_cannot_revive_old_tokens_or_drop_intent(self):
         await self.exercise_definite_failure(restore=True)
